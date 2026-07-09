@@ -86,16 +86,14 @@ CU_ENDPOINT = os.environ.get(
 ).rstrip("/") + "/"
 CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
 
-# Determinism + caching: to get consistent, golden-matching results in the
-# shortest time, every model call is content-addressed and cached on disk, and
-# best-effort determinism (temperature=0 + fixed seed) is requested. Identical
-# input -> identical crops -> cache hit -> byte-identical output, no tokens,
-# near-instant. Bypass with PIPELINE_CACHE=0 / --no-cache; recompute with
-# --refresh-cache.
+# Determinism + caching. Caching is OFF by default: every run recomputes the OCR
+# genuinely (self-consistency voting), so nothing is ever a cached replay.
+# Enable the response cache with PIPELINE_CACHE=1 for fast, byte-identical
+# re-runs of the same document (--refresh-cache recomputes + overwrites).
 GPT_TEMPERATURE = float(os.environ.get("GPT_TEMPERATURE", "0"))
 GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
 CACHE_DIR = os.environ.get("PIPELINE_CACHE_DIR", ".cache")
-CACHE_ENABLED = os.environ.get("PIPELINE_CACHE", "1") not in ("", "0", "false", "False")
+CACHE_ENABLED = os.environ.get("PIPELINE_CACHE", "0") not in ("", "0", "false", "False")
 CACHE_REFRESH = False  # set by --refresh-cache: recompute and overwrite cache
 # The document-level result cache (whole-output replay) is OFF by default: we want
 # genuine computation, not a replay. Enable with DOC_CACHE=1 for instant re-serve.

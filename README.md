@@ -256,14 +256,14 @@ deterministic engine trades too much accuracy, so GPT voting wins.
 
 ### Reproducibility & speed (caching)
 
-- **Response cache** (`.cache/gpt`, `.cache/cu`) — each GPT/CU call is memoized on disk,
-  keyed on its content **and seed**, so the N voting draws are distinct genuine calls and a
-  **re-run of the same document reuses them → byte-identical result, 0 new tokens**.
+- **Response cache** (`.cache/gpt`, `.cache/cu`) — **off by default**, so every run recomputes
+  the OCR genuinely (nothing is ever a replay). Opt in with `PIPELINE_CACHE=1` for fast,
+  byte-identical re-runs of the same document: each GPT/CU call is then memoized keyed on its
+  content **and seed**, so the N voting draws stay distinct genuine calls.
 - **Result cache** (`.cache/docs`, opt-in with `DOC_CACHE=1`) — stores the whole output dir
   per input for instant re-serve. **Off by default** (we want genuine computation).
 - Each run reports `Total time (mm:ss)` and `GPT tokens (in/out/total)`; both are written to
-  `handwriting_result.json` (`elapsed`, `usage`, `cache_hits`). `--no-cache` bypasses,
-  `--refresh-cache` recomputes.
+  `handwriting_result.json` (`elapsed`, `usage`, `cache_hits`). `--refresh-cache` recomputes.
 
 ### Golden dataset & regression checks
 

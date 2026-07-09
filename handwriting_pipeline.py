@@ -306,6 +306,25 @@ def render_pdf_page(pdf_path: str, page_number: int, dpi: int) -> Image.Image:
         doc.close()
 
 
+def pdf_page_count(pdf_path: str) -> int:
+    doc = fitz.open(pdf_path)
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+def _single_page_pdf_bytes(pdf_path: str, page: int) -> bytes:
+    """Return a 1-page PDF (bytes) containing only page `page` (1-based)."""
+    src = fitz.open(pdf_path)
+    try:
+        one = fitz.open()
+        one.insert_pdf(src, from_page=page - 1, to_page=page - 1)
+        return one.tobytes()
+    finally:
+        src.close()
+
+
 def load_image(image_path: str) -> Image.Image:
     return Image.open(image_path).convert("RGB")
 
@@ -609,14 +628,20 @@ def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
 # --------------------------------------------------------------------------- #
 # Content Understanding printed-text OCR (for the merged Markdown)
 # --------------------------------------------------------------------------- #
-def cu_ocr_markdown(input_path: str, timeout_s: int = 180, retries: int = 4) -> str:
+def cu_ocr_markdown(input_path: str, timeout_s: int = 180, retries: int = 4,
+                    page: int | None = None) -> str:
     """Run Content Understanding (prebuilt-documentSearch) on the file and return
     its printed-text markdown. Uses the same Entra ID token as GPT. Retries the
-    submit and tolerates transient errors while polling."""
+    submit and tolerates transient errors while polling. If `page` is given for a
+    PDF, only that single page is analyzed (keeps per-page merges consistent)."""
     ext = Path(input_path).suffix.lower()
-    mime = {".pdf": "application/pdf", ".png": "image/png",
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "application/octet-stream")
-    data = base64.b64encode(Path(input_path).read_bytes()).decode()
+    if page is not None and ext == ".pdf":
+        raw, mime = _single_page_pdf_bytes(input_path, page), "application/pdf"
+    else:
+        mime = {".pdf": "application/pdf", ".png": "image/png",
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "application/octet-stream")
+        raw = Path(input_path).read_bytes()
+    data = base64.b64encode(raw).decode()
     ckey = _hash_obj({"cu": data, "mime": mime, "api": CU_API_VERSION})
     cached = _cache_get("cu", ckey)
     if cached is not None:
@@ -1369,7 +1394,7 @@ def run_pipeline(
     if merge_md:
         print("[CU] starting Content Understanding OCR in background (overlaps region OCR) ...")
         cu_executor = ThreadPoolExecutor(max_workers=1)
-        cu_future = cu_executor.submit(cu_ocr_markdown, input_path)
+        cu_future = cu_executor.submit(cu_ocr_markdown, input_path, page=page)
 
     # ---- determine regions ------------------------------------------------ #
     regions: list[dict] = []
@@ -1632,11 +1657,67 @@ def _parse_crop(s: str | None) -> tuple[int, int, int, int] | None:
     return tuple(parts)  # type: ignore[return-value]
 
 
+def _parse_pages(spec: str | None, total: int, single: int | None) -> list[int]:
+    """Resolve pages to process. Priority: --page (single) > --pages (spec) > all.
+    Values are clamped to [1, total]."""
+    if single:
+        return [single] if 1 <= single <= total else []
+    if spec:
+        out: set[int] = set()
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                out.update(range(int(a), int(b) + 1))
+            else:
+                out.add(int(part))
+        return sorted(p for p in out if 1 <= p <= total)
+    return list(range(1, total + 1))
+
+
+def run_document(
+    input_path: str, pages: list[int], dpi: int,
+    crops: list[tuple[int, int, int, int]] | None, output_dir: str,
+    chunk_width: int, overlap: int, ocr_mode: str,
+    auto_detect: bool, max_regions: int | None,
+    printed_context: str, italic: bool, merge_md: bool,
+) -> int:
+    """Process one or many pages. A single page writes straight into output_dir;
+    multiple pages get one subfolder per page plus a combined document.md."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    multi = len(pages) > 1
+    rc, page_docs = 0, []
+    for i, page in enumerate(pages, 1):
+        page_out = out / f"page_{page:04d}" if multi else out
+        if multi:
+            print(f"\n{'#' * 70}\n# PAGE {page}  ({i}/{len(pages)})\n{'#' * 70}")
+        rc = run_pipeline(
+            input_path=input_path, page=page, dpi=dpi, crops=crops,
+            output_dir=str(page_out), chunk_width=chunk_width, overlap=overlap,
+            ocr_mode=ocr_mode, auto_detect=auto_detect, max_regions=max_regions,
+            printed_context=printed_context, italic=italic, merge_md=merge_md,
+        ) or rc
+        md = page_out / "merged.md"
+        if multi and md.exists():
+            page_docs.append((page, md.read_text(encoding="utf-8").strip()))
+    if multi and page_docs:
+        combined = "\n\n".join(
+            f"<!-- ===================== Page {p} ===================== -->\n\n{t}"
+            for p, t in page_docs)
+        (out / "document.md").write_text(combined + "\n", encoding="utf-8")
+        print(f"\n{'=' * 70}\nDOCUMENT: {len(page_docs)} page(s) -> {out / 'document.md'}\n{'=' * 70}")
+    return rc
+
+
 def main() -> int:
     global MAX_WORKERS, CACHE_ENABLED, CACHE_REFRESH
     ap = argparse.ArgumentParser(description="Hebrew handwriting OCR helper pipeline")
     ap.add_argument("--input", required=True, help="PDF or image path")
-    ap.add_argument("--page", type=int, default=1, help="PDF page number (1-based)")
+    ap.add_argument("--page", type=int, default=None, help="a single PDF page (1-based); default: ALL pages")
+    ap.add_argument("--pages", default=None, help='pages to process, e.g. "1-3,5"; default: all pages')
     ap.add_argument("--crop", action="append", default=None,
                     help='handwriting rectangle "x,y,w,h" in px; repeat for multiple regions')
     ap.add_argument("--auto-detect", action="store_true",
@@ -1646,7 +1727,7 @@ def main() -> int:
     ap.add_argument("--dpi", type=int, default=400, help="PDF render DPI (300-600)")
     ap.add_argument("--chunk-width", type=int, default=900)
     ap.add_argument("--overlap", type=int, default=150)
-    ap.add_argument("--ocr-mode", choices=["full", "chunks", "both"], default="both")
+    ap.add_argument("--ocr-mode", choices=["full", "chunks", "both"], default="full")
     ap.add_argument("--workers", type=int, default=MAX_WORKERS,
                     help="parallel GPT vision calls in flight (use 1 for easy debugging)")
     ap.add_argument("--printed-context", default=None,
@@ -1658,7 +1739,8 @@ def main() -> int:
     ap.add_argument("--italic", action="store_true",
                     help="treat regions as possibly ITALIC/CURSIVE printed Hebrew (not just handwriting)")
     ap.add_argument("--merge-md", action="store_true",
-                    help="also produce merged.md: CU printed text + GPT handwriting, de-duplicated")
+                    help="(default ON) produce merged.md: CU printed text + GPT handwriting")
+    ap.add_argument("--no-merge", action="store_true", help="skip merged.md")
     ap.add_argument("--no-cache", action="store_true",
                     help="disable the model-response cache (always call the model)")
     ap.add_argument("--refresh-cache", action="store_true",
@@ -1680,13 +1762,29 @@ def main() -> int:
             print(f"Using printed context ({args.context_mode}, {len(printed_context)} chars, soft hint only)")
 
     crops = [_parse_crop(c) for c in args.crop] if args.crop else None
+    # Smart defaults: auto-detect handwriting when no manual crop is given; merge
+    # unless --no-merge. So `--input doc.pdf` alone does the right thing.
+    auto_detect = args.auto_detect or (crops is None)
+    merge_md = not args.no_merge
 
-    return run_pipeline(
-        input_path=args.input, page=args.page, dpi=args.dpi,
-        crops=crops, output_dir=args.output,
-        chunk_width=args.chunk_width, overlap=args.overlap, ocr_mode=args.ocr_mode,
-        auto_detect=args.auto_detect, max_regions=args.max_regions,
-        printed_context=printed_context, italic=args.italic, merge_md=args.merge_md,
+    # Smart page handling: a PDF processes ALL pages by default; an image is 1 page.
+    ext = Path(args.input).suffix.lower()
+    total = pdf_page_count(args.input) if ext == ".pdf" else 1
+    pages = _parse_pages(args.pages, total, args.page)
+    if not pages:
+        print(f"No pages to process (input has {total} page(s)).", file=sys.stderr)
+        return 1
+    if len(pages) > 1:
+        print(f"[document] {args.input}: {total} page(s); processing {len(pages)} "
+              f"(pages {pages[0]}-{pages[-1]}).")
+        print("[document] runs the pipeline per page (~Nx the single-page time). "
+              "Use --pages 1-3 to limit, or OCR_REASONING=low to go faster.")
+
+    return run_document(
+        input_path=args.input, pages=pages, dpi=args.dpi, crops=crops,
+        output_dir=args.output, chunk_width=args.chunk_width, overlap=args.overlap,
+        ocr_mode=args.ocr_mode, auto_detect=auto_detect, max_regions=args.max_regions,
+        printed_context=printed_context, italic=args.italic, merge_md=merge_md,
     )
 
 

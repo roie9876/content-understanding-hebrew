@@ -151,28 +151,39 @@ the visible strokes.
 
 ### How to test it
 
-**Step 1 — auto-detect and transcribe everything (recommended):**
+**The tool is smart about input — `--input` alone does the right thing.** No `--page`,
+`--auto-detect`, or `--merge-md` needed:
 
 ```bash
 az login   # once
-python handwriting_pipeline.py \
-  --input "sample/אישור מסירה -דירה 8.pdf" \
-  --auto-detect --ocr-mode full --workers 8 \
+
+# single page or image — auto-detects handwriting + builds merged.md
+python handwriting_pipeline.py --input "sample/אישור מסירה -דירה 8.pdf" \
   --output ./output_handwriting/test
+
+# a multi-page PDF — ALL pages are processed automatically
+python handwriting_pipeline.py --input report.pdf --output ./output_handwriting/report
+#   -> output_handwriting/report/page_0001/…, page_0002/…, and a combined document.md
 ```
 
-**Step 2 — inspect the outputs** (inside `--output`, git-ignored):
+Restrict or tune only when you want to: `--pages 1-3,5` (subset), `--page 2` (one page),
+`--crop "x,y,w,h"` (manual region, skips auto-detect), `--no-merge` (skip merged.md),
+`--workers N`, `OCR_REASONING=low` (faster). For a big PDF, note it runs per page
+(~N× the single-page time).
+
+**Inspect the outputs** (inside `--output`, git-ignored). For a multi-page PDF each page is
+in its own `page_NNNN/` folder plus a top-level `document.md` concatenating them:
 
 | File | What it is |
 | --- | --- |
 | `page_1_regions.png` | the page with numbered red detection boxes |
 | `region_NN_*/result.json` | the region's final reading + per-word confidence/reason/notes |
 | `region_NN_*/per_image_ocr.json` | what each enhanced image/chunk read |
-| `region_NN_*/visual_reconcile_input.json` | images + candidates sent to the visual step |
-| `region_NN_*/01_…`–`06_…`, `chunk_*.png` | the enhanced crops actually sent to GPT |
-| `handwriting_result.json` | all regions combined |
+| `handwriting_result.json` | all regions combined (+ `usage`, `elapsed`) |
 | `merged.html` / `merged.jpg` | the page with extracted handwriting overlaid in **red** |
-| `merged.md` | (with `--merge-md`) full doc: CU printed text + handwriting in red, de-duplicated |
+| `merged.md` | full page: CU printed text + handwriting in red, de-duplicated |
+| `document.md` | (multi-page) all pages' `merged.md` concatenated |
+
 
 **Other ways to run:**
 
@@ -211,18 +222,18 @@ done
 
 ### CLI options (`--help` for the full list)
 
-- `--auto-detect` — locate all handwriting regions automatically
-- `--crop "x,y,w,h"` — manual region in pixels (repeat for multiple regions)
-- `--ocr-mode full|chunks|both` — which images to OCR (default `both`)
+- *(defaults)* no crop → **auto-detect** handwriting; a PDF → **all pages**; **merged.md on**
+- `--page N` / `--pages "1-3,5"` — process one page / a subset (default: all pages)
+- `--crop "x,y,w,h"` — manual region in pixels (repeat for multiple regions; skips auto-detect)
+- `--no-merge` — skip `merged.md`
+- `--ocr-mode full|chunks|both` — which images to OCR (default `full`)
 - `--workers N` — parallel GPT calls in flight (`1` for easy debugging)
-- `--merge-md` — also build `merged.md` (CU printed text + handwriting, de-duplicated)
-- `--no-cache` — disable the model-response cache (always call the model)
-- `--refresh-cache` — ignore the cache, recompute, and overwrite it
+- `--refresh-cache` — ignore the cache, recompute, and overwrite it (cache is off by default)
 - `--printed-context / --printed-context-file` + `--context-mode none|nearby|summary` —
   optional short printed-text **soft** hint (default `none`)
 - `--italic` — also read italic/cursive **printed** Hebrew here (opt-in only; normally
   italic is printed text and belongs to the Content Understanding pipeline)
-- `--dpi`, `--page`, `--max-regions`
+- `--dpi`, `--max-regions`
 
 The handwriting engine is a Vision LLM — Tesseract is intentionally not used (weak for
 Hebrew handwriting).

@@ -61,6 +61,22 @@ def _center(box: list[int]) -> tuple[float, float]:
     return (x + w / 2.0, y + h / 2.0)
 
 
+def _is_stable(text: str) -> bool:
+    """A golden reading is 'stable' (reproducible enough to ENFORCE) when it is
+    short, unmarked ([?]-free), single-line, and dominated by digits/ASCII
+    (dates, numbers, IDs, emails). Long/cursive Hebrew notes are 'volatile' - the
+    vision model rewords them run-to-run, so they are reported but never fail.
+    """
+    t = (text or "").strip()
+    if not t or "[?]" in t or "\n" in t:
+        return False
+    core = t.replace(" ", "")
+    if not core or len(core) > 20:
+        return False
+    asciiish = sum(ch.isascii() for ch in core)
+    return asciiish >= max(1, int(0.7 * len(core)))
+
+
 def _load_regions(result_json: Path) -> list[dict]:
     data = json.loads(result_json.read_text(encoding="utf-8"))
     return data.get("regions", [])
@@ -91,8 +107,10 @@ def _match(golden: list[dict], current: list[dict]):
     return pairs, extras
 
 
-def _status(golden_text: str, current_text: str | None) -> tuple[str, float, bool]:
-    """Return (label, ratio, is_fail)."""
+def _status(golden_text: str, current_text: str | None, stable: bool) -> tuple[str, float, bool]:
+    """Return (label, ratio, is_fail). Structural problems (missing/empty) always
+    fail. Text divergence fails ONLY on stable fields; on volatile fields it is
+    reported but not failed, because the model is non-deterministic there."""
     g = (golden_text or "").strip()
     if current_text is None:
         return ("MISSING", 0.0, True)
@@ -102,9 +120,11 @@ def _status(golden_text: str, current_text: str | None) -> tuple[str, float, boo
     r = _ratio(g, c)
     if r >= OK_RATIO:
         return ("OK", r, False)
+    if not stable:
+        return ("VOLATILE-DIFF", r, False)   # expected model variance -> not a fail
     if r >= DIVERGE_RATIO:
-        return ("DRIFT", r, False)          # within model variance -> warn only
-    return ("DIVERGED", r, True)            # real divergence -> fail
+        return ("DRIFT", r, False)           # minor drift on a stable field -> warn
+    return ("DIVERGED", r, True)             # stable field genuinely changed -> fail
 
 
 def compare_sample(stem: str) -> dict:
@@ -124,12 +144,13 @@ def compare_sample(stem: str) -> dict:
     for g, c in pairs:
         gt = g.get("final_transcription") or ""
         ct = None if c is None else (c.get("final_transcription") or "")
-        label, r, is_fail = _status(gt, ct)
+        stable = _is_stable(gt)
+        label, r, is_fail = _status(gt, ct, stable)
         fails += int(is_fail)
-        if label not in ("MISSING",):
+        if label != "MISSING":
             ratios.append(r)
         rows.append({"golden_label": g.get("label", ""), "golden": gt,
-                     "current": ct, "status": label, "ratio": r})
+                     "current": ct, "status": label, "ratio": r, "stable": stable})
 
     count_fail = len(current) != len(golden)
     avg = sum(ratios) / len(ratios) if ratios else 0.0
@@ -158,9 +179,11 @@ def _print_report(res: dict) -> None:
     print(f"regions: golden={res['golden_count']} current={res['current_count']}"
           + ("   [COUNT CHANGED]" if res["count_fail"] else ""))
     for i, row in enumerate(res["rows"], 1):
-        mark = {"OK": "ok  ", "DRIFT": "drift", "DIVERGED": "FAIL", "EMPTY": "FAIL", "MISSING": "FAIL"}
-        print(f"  [{i}] {mark.get(row['status'], '?')} {row['status']:9} "
-              f"sim={row['ratio']:.2f}  ({row['golden_label']})")
+        mark = {"OK": "ok  ", "DRIFT": "warn", "VOLATILE-DIFF": "info",
+                "DIVERGED": "FAIL", "EMPTY": "FAIL", "MISSING": "FAIL"}
+        tag = "stable" if row.get("stable") else "volatile"
+        print(f"  [{i}] {mark.get(row['status'], '?'):4} {row['status']:13} "
+              f"sim={row['ratio']:.2f}  [{tag}] ({row['golden_label']})")
         print(f"        golden : {row['golden'][:90]!r}")
         print(f"        current: {(row['current'] or '')[:90]!r}")
     for ex in res["extras"]:

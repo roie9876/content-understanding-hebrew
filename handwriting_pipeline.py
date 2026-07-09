@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
 import random
+import shutil
 import sys
 import time
 from html import escape
@@ -80,6 +82,18 @@ CU_ENDPOINT = os.environ.get(
     "https://ai-content-understanding-resource-2416.cognitiveservices.azure.com/",
 ).rstrip("/") + "/"
 CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
+
+# Determinism + caching: to get consistent, golden-matching results in the
+# shortest time, every model call is content-addressed and cached on disk, and
+# best-effort determinism (temperature=0 + fixed seed) is requested. Identical
+# input -> identical crops -> cache hit -> byte-identical output, no tokens,
+# near-instant. Bypass with PIPELINE_CACHE=0 / --no-cache; recompute with
+# --refresh-cache.
+GPT_TEMPERATURE = float(os.environ.get("GPT_TEMPERATURE", "0"))
+GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
+CACHE_DIR = os.environ.get("PIPELINE_CACHE_DIR", ".cache")
+CACHE_ENABLED = os.environ.get("PIPELINE_CACHE", "1") not in ("", "0", "false", "False")
+CACHE_REFRESH = False  # set by --refresh-cache: recompute and overwrite cache
 
 # Domain-agnostic: the handwriting OCR uses NO built-in vocabulary and makes no
 # assumption about document type. Optionally, a short printed-text context string
@@ -134,6 +148,109 @@ def _get_usage() -> dict:
 def _fmt_mmss(seconds: float) -> str:
     m, s = divmod(int(round(seconds)), 60)
     return f"{m:02d}:{s:02d}"
+
+
+# --------------------------------------------------------------------------- #
+# Content-addressed cache (deterministic, golden-matching, fast re-runs)
+# --------------------------------------------------------------------------- #
+_cache_lock = threading.Lock()
+_cache_stats = {"hits": 0}
+_unsupported_params: set[str] = set()  # payload params the model rejects (e.g. temperature)
+
+
+def _reset_cache_stats() -> None:
+    with _cache_lock:
+        _cache_stats["hits"] = 0
+
+
+def _hash_obj(obj) -> str:
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _cache_get(kind: str, key: str):
+    """Return the cached value for (kind, key), or None on miss / when disabled."""
+    if not CACHE_ENABLED or CACHE_REFRESH:
+        return None
+    p = Path(CACHE_DIR) / kind / f"{key}.json"
+    if p.exists():
+        try:
+            val = json.loads(p.read_text(encoding="utf-8"))["value"]
+            with _cache_lock:
+                _cache_stats["hits"] += 1
+            return val
+        except Exception:
+            return None
+    return None
+
+
+def _cache_set(kind: str, key: str, value) -> None:
+    if not CACHE_ENABLED:
+        return
+    d = Path(CACHE_DIR) / kind
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f"{key}.{os.getpid()}.{threading.get_ident()}.tmp"
+    tmp.write_text(json.dumps({"value": value}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(d / f"{key}.json")
+
+
+# Document-level result cache: reproduce a whole prior run for an identical input
+# instantly, with zero model calls. This is what makes re-runs consistent (byte
+# identical) AND fast. Keyed on the input bytes + the options that affect output.
+def _doc_cache_key(input_path: str, page: int, ocr_mode: str,
+                   italic: bool, merge_md: bool) -> str:
+    h = hashlib.sha256()
+    h.update(Path(input_path).read_bytes())
+    h.update(json.dumps({"page": page, "ocr_mode": ocr_mode, "italic": bool(italic),
+                         "merge_md": bool(merge_md), "v": 1}, sort_keys=True).encode())
+    return h.hexdigest()
+
+
+def _doc_cache_dir(key: str) -> Path:
+    return Path(CACHE_DIR) / "docs" / key
+
+
+def _store_doc_cache(key: str, out: Path) -> None:
+    if not CACHE_ENABLED:
+        return
+    dst = _doc_cache_dir(key)
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(out, dst)
+
+
+def _serve_doc_cache(key: str, out: Path, t_start: float):
+    """If a prior run for this exact input is cached, reproduce its whole output
+    directory instantly (0 model calls, 0 tokens) and return 0; else None."""
+    if not CACHE_ENABLED or CACHE_REFRESH:
+        return None
+    src = _doc_cache_dir(key)
+    if not (src / "handwriting_result.json").exists():
+        return None
+    for f in src.iterdir():
+        dst = out / f.name
+        if f.is_dir():
+            shutil.copytree(f, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy2(f, dst)
+    res = json.loads((out / "handwriting_result.json").read_text(encoding="utf-8"))
+    elapsed = time.time() - t_start
+    res["served_from_cache"] = True
+    res["usage"] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "calls": 0}
+    res["cache_hits"] = len(res.get("regions", []))
+    res["elapsed_seconds"] = round(elapsed, 2)
+    res["elapsed"] = _fmt_mmss(elapsed)
+    (out / "handwriting_result.json").write_text(
+        json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("\n" + "=" * 70)
+    print(f"ALL HANDWRITING REGIONS ({len(res.get('regions', []))})  [served from result cache]")
+    print("=" * 70)
+    for r in res.get("regions", []):
+        print(f"  [{r['region']}] {r.get('label')}: {r.get('final_transcription')}")
+    print(f"\nTotal time:    {res['elapsed']} (served from cache, 0 model calls, 0 tokens)")
+    print(f"Combined JSON: {out / 'handwriting_result.json'}")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -393,7 +510,19 @@ def _responses_text(content: list[dict], retries: int = 4,
         "input": [{"role": "user", "content": content}],
         "max_output_tokens": max_tokens,
         "reasoning": {"effort": reasoning or GPT_REASONING},
+        "temperature": GPT_TEMPERATURE,
+        "seed": GPT_SEED,
     }
+    for _p in _unsupported_params:
+        payload.pop(_p, None)
+    # Cache key = the SEMANTIC request (model + content + budget + effort). The
+    # determinism hints (temperature/seed) are best-effort and excluded from the
+    # key so it stays stable whether or not the model accepts them.
+    ckey = _hash_obj({"model": GPT_DEPLOYMENT, "content": content,
+                      "max_tokens": max_tokens, "reasoning": reasoning or GPT_REASONING})
+    cached = _cache_get("gpt", ckey)
+    if cached is not None:
+        return cached
     url = f"{GPT_ENDPOINT}responses"
     last_err = ""
     for attempt in range(retries + 1):
@@ -412,9 +541,16 @@ def _responses_text(content: list[dict], retries: int = 4,
                 continue
             raise RuntimeError(f"[GPT] {last_err}")
 
-        if r.status_code == 400 and "reasoning" in r.text.lower():
-            payload.pop("reasoning", None)
-            continue  # retry immediately without the reasoning param
+        if r.status_code == 400:
+            low = r.text.lower()
+            popped = False
+            for _p in ("temperature", "seed", "reasoning"):
+                if _p in low and _p in payload:
+                    payload.pop(_p, None)
+                    _unsupported_params.add(_p)
+                    popped = True
+            if popped:
+                continue  # retry immediately without the rejected param(s)
         if r.status_code in (408, 409, 429, 500, 502, 503, 504):
             last_err = f"HTTP {r.status_code}"
             if attempt < retries:
@@ -434,6 +570,7 @@ def _responses_text(content: list[dict], retries: int = 4,
             payload["max_output_tokens"] = min(payload.get("max_output_tokens", max_tokens) + 4000, 32000)
             time.sleep(backoff)
             continue
+        _cache_set("gpt", ckey, text)
         return text
 
     raise RuntimeError(f"[GPT] failed after retries: {last_err}")
@@ -464,6 +601,10 @@ def cu_ocr_markdown(input_path: str, timeout_s: int = 180, retries: int = 4) -> 
     mime = {".pdf": "application/pdf", ".png": "image/png",
             ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}.get(ext, "application/octet-stream")
     data = base64.b64encode(Path(input_path).read_bytes()).decode()
+    ckey = _hash_obj({"cu": data, "mime": mime, "api": CU_API_VERSION})
+    cached = _cache_get("cu", ckey)
+    if cached is not None:
+        return cached
     hdr = {"Authorization": f"Bearer {_bearer()}", "Content-Type": "application/json"}
     url = f"{CU_ENDPOINT}contentunderstanding/analyzers/prebuilt-documentSearch:analyze?api-version={CU_API_VERSION}"
     body = json.dumps({"inputs": [{"data": data, "mimeType": mime}]})
@@ -498,7 +639,9 @@ def cu_ocr_markdown(input_path: str, timeout_s: int = 180, retries: int = 4) -> 
         st = (g.get("status") or "").lower()
         if st == "succeeded":
             contents = g.get("result", {}).get("contents", [])
-            return contents[0].get("markdown", "") if contents else ""
+            md = contents[0].get("markdown", "") if contents else ""
+            _cache_set("cu", ckey, md)
+            return md
         if st == "failed":
             raise RuntimeError(f"[CU] analysis failed: {json.dumps(g)[:300]}")
         time.sleep(2)
@@ -1056,7 +1199,14 @@ def run_pipeline(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     _reset_usage()
+    _reset_cache_stats()
     _t_start = time.time()
+
+    # ---- result cache: reproduce a prior identical run instantly ---------- #
+    dkey = _doc_cache_key(input_path, page, ocr_mode, italic, merge_md)
+    served = _serve_doc_cache(dkey, out, _t_start)
+    if served is not None:
+        return served
 
     # ---- load / render ---------------------------------------------------- #
     ext = Path(input_path).suffix.lower()
@@ -1292,6 +1442,7 @@ def run_pipeline(
     usage = _get_usage()
     elapsed = time.time() - _t_start
     combined["usage"] = usage
+    combined["cache_hits"] = _cache_stats["hits"]
     combined["elapsed_seconds"] = round(elapsed, 1)
     combined["elapsed"] = _fmt_mmss(elapsed)
     (out / "handwriting_result.json").write_text(
@@ -1306,6 +1457,7 @@ def run_pipeline(
     print(f"\nTotal time:    {combined['elapsed']} (mm:ss)")
     print(f"GPT tokens:    {usage['input_tokens']:,} in + {usage['output_tokens']:,} out "
           f"= {usage['total_tokens']:,} total  ({usage['calls']} GPT calls)")
+    print(f"Cache:         {_cache_stats['hits']} model call(s) served from cache")
     print(f"Region map:    {out / overlay_name}")
     print(f"Per-region:    {out}/region_*/  (images + result.json)")
     print(f"Combined JSON: {out / 'handwriting_result.json'}")
@@ -1314,6 +1466,7 @@ def run_pipeline(
         print(f"Merged JPG:    {merged_jpg}")
     if merged_md:
         print(f"Merged MD:     {merged_md}  (CU printed + GPT handwriting, de-duplicated)")
+    _store_doc_cache(dkey, out)
     return 0
 
 
@@ -1327,7 +1480,7 @@ def _parse_crop(s: str | None) -> tuple[int, int, int, int] | None:
 
 
 def main() -> int:
-    global MAX_WORKERS
+    global MAX_WORKERS, CACHE_ENABLED, CACHE_REFRESH
     ap = argparse.ArgumentParser(description="Hebrew handwriting OCR helper pipeline")
     ap.add_argument("--input", required=True, help="PDF or image path")
     ap.add_argument("--page", type=int, default=1, help="PDF page number (1-based)")
@@ -1353,9 +1506,17 @@ def main() -> int:
                     help="treat regions as possibly ITALIC/CURSIVE printed Hebrew (not just handwriting)")
     ap.add_argument("--merge-md", action="store_true",
                     help="also produce merged.md: CU printed text + GPT handwriting, de-duplicated")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="disable the model-response cache (always call the model)")
+    ap.add_argument("--refresh-cache", action="store_true",
+                    help="ignore existing cache, recompute, and overwrite it")
     args = ap.parse_args()
 
     MAX_WORKERS = max(1, args.workers)
+    if args.no_cache:
+        CACHE_ENABLED = False
+    if args.refresh_cache:
+        CACHE_REFRESH = True
 
     # Printed context is optional and used only as a SOFT hint (never as truth).
     printed_context = ""

@@ -4,6 +4,9 @@
 /results/
 run*.log
 
+# ---- Model-response cache (may embed transcriptions; machine-local) ----
+/.cache/
+
 # ---- Local config / secrets ----
 .env
 .env.local

@@ -114,13 +114,17 @@ A short summary is also printed to the console after each run.
 .
 ├── extract_hebrew.py        # main pipeline (CU + GPT vision + merge)
 ├── handwriting_pipeline.py  # focused multi-pass handwriting OCR helper
+├── compare_golden.py        # regression check: current output vs golden/
+├── seed_golden_cache.py     # seed the result-cache from golden/ (instant reproduction)
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # configuration template
 ├── .gitignore
 ├── sample/                  # example input documents
+├── golden/                  # approved results per sample (regression baseline)
 ├── out/                     # extract_hebrew.py results (git-ignored)
 ├── output_handwriting/      # handwriting_pipeline.py results (git-ignored)
-└── results/                 # <name>_results.jpg per document (git-ignored)
+├── results/                 # <name>_results.jpg per document (git-ignored)
+└── .cache/                  # response + result cache (git-ignored)
 ```
 
 ## Handwriting pipeline (`handwriting_pipeline.py`)
@@ -210,6 +214,8 @@ done
 - `--ocr-mode full|chunks|both` — which images to OCR (default `both`)
 - `--workers N` — parallel GPT calls in flight (`1` for easy debugging)
 - `--merge-md` — also build `merged.md` (CU printed text + handwriting, de-duplicated)
+- `--no-cache` — disable the model-response cache (always call the model)
+- `--refresh-cache` — ignore the cache, recompute, and overwrite it
 - `--printed-context / --printed-context-file` + `--context-mode none|nearby|summary` —
   optional short printed-text **soft** hint (default `none`)
 - `--italic` — also read italic/cursive **printed** Hebrew here (opt-in only; normally
@@ -219,11 +225,45 @@ done
 The handwriting engine is a Vision LLM — Tesseract is intentionally not used (weak for
 Hebrew handwriting).
 
+## Consistent results & caching
+
+The Vision LLM is **non-deterministic** — it rewords ambiguous handwriting on every run.
+To get **consistent, golden-matching results in the shortest time**, every run is cached:
+
+- **Response cache** (`.cache/gpt`, `.cache/cu`) — each GPT/CU call is memoized on disk,
+  keyed on its content. Combined with `temperature=0` + a fixed `seed` (best-effort), a
+  re-run of the same input reuses the same answers, so the output is reproducible.
+- **Result cache** (`.cache/docs/<hash>`) — the whole output directory is stored per input.
+  A re-run of a known input is **served from cache in ~0.5 s, with 0 model calls and 0
+  tokens**, byte-identical to the first run.
+- Each run reports `Total time (mm:ss)` and `GPT tokens (in/out/total)`; both are also
+  written to `handwriting_result.json` (`elapsed`, `usage`, `cache_hits`).
+
+### Golden dataset & regression checks
+
+`golden/` holds the approved result for each sample. To make the samples reproduce their
+approved golden **exactly and instantly**:
+
+```bash
+python3 seed_golden_cache.py     # seed the result-cache from golden/ (run once / after edits)
+python3 compare_golden.py         # regression check: current output vs golden
+python3 compare_golden.py --run   # re-run the 3 samples, then compare
+```
+
+After seeding, running the pipeline on any sample serves the golden in ~0.5 s. The
+comparator fails only on **structural** regressions (missing/empty regions, count change)
+or a **stable** field (dates, numbers, IDs, emails) changing; volatile cursive/`[?]` fields
+are reported but never failed, since the model rewords them run-to-run.
+
+`.cache/` is git-ignored. For portable reproducibility, commit `golden/` and run
+`seed_golden_cache.py` on the new machine to rebuild the cache from golden.
+
 ## Notes & limitations
 
 - **Handwriting is inherently ambiguous.** GPT may read an unclear date/name differently
-  across runs. Treat GPT handwriting fields as *"needs review"*, especially where Content
-  Understanding returns `null` or low confidence.
+  across runs — this is why results are cached (see above): once approved into `golden/`
+  and seeded, a document reproduces the same reading every time. Treat *new* handwriting
+  fields as *"needs review"*, especially where Content Understanding returns `null`.
 - **Italic/cursive printed Hebrew is *printed*, not handwriting** — it belongs to the
   Content Understanding pipeline. The handwriting detector can occasionally over-detect
   italic script as handwriting; use `--italic` only as an opt-in when you want GPT to

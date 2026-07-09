@@ -116,7 +116,8 @@ def compare_sample(stem: str) -> dict:
         return {"stem": stem, "error": f"no current output ({cpath})"}
 
     golden = _load_regions(gpath)
-    current = _load_regions(cpath)
+    cur_data = json.loads(cpath.read_text(encoding="utf-8"))
+    current = cur_data.get("regions", [])
     pairs, extras = _match(golden, current)
 
     rows, ratios, fails = [], [], 0
@@ -144,6 +145,7 @@ def compare_sample(stem: str) -> dict:
         "golden_count": len(golden), "current_count": len(current),
         "count_fail": count_fail, "avg_ratio": avg, "md_ratio": md_ratio,
         "fails": fails, "verdict": verdict,
+        "usage": cur_data.get("usage"), "elapsed": cur_data.get("elapsed"),
     }
 
 
@@ -166,6 +168,12 @@ def _print_report(res: dict) -> None:
               f"{(ex.get('final_transcription') or '')[:60]!r}")
     md = f"{res['md_ratio']:.2f}" if res["md_ratio"] is not None else "n/a"
     print(f"  avg region similarity: {res['avg_ratio']:.2f}   merged.md similarity: {md}")
+    u = res.get("usage") or {}
+    if u or res.get("elapsed"):
+        tok = (f"{u.get('total_tokens', 0):,} tokens "
+               f"({u.get('input_tokens', 0):,} in / {u.get('output_tokens', 0):,} out, "
+               f"{u.get('calls', 0)} calls)") if u else "n/a"
+        print(f"  time: {res.get('elapsed', 'n/a')}   tokens: {tok}")
     print(f"  VERDICT: {res['verdict']}"
           + (f"  ({res['fails']} structural regression(s))" if res["fails"] else ""))
 

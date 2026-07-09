@@ -67,6 +67,13 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel GPT calls in f
 OCR_REASONING = os.environ.get("OCR_REASONING", GPT_REASONING)       # per-image OCR effort
 OCR_MAX_SIDE = int(os.environ.get("OCR_MAX_SIDE", str(MAX_SEND_SIDE)))  # px cap for OCR images
 
+# #4 Fewer per-image OCR calls at the SAME reasoning (the main no-quality-loss
+# speed lever). Only these enhanced versions are SENT to OCR; all 6 are still
+# built, saved, and shown to the visual-reconcile authority, so accuracy holds.
+# Set OCR_ALL_VERSIONS=1 to OCR every version (old behavior).
+OCR_VERSIONS = ["01_original_crop.png", "02_upscaled_contrast.png", "04_denoised.png"]
+OCR_ALL_VERSIONS = os.environ.get("OCR_ALL_VERSIONS", "0") not in ("", "0", "false", "False")
+
 # Content Understanding (for the printed-text layer used in the merged Markdown).
 CU_ENDPOINT = os.environ.get(
     "CU_ENDPOINT",
@@ -92,6 +99,41 @@ def _bearer() -> str:
         at = _credential.get_token(SCOPE)
         _token_cache[SCOPE] = (at.expires_on, at.token)
         return at.token
+
+
+# --------------------------------------------------------------------------- #
+# Token-usage accounting (thread-safe; GPT Responses API calls only)
+# --------------------------------------------------------------------------- #
+_usage_lock = threading.Lock()
+_usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+
+
+def _reset_usage() -> None:
+    with _usage_lock:
+        _usage.update(input_tokens=0, output_tokens=0, calls=0)
+
+
+def _add_usage(resp: dict) -> None:
+    """Accumulate token usage from a GPT Responses API JSON response."""
+    u = resp.get("usage") or {}
+    it = u.get("input_tokens", u.get("prompt_tokens", 0)) or 0
+    ot = u.get("output_tokens", u.get("completion_tokens", 0)) or 0
+    with _usage_lock:
+        _usage["input_tokens"] += int(it)
+        _usage["output_tokens"] += int(ot)
+        _usage["calls"] += 1
+
+
+def _get_usage() -> dict:
+    with _usage_lock:
+        u = dict(_usage)
+    u["total_tokens"] = u["input_tokens"] + u["output_tokens"]
+    return u
+
+
+def _fmt_mmss(seconds: float) -> str:
+    m, s = divmod(int(round(seconds)), 60)
+    return f"{m:02d}:{s:02d}"
 
 
 # --------------------------------------------------------------------------- #
@@ -382,7 +424,9 @@ def _responses_text(content: list[dict], retries: int = 4,
             raise RuntimeError(f"[GPT] {r.status_code} after retries: {r.text[:200]}")
         if r.status_code != 200:
             raise RuntimeError(f"[GPT] {r.status_code}: {r.text[:400]}")
-        text = _gpt_output_text(r.json())
+        resp_json = r.json()
+        _add_usage(resp_json)
+        text = _gpt_output_text(resp_json)
         if not text.strip() and attempt < retries:
             # 200 but empty output (reasoning consumed the whole budget) -> retry
             # with a larger output budget.
@@ -524,6 +568,37 @@ def _attach_source_images(final: dict, usable: list[dict]) -> None:
             r["source"] for r in usable
             if txt and txt in (r.get("ocr") or {}).get("full_transcription", "")
         ]
+
+
+def _early_exit_transcription(results: list[dict]) -> dict | None:
+    """#5 speed lever: if the per-image reads are short, unmarked, and agree,
+    accept them directly and skip the (expensive) visual-reconcile call.
+
+    Only triggers on easy fields (dates, numbers, single short tokens). Any '[?]'
+    uncertainty, any newline (multi-field), a long value, or weak agreement falls
+    through to full visual adjudication. Returns a final dict or None.
+    """
+    texts = [(r.get("ocr") or {}).get("full_transcription", "") for r in results]
+    texts = [t for t in texts if t and t.strip()]
+    if len(texts) < 2:
+        return None
+    joined = "".join(texts)
+    if "[?]" in joined or "\n" in joined:
+        return None
+    normed = [" ".join(t.split()) for t in texts]
+    top = max(set(normed), key=normed.count)
+    if not top or len(top) > 18:
+        return None
+    if normed.count(top) < max(2, (len(normed) + 1) // 2):
+        return None
+    raw = next(t for t in texts if " ".join(t.split()) == top).strip()
+    return {
+        "final_transcription": raw,
+        "alternative_transcriptions": [],
+        "words": [],
+        "notes": [f"early-exit: {normed.count(top)}/{len(normed)} reads agreed "
+                  "(skipped visual reconcile)"],
+    }
 
 
 def reconcile_ocr_results(results: list[dict], printed_context: str = "") -> dict:
@@ -938,9 +1013,10 @@ def build_merged_jpg(output_dir: str, page_name: str, regions: list[dict], quali
 def prepare_region_images(
     page_img: Image.Image, region: dict, out_dir: str,
     ocr_mode: str, chunk_width: int, overlap: int,
-) -> list[tuple[str, Image.Image]]:
-    """Crop + enhance + chunk a region, save the images, and return the list of
-    (source_name, image) OCR tasks to run (order preserved)."""
+) -> tuple[list[tuple[str, Image.Image]], list[tuple[str, Image.Image]]]:
+    """Crop + enhance + chunk a region and save the images. Returns
+    (ocr_tasks, all_images): ocr_tasks is the reduced set sent to per-image OCR
+    (#4); all_images is the full set kept for the visual-reconcile authority."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     x, y, w, h = region["box"]
@@ -955,12 +1031,16 @@ def prepare_region_images(
     }
     save_outputs(out_dir, chunk_images)
 
-    tasks: list[tuple[str, Image.Image]] = []
+    all_images = list(versions.items()) + list(chunk_images.items())
+    ocr_tasks: list[tuple[str, Image.Image]] = []
     if ocr_mode in ("full", "both"):
-        tasks += list(versions.items())
+        items = list(versions.items())
+        if not OCR_ALL_VERSIONS:
+            items = [(n, im) for n, im in items if n in OCR_VERSIONS]
+        ocr_tasks += items
     if ocr_mode in ("chunks", "both"):
-        tasks += list(chunk_images.items())
-    return tasks
+        ocr_tasks += list(chunk_images.items())
+    return ocr_tasks, all_images
 
 
 # --------------------------------------------------------------------------- #
@@ -975,6 +1055,8 @@ def run_pipeline(
 ) -> int:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    _reset_usage()
+    _t_start = time.time()
 
     # ---- load / render ---------------------------------------------------- #
     ext = Path(input_path).suffix.lower()
@@ -1025,11 +1107,13 @@ def run_pipeline(
     prompt = build_ocr_prompt(printed_context, italic=italic)
     region_dirs = [out / f"region_{i:02d}_{_slug(r.get('label', ''))}"
                    for i, r in enumerate(regions, 1)]
-    region_tasks = [
+    region_prep = [
         prepare_region_images(page_img, region, str(region_dirs[i]),
                               ocr_mode, chunk_width, overlap)
         for i, region in enumerate(regions)
     ]
+    region_tasks = [ocr for ocr, _all in region_prep]         # images sent to per-image OCR (#4)
+    region_images = [allimg for _ocr, allimg in region_prep]  # full image set for visual reconcile
 
     # ---- run ALL vision calls in parallel across ALL regions -------------- #
     flat = [(ri, name, img)
@@ -1079,8 +1163,11 @@ def run_pipeline(
     print("[reconcile] final visual adjudication per region ...")
 
     def _reconcile_region(ri: int) -> dict:
-        imgs = region_tasks[ri]
         res = region_results[ri]
+        early = _early_exit_transcription(res)  # #5: skip reconcile for easy, agreed reads
+        if early is not None:
+            return early
+        imgs = region_images[ri]
         try:  # 1) visual adjudication with images (primary)
             final = visual_reconcile_ocr_results(imgs, res, printed_context)
             final.setdefault("notes", []).append("visual reconciliation")
@@ -1126,7 +1213,7 @@ def run_pipeline(
         (rdir / "per_image_ocr.json").write_text(
             json.dumps(per_image, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        sel = _select_visual_images(region_tasks[i - 1], res)
+        sel = _select_visual_images(region_images[i - 1], res)
         vinput = {
             "printed_context_used": printed_context,
             "selected_images": [n for n, _ in sel],
@@ -1163,8 +1250,8 @@ def run_pipeline(
         "source": input_path, "page": page,
         "region_map": overlay_name, "regions": all_results,
     }
-    (out / "handwriting_result.json").write_text(
-        json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
+    # handwriting_result.json is written AFTER the merge step below so the token
+    # totals include the merge call and the elapsed time covers the whole run.
 
     # ---- merged doc: handwriting (red) over printed page ------------------- #
     cu_markdown = ""
@@ -1201,13 +1288,25 @@ def run_pipeline(
         except Exception as exc:
             print(f"[merge] markdown failed: {exc}", file=sys.stderr)
 
+    # ---- usage + timing --------------------------------------------------- #
+    usage = _get_usage()
+    elapsed = time.time() - _t_start
+    combined["usage"] = usage
+    combined["elapsed_seconds"] = round(elapsed, 1)
+    combined["elapsed"] = _fmt_mmss(elapsed)
+    (out / "handwriting_result.json").write_text(
+        json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
+
     # ---- summary ---------------------------------------------------------- #
     print("\n" + "=" * 70)
     print(f"ALL HANDWRITING REGIONS ({len(all_results)})")
     print("=" * 70)
     for r in all_results:
         print(f"  [{r['region']}] {r.get('label')}: {r.get('final_transcription')}")
-    print(f"\nRegion map:    {out / overlay_name}")
+    print(f"\nTotal time:    {combined['elapsed']} (mm:ss)")
+    print(f"GPT tokens:    {usage['input_tokens']:,} in + {usage['output_tokens']:,} out "
+          f"= {usage['total_tokens']:,} total  ({usage['calls']} GPT calls)")
+    print(f"Region map:    {out / overlay_name}")
     print(f"Per-region:    {out}/region_*/  (images + result.json)")
     print(f"Combined JSON: {out / 'handwriting_result.json'}")
     print(f"Merged doc:    {merged}  (handwriting in RED over the printed page)")

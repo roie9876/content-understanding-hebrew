@@ -92,6 +92,7 @@ CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
 # re-runs of the same document (--refresh-cache recomputes + overwrites).
 GPT_TEMPERATURE = float(os.environ.get("GPT_TEMPERATURE", "0"))
 GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
+GPT_READ_TIMEOUT = int(os.environ.get("GPT_READ_TIMEOUT", "90"))  # per-call read timeout (s); stuck calls retry fast
 CACHE_DIR = os.environ.get("PIPELINE_CACHE_DIR", ".cache")
 CACHE_ENABLED = os.environ.get("PIPELINE_CACHE", "0") not in ("", "0", "false", "False")
 CACHE_REFRESH = False  # set by --refresh-cache: recompute and overwrite cache
@@ -545,7 +546,7 @@ def _responses_text(content: list[dict], retries: int = 4,
                 url,
                 headers={"Authorization": f"Bearer {_bearer()}", "Content-Type": "application/json"},
                 data=json.dumps(payload),
-                timeout=180,
+                timeout=GPT_READ_TIMEOUT,
             )
         except requests.exceptions.RequestException as exc:  # timeout / connection reset
             last_err = f"request error: {exc}"

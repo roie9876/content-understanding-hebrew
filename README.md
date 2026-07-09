@@ -254,6 +254,22 @@ Intelligence (`prebuilt-read`) on the same crops: it is 100% deterministic but i
 Hebrew handwriting (reads the printed body, garbles the cursive, sim ~0.1–0.4). A
 deterministic engine trades too much accuracy, so GPT voting wins.
 
+### Speed vs quality
+
+Measured on `אישור` (8 regions, cache off, 16 workers):
+
+| Setting | Time | Cursive quality |
+|---|---|---|
+| **medium reasoning** (default) | ~5–6 min | best — no empty/garbled fields |
+| `OCR_REASONING=low` | ~2 min | degrades: some cursive fields go empty/garbled |
+| `OCR_REASONING=low VOTE_SEEDS=5` | ~4 min | partially recovers, still below medium |
+
+The bottleneck is **per-call reasoning latency**, not parallelism (crops already run in
+parallel up to `--workers`). Lowering reasoning is the only large speedup, but it costs
+cursive accuracy — so **medium is the default**. `GPT_READ_TIMEOUT` (default 90 s) caps a
+stuck call so it retries fast, taming worst-case tail latency. Speed/quality knobs:
+`OCR_REASONING`, `VOTE_SEEDS`, `--workers`, `GPT_READ_TIMEOUT`.
+
 ### Reproducibility & speed (caching)
 
 - **Response cache** (`.cache/gpt`, `.cache/cu`) — **off by default**, so every run recomputes

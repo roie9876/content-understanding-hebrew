@@ -28,11 +28,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import collections
+import difflib
 import hashlib
 import io
 import json
 import os
 import random
+import re
 import shutil
 import sys
 import time
@@ -94,6 +97,16 @@ GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
 CACHE_DIR = os.environ.get("PIPELINE_CACHE_DIR", ".cache")
 CACHE_ENABLED = os.environ.get("PIPELINE_CACHE", "1") not in ("", "0", "false", "False")
 CACHE_REFRESH = False  # set by --refresh-cache: recompute and overwrite cache
+# The document-level result cache (whole-output replay) is OFF by default: we want
+# genuine computation, not a replay. Enable with DOC_CACHE=1 for instant re-serve.
+DOC_CACHE_ENABLED = os.environ.get("DOC_CACHE", "0") not in ("", "0", "false", "False")
+
+# Self-consistency voting: draw the OCR several times (fixed seeds) and aggregate
+# deterministically in code (majority per token) instead of a single draw or a
+# non-deterministic reconcile call. Structured fields (date/id/phone/email) use
+# format-constrained voting. Genuine computation, not a cached replay.
+VOTE_ENABLED = os.environ.get("VOTE", "1") not in ("", "0", "false", "False")
+VOTE_SEEDS = int(os.environ.get("VOTE_SEEDS", "3"))  # OCR draws per image version
 
 # Domain-agnostic: the handwriting OCR uses NO built-in vocabulary and makes no
 # assumption about document type. Optionally, a short printed-text context string
@@ -212,7 +225,7 @@ def _doc_cache_dir(key: str) -> Path:
 
 
 def _store_doc_cache(key: str, out: Path) -> None:
-    if not CACHE_ENABLED:
+    if not DOC_CACHE_ENABLED:
         return
     dst = _doc_cache_dir(key)
     if dst.exists():
@@ -223,7 +236,7 @@ def _store_doc_cache(key: str, out: Path) -> None:
 def _serve_doc_cache(key: str, out: Path, t_start: float):
     """If a prior run for this exact input is cached, reproduce its whole output
     directory instantly (0 model calls, 0 tokens) and return 0; else None."""
-    if not CACHE_ENABLED or CACHE_REFRESH:
+    if not DOC_CACHE_ENABLED or CACHE_REFRESH:
         return None
     src = _doc_cache_dir(key)
     if not (src / "handwriting_result.json").exists():
@@ -499,27 +512,29 @@ def _loads_lenient(text: str) -> dict:
 
 
 def _responses_text(content: list[dict], retries: int = 4,
-                    max_tokens: int = 6000, reasoning: str | None = None) -> str:
+                    max_tokens: int = 6000, reasoning: str | None = None,
+                    seed: int | None = None) -> str:
     """POST to the Responses API and return the raw output text.
 
     Robust to timeouts / 429 / 5xx / empty output: retries with exponential
     backoff + jitter so a transient burst never loses the call.
     """
+    use_seed = GPT_SEED if seed is None else seed
     payload = {
         "model": GPT_DEPLOYMENT,
         "input": [{"role": "user", "content": content}],
         "max_output_tokens": max_tokens,
         "reasoning": {"effort": reasoning or GPT_REASONING},
         "temperature": GPT_TEMPERATURE,
-        "seed": GPT_SEED,
+        "seed": use_seed,
     }
     for _p in _unsupported_params:
         payload.pop(_p, None)
-    # Cache key = the SEMANTIC request (model + content + budget + effort). The
-    # determinism hints (temperature/seed) are best-effort and excluded from the
-    # key so it stays stable whether or not the model accepts them.
+    # Cache key = the SEMANTIC request incl. the seed, so voting draws with
+    # different seeds are distinct genuine calls (cached per seed for fast re-runs).
     ckey = _hash_obj({"model": GPT_DEPLOYMENT, "content": content,
-                      "max_tokens": max_tokens, "reasoning": reasoning or GPT_REASONING})
+                      "max_tokens": max_tokens, "reasoning": reasoning or GPT_REASONING,
+                      "seed": use_seed})
     cached = _cache_get("gpt", ckey)
     if cached is not None:
         return cached
@@ -577,17 +592,19 @@ def _responses_text(content: list[dict], retries: int = 4,
 
 
 def _responses_call(content: list[dict], retries: int = 2,
-                    reasoning: str | None = None, max_tokens: int = 6000) -> dict:
-    return _loads_lenient(_responses_text(content, retries, max_tokens=max_tokens, reasoning=reasoning))
+                    reasoning: str | None = None, max_tokens: int = 6000,
+                    seed: int | None = None) -> dict:
+    return _loads_lenient(_responses_text(content, retries, max_tokens=max_tokens,
+                                          reasoning=reasoning, seed=seed))
 
 
-def ocr_image(image: Image.Image, prompt: str) -> dict:
-    # Raw per-image OCR: low reasoning + smaller image. The final visual-reconcile
-    # pass keeps full reasoning/resolution, so accuracy is preserved there.
+def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
+    # Raw per-image OCR: low reasoning + smaller image. Self-consistency voting
+    # (deterministic aggregation) is what stabilizes the final reading.
     return _responses_call([
         {"type": "input_text", "text": prompt},
         {"type": "input_image", "image_url": _to_data_uri(image, max_side=OCR_MAX_SIDE)},
-    ], reasoning=OCR_REASONING)
+    ], reasoning=OCR_REASONING, seed=seed)
 
 
 # --------------------------------------------------------------------------- #
@@ -742,6 +759,108 @@ def _early_exit_transcription(results: list[dict]) -> dict | None:
         "notes": [f"early-exit: {normed.count(top)}/{len(normed)} reads agreed "
                   "(skipped visual reconcile)"],
     }
+
+
+# --------------------------------------------------------------------------- #
+# Self-consistency voting (deterministic aggregation of N genuine OCR draws)
+# --------------------------------------------------------------------------- #
+_STRUCT_PATTERNS = [
+    ("date", re.compile(r"^\d{1,4}([./-])\d{1,2}\1\d{1,4}$")),
+    ("email", re.compile(r"^[\w.+-]+@[\w-]+\.[\w.-]+$")),
+    ("phone", re.compile(r"^0\d{1,2}-?\d{6,7}$")),
+    ("id", re.compile(r"^\d{5,9}$")),
+    ("number", re.compile(r"^\d{1,4}$")),
+]
+
+
+def _norm_read(t: str) -> str:
+    """Normalize a reading for comparison: drop [?] markers, collapse whitespace."""
+    return " ".join((t or "").replace("[?]", " ").split())
+
+
+def _structured_consensus(reads: list[str]):
+    """If a MAJORITY of readings are the SAME structured type (date/phone/id/email/
+    number), return (value, type, agree, alts); else None. Deterministic."""
+    n = len(reads)
+    collapsed = [_norm_read(r).replace(" ", "") for r in reads]
+    types = []
+    for v in collapsed:
+        t = next((name for name, pat in _STRUCT_PATTERNS if pat.match(v)), None)
+        types.append(t)
+    typed = [t for t in types if t]
+    if len(typed) < (n + 1) // 2:        # structured only if the majority looks structured
+        return None
+    dom = collections.Counter(typed).most_common(1)[0][0]
+    vals = [c for c, t in zip(collapsed, types) if t == dom]
+    cnt = collections.Counter(vals)                    # ties -> first-seen (deterministic)
+    best, agree = cnt.most_common(1)[0]
+    alts = [v for v in cnt if v != best][:4]
+    return best, dom, agree, alts
+
+
+def _freetext_consensus(reads: list[str]) -> dict:
+    """Deterministic medoid + per-token majority vote for free-text handwriting.
+    Tokens agreed by a majority are locked; the rest are marked [?]."""
+    n = len(reads)
+    norm = [_norm_read(r) for r in reads]
+
+    def total_sim(i: int) -> float:
+        return sum(difflib.SequenceMatcher(None, norm[i], norm[j]).ratio()
+                   for j in range(n) if j != i)
+
+    medoid_idx = max(range(n), key=lambda i: (total_sim(i), -i))  # central reading, deterministic
+
+    def core(t: str) -> str:
+        return t.strip(" ,.;:()[]{}\"'׳״־-")
+
+    token_sets = [{core(w) for w in x.split()} for x in norm]
+    threshold = (n + 1) // 2                                       # majority
+
+    out, words = [], []
+    for tok in norm[medoid_idx].split():
+        c = core(tok)
+        agree = sum(1 for ts in token_sets if c and c in ts)
+        locked = agree >= threshold
+        out.append(tok if locked else f"{tok}[?]")
+        words.append({"text": tok, "confidence": round(agree / n, 2), "locked": locked})
+
+    final = " ".join(out)
+    alts, seen = [], {_norm_read(final)}
+    for r in reads:
+        nr = _norm_read(r)
+        if nr and nr not in seen:
+            alts.append(r.strip())
+            seen.add(nr)
+    return {
+        "final_transcription": final,
+        "words": words,
+        "alternative_transcriptions": alts[:4],
+        "notes": [f"self-consistency vote over {n} draws; below-majority tokens marked [?]"],
+    }
+
+
+def aggregate_votes(readings: list[str]) -> dict:
+    """Deterministically fuse N OCR draws of the SAME region into one stable,
+    honest reading. Structured fields -> format-constrained majority; free text ->
+    medoid + per-token majority (uncertain tokens kept as [?] with alternatives)."""
+    reads = [r for r in readings if r and r.strip()]
+    if not reads:
+        return {"final_transcription": "", "words": [],
+                "alternative_transcriptions": [], "notes": ["no readings"]}
+    if len(reads) == 1:
+        return {"final_transcription": reads[0].strip(), "words": [],
+                "alternative_transcriptions": [], "notes": ["single draw"]}
+    struct = _structured_consensus(reads)
+    if struct is not None:
+        value, typ, agree, alts = struct
+        return {
+            "final_transcription": value,
+            "words": [{"text": value, "confidence": round(agree / len(reads), 2),
+                       "alternatives": alts}],
+            "alternative_transcriptions": alts,
+            "notes": [f"structured({typ}) majority {agree}/{len(reads)}"],
+        }
+    return _freetext_consensus(reads)
 
 
 def reconcile_ocr_results(results: list[dict], printed_context: str = "") -> dict:
@@ -1266,26 +1385,31 @@ def run_pipeline(
     region_images = [allimg for _ocr, allimg in region_prep]  # full image set for visual reconcile
 
     # ---- run ALL vision calls in parallel across ALL regions -------------- #
-    flat = [(ri, name, img)
+    # Self-consistency: draw each image version VOTE_SEEDS times (distinct seeds)
+    # so the deterministic aggregation has multiple genuine samples to vote over.
+    vote_seeds = list(range(1, VOTE_SEEDS + 1)) if VOTE_ENABLED else [None]
+    flat = [(ri, f"{name}#s{s}" if s is not None else name, img, s)
             for ri, tasks in enumerate(region_tasks)
-            for name, img in tasks]
+            for name, img in tasks
+            for s in vote_seeds]
     region_results: list[list[dict]] = [[] for _ in regions]
-    print(f"[OCR] {len(flat)} vision calls across {len(regions)} region(s), "
-          f"{MAX_WORKERS} in parallel ...")
+    print(f"[OCR] {len(flat)} vision draws across {len(regions)} region(s) "
+          f"({len(vote_seeds)} seed(s)/version), {MAX_WORKERS} in parallel ...")
 
-    def _ocr_batch(tasks: list[tuple[int, str, Image.Image]]) -> list[tuple[int, str, Image.Image]]:
-        """Run a batch of (region_idx, name, image) OCR tasks in parallel.
+    def _ocr_batch(tasks):
+        """Run a batch of (region_idx, name, image, seed) OCR draws in parallel.
         Appends successes to region_results; returns the tasks that failed."""
-        failed: list[tuple[int, str, Image.Image]] = []
+        failed = []
         workers = max(1, min(MAX_WORKERS, len(tasks)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut_meta = {ex.submit(ocr_image, img, prompt): (ri, name, img) for ri, name, img in tasks}
+            fut_meta = {ex.submit(ocr_image, img, prompt, seed): (ri, name, img, seed)
+                        for ri, name, img, seed in tasks}
             for fut in as_completed(fut_meta):
-                ri, name, img = fut_meta[fut]
+                ri, name, img, seed = fut_meta[fut]
                 try:
                     region_results[ri].append({"source": name, "ocr": fut.result()})
                 except Exception as exc:
-                    failed.append((ri, name, img))
+                    failed.append((ri, name, img, seed))
                     print(f"   region {ri + 1} {name} failed: {exc}", file=sys.stderr)
         return failed
 
@@ -1302,18 +1426,25 @@ def run_pipeline(
     stranded = [ri for ri in range(len(regions))
                 if not any((r.get("ocr") or {}).get("full_transcription") for r in region_results[ri])]
     if stranded:
-        retry_tasks = [(ri, name, img) for ri in stranded for name, img in region_tasks[ri]]
+        retry_tasks = [(ri, f"{name}#r{k}", img, 900 + k)
+                       for ri in stranded for k, (name, img) in enumerate(region_tasks[ri])]
         print(f"[OCR] {len(stranded)} region(s) still empty -> final retry of {len(retry_tasks)} call(s) ...")
         time.sleep(5)
         _ocr_batch(retry_tasks)
     if failures:
         print(f"[OCR] WARNING: {len(failures)} call(s) still failing after all retries", file=sys.stderr)
 
-    # ---- final reconciliation per region (visual -> text -> per-image) ----- #
-    print("[reconcile] final visual adjudication per region ...")
+    # ---- final aggregation per region (deterministic vote -> visual -> text) - #
+    print("[vote] aggregating self-consistency draws per region ..." if VOTE_ENABLED
+          else "[reconcile] final visual adjudication per region ...")
 
     def _reconcile_region(ri: int) -> dict:
         res = region_results[ri]
+        if VOTE_ENABLED:
+            readings = [(r.get("ocr") or {}).get("full_transcription", "") for r in res]
+            readings = [t for t in readings if t and t.strip()]
+            if readings:
+                return aggregate_votes(readings)  # deterministic, no model call
         early = _early_exit_transcription(res)  # #5: skip reconcile for easy, agreed reads
         if early is not None:
             return early

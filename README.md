@@ -116,6 +116,8 @@ A short summary is also printed to the console after each run.
 ├── handwriting_pipeline.py  # focused multi-pass handwriting OCR helper
 ├── compare_golden.py        # regression check: current output vs golden/
 ├── seed_golden_cache.py     # seed the result-cache from golden/ (instant reproduction)
+├── exp_determinism.py       # stability probe: single-draw vs self-consistency vote
+├── azure_ocr_benchmark.py   # Azure Document Intelligence vs GPT-voting benchmark
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # configuration template
 ├── .gitignore
@@ -225,19 +227,43 @@ done
 The handwriting engine is a Vision LLM — Tesseract is intentionally not used (weak for
 Hebrew handwriting).
 
-## Consistent results & caching
+## Consistency: self-consistency voting (deterministic where the input allows)
 
-The Vision LLM is **non-deterministic** — it rewords ambiguous handwriting on every run.
-To get **consistent, golden-matching results in the shortest time**, every run is cached:
+The Vision LLM is **non-deterministic** on ambiguous handwriting. Rather than replay a
+cached guess, the pipeline computes a **stable, honest** result on every run via
+**self-consistency voting**:
+
+1. Each region is drawn **N times** (3 image versions × `VOTE_SEEDS`=3 fixed seeds = 9
+   genuine OCR draws).
+2. The draws are aggregated **deterministically in code** (no model call):
+   - **Structured fields** (date / phone / id / email / number) → format-constrained
+     majority vote. These are **truly deterministic + correct** (measured: date & numbers
+     1 distinct across fresh sessions, similarity 1.00).
+   - **Free text** → medoid + per-token majority: agreed tokens **lock**, the rest are
+     kept as `[?]` with alternatives.
+
+Measured on the free-text-heavy `אישור` sample (cache off, 3 fresh sessions): single draws
+were 9–12 of 12 distinct (chaos); the **vote lifts cross-session similarity to 0.5–0.8** and
+locks the readable skeleton (`3 מפתחות … מים`), flagging only the genuinely-ambiguous words
+`[?]`. That is the honest ceiling — genuinely-ambiguous cursive can't be made byte-identical
+across fresh draws, but it is never a different fabrication each run. `VOTE=0` restores the
+old (non-deterministic) reconcile path; `VOTE_SEEDS` sets the draws per version.
+
+**Why not a deterministic OCR engine?** `azure_ocr_benchmark.py` benchmarks Azure Document
+Intelligence (`prebuilt-read`) on the same crops: it is 100% deterministic but inaccurate on
+Hebrew handwriting (reads the printed body, garbles the cursive, sim ~0.1–0.4). A
+deterministic engine trades too much accuracy, so GPT voting wins.
+
+### Reproducibility & speed (caching)
 
 - **Response cache** (`.cache/gpt`, `.cache/cu`) — each GPT/CU call is memoized on disk,
-  keyed on its content. Combined with `temperature=0` + a fixed `seed` (best-effort), a
-  re-run of the same input reuses the same answers, so the output is reproducible.
-- **Result cache** (`.cache/docs/<hash>`) — the whole output directory is stored per input.
-  A re-run of a known input is **served from cache in ~0.5 s, with 0 model calls and 0
-  tokens**, byte-identical to the first run.
-- Each run reports `Total time (mm:ss)` and `GPT tokens (in/out/total)`; both are also
-  written to `handwriting_result.json` (`elapsed`, `usage`, `cache_hits`).
+  keyed on its content **and seed**, so the N voting draws are distinct genuine calls and a
+  **re-run of the same document reuses them → byte-identical result, 0 new tokens**.
+- **Result cache** (`.cache/docs`, opt-in with `DOC_CACHE=1`) — stores the whole output dir
+  per input for instant re-serve. **Off by default** (we want genuine computation).
+- Each run reports `Total time (mm:ss)` and `GPT tokens (in/out/total)`; both are written to
+  `handwriting_result.json` (`elapsed`, `usage`, `cache_hits`). `--no-cache` bypasses,
+  `--refresh-cache` recomputes.
 
 ### Golden dataset & regression checks
 

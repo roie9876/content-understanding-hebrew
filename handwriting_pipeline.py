@@ -772,6 +772,15 @@ _STRUCT_PATTERNS = [
     ("number", re.compile(r"^\d{1,4}$")),
 ]
 
+# High-specificity types that we lock even if only a plurality of draws read them
+# cleanly (a valid email/date/phone is a strong signal; free-text voting mangles
+# them by splitting on @/./-). Only used when the match dominates the reading.
+_STRUCT_SUBSTR = [
+    ("email", re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")),
+    ("date", re.compile(r"\d{1,4}[./-]\d{1,2}[./-]\d{1,4}")),
+    ("phone", re.compile(r"0\d{1,2}-?\d{6,7}")),
+]
+
 
 def _norm_read(t: str) -> str:
     """Normalize a reading for comparison: drop [?] markers, collapse whitespace."""
@@ -779,14 +788,28 @@ def _norm_read(t: str) -> str:
 
 
 def _structured_consensus(reads: list[str]):
-    """If a MAJORITY of readings are the SAME structured type (date/phone/id/email/
-    number), return (value, type, agree, alts); else None. Deterministic."""
+    """If the readings are the SAME structured value (date/phone/id/email/number),
+    return (value, type, agree, alts); else None. Deterministic.
+
+    (a) High-specificity email/date/phone are locked on a plurality of clean draws
+        (when the match dominates the reading). (b) Plain number/id require a
+        majority of whole-value matches."""
     n = len(reads)
+    for typ, pat in _STRUCT_SUBSTR:
+        hits = []
+        for r in reads:
+            nr = _norm_read(r)
+            m = pat.search(nr.replace(" ", ""))
+            if m and len(m.group(0)) >= 0.5 * max(1, len(nr.replace(" ", ""))):
+                hits.append(m.group(0))
+        if len(hits) >= max(2, n // 4):
+            cnt = collections.Counter(hits)
+            best, agree = cnt.most_common(1)[0]
+            return best, typ, agree, [v for v in cnt if v != best][:4]
+
     collapsed = [_norm_read(r).replace(" ", "") for r in reads]
-    types = []
-    for v in collapsed:
-        t = next((name for name, pat in _STRUCT_PATTERNS if pat.match(v)), None)
-        types.append(t)
+    types = [next((name for name, pat in _STRUCT_PATTERNS if pat.match(v)), None)
+             for v in collapsed]
     typed = [t for t in types if t]
     if len(typed) < (n + 1) // 2:        # structured only if the majority looks structured
         return None

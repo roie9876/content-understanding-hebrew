@@ -1,5 +1,8 @@
 # ---- Generated output (contains extracted PII: names, IDs, transcriptions) ----
 /out/
+/output_handwriting/
+/results/
+run*.log
 
 # ---- Local config / secrets ----
 .env

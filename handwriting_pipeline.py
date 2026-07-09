@@ -59,6 +59,14 @@ SCOPE = "https://cognitiveservices.azure.com/.default"
 MAX_SEND_SIDE = int(os.environ.get("MAX_SEND_SIDE", "3000"))  # cap px sent to LLM
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel GPT calls in flight
 
+# Speed knobs (OPT-IN). Defaults preserve full quality: per-image OCR keeps the
+# same reasoning/resolution as before. Set OCR_REASONING=low and/or OCR_MAX_SIDE
+# smaller to trade some accuracy for speed on easy documents. (Measured: low
+# reasoning noticeably degrades hard Hebrew handwriting, so it is NOT the default.)
+# The always-on free win is CU running concurrently with region OCR (run_pipeline).
+OCR_REASONING = os.environ.get("OCR_REASONING", GPT_REASONING)       # per-image OCR effort
+OCR_MAX_SIDE = int(os.environ.get("OCR_MAX_SIDE", str(MAX_SEND_SIDE)))  # px cap for OCR images
+
 # Content Understanding (for the printed-text layer used in the merged Markdown).
 CU_ENDPOINT = os.environ.get(
     "CU_ENDPOINT",
@@ -387,15 +395,18 @@ def _responses_text(content: list[dict], retries: int = 4,
     raise RuntimeError(f"[GPT] failed after retries: {last_err}")
 
 
-def _responses_call(content: list[dict], retries: int = 2) -> dict:
-    return _loads_lenient(_responses_text(content, retries))
+def _responses_call(content: list[dict], retries: int = 2,
+                    reasoning: str | None = None, max_tokens: int = 6000) -> dict:
+    return _loads_lenient(_responses_text(content, retries, max_tokens=max_tokens, reasoning=reasoning))
 
 
 def ocr_image(image: Image.Image, prompt: str) -> dict:
+    # Raw per-image OCR: low reasoning + smaller image. The final visual-reconcile
+    # pass keeps full reasoning/resolution, so accuracy is preserved there.
     return _responses_call([
         {"type": "input_text", "text": prompt},
-        {"type": "input_image", "image_url": _to_data_uri(image)},
-    ])
+        {"type": "input_image", "image_url": _to_data_uri(image, max_side=OCR_MAX_SIDE)},
+    ], reasoning=OCR_REASONING)
 
 
 # --------------------------------------------------------------------------- #
@@ -979,6 +990,14 @@ def run_pipeline(
     page_img.save(out / page_name)
     print(f"Rendered page -> {out / page_name}  (size {page_img.width}x{page_img.height} px)")
 
+    # ---- kick off Content Understanding early (overlaps region OCR) -------- #
+    cu_executor = None
+    cu_future = None
+    if merge_md:
+        print("[CU] starting Content Understanding OCR in background (overlaps region OCR) ...")
+        cu_executor = ThreadPoolExecutor(max_workers=1)
+        cu_future = cu_executor.submit(cu_ocr_markdown, input_path)
+
     # ---- determine regions ------------------------------------------------ #
     regions: list[dict] = []
     if auto_detect:
@@ -1149,12 +1168,15 @@ def run_pipeline(
 
     # ---- merged doc: handwriting (red) over printed page ------------------- #
     cu_markdown = ""
-    if merge_md:
+    if merge_md and cu_future is not None:
         try:
-            print(f"[CU] running Content Understanding OCR for merged Markdown ...")
-            cu_markdown = cu_ocr_markdown(input_path)
+            print("[CU] collecting background Content Understanding result ...")
+            cu_markdown = cu_future.result()
         except Exception as exc:
             print(f"[CU] OCR failed: {exc}", file=sys.stderr)
+        finally:
+            if cu_executor is not None:
+                cu_executor.shutdown(wait=False)
     if not cu_markdown:
         cu_json = Path("out/result.json")
         if cu_json.exists():

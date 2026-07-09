@@ -1,0 +1,101 @@
+{
+  "source": "sample/חוזר מכר - דף ראשון.png",
+  "page": 1,
+  "region_map": "page_1_regions.png",
+  "regions": [
+    {
+      "region": 1,
+      "folder": "region_01_blue_handwritten_note_in",
+      "label": "blue handwritten note in top right margin",
+      "box": [
+        309,
+        0,
+        466,
+        93
+      ],
+      "final_transcription": "בסד[?]",
+      "words": [
+        {
+          "text": "בסד[?]",
+          "confidence": 0.59,
+          "alternatives": [
+            "בסד",
+            "בטל",
+            "בטון"
+          ],
+          "reason": "נראים שלושה סימנים בכתב יד; הימני דומה ל-ב, האמצעי ללולאה של ס, והשמאלי יכול להתפרש כ-ד אך אינו חד.",
+          "source_images": [
+            "01_original_crop.png"
+          ]
+        }
+      ],
+      "notes": [
+        "הכיתוב הידני קטן וחיוור מאוד.",
+        "יש דמיון חזותי ל'בסד' כקיצור מקובל, אך האות האחרונה אינה ודאית.",
+        "לא נראים בבירור גרשיים/גרש.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 2,
+      "folder": "region_02_blue_handwritten_phone_n",
+      "label": "blue handwritten phone number",
+      "box": [
+        342,
+        364,
+        369,
+        73
+      ],
+      "final_transcription": "058329",
+      "words": [
+        {
+          "text": "058329",
+          "confidence": 0.84,
+          "alternatives": [
+            "052329",
+            "058328"
+          ],
+          "reason": "Single handwritten numeric entry; middle digit looks more like 8 than 2, and final digit appears as 9 though slightly faint.",
+          "source_images": [
+            "04_denoised.png",
+            "06_optional_line_removed.png"
+          ]
+        }
+      ],
+      "notes": [
+        "The handwritten content is numeric, not Hebrew letters.",
+        "Leftmost 0 is slightly clipped/faint in some versions.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 3,
+      "folder": "region_03_blue_handwritten_email_a",
+      "label": "blue handwritten email address",
+      "box": [
+        450,
+        446,
+        227,
+        69
+      ],
+      "final_transcription": "bi2504@gmail.com[?]",
+      "words": [
+        {
+          "text": "bi2504@gmail.com[?]",
+          "confidence": 0.63,
+          "alternatives": [
+            "bi25040@gmail.com",
+            "bi2so4@gmail.com"
+          ],
+          "reason": "@gmail.com is visually clear; the username begins like 'bi2' and most likely continues '504', but the middle strokes are faint.",
+          "source_images": []
+        }
+      ],
+      "notes": [
+        "Handwriting is a Latin-character email address, not Hebrew script.",
+        "The domain appears clearly as gmail.com across the enhanced versions.",
+        "visual reconciliation"
+      ]
+    }
+  ]
+}

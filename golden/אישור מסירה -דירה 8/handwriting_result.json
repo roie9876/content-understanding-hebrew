@@ -1,0 +1,480 @@
+{
+  "source": "sample/אישור מסירה -דירה 8.pdf",
+  "page": 1,
+  "region_map": "page_1_regions.png",
+  "regions": [
+    {
+      "region": 1,
+      "folder": "region_01_date",
+      "label": "date",
+      "box": [
+        228,
+        406,
+        1843,
+        380
+      ],
+      "final_transcription": "1.1.2026",
+      "words": [
+        {
+          "text": "1.1.2026",
+          "confidence": 0.77,
+          "alternatives": [
+            "11.1.2026"
+          ],
+          "reason": "The year 2026 and the second separator are clear. On the left, there is one tall '1' and another clear '1'; the small middle mark looks more like a separator/pen artifact on the underline than a full extra digit.",
+          "source_images": [
+            "01_original_crop.png",
+            "02_upscaled_contrast.png",
+            "06_optional_line_removed.png",
+            "04_denoised.png",
+            "05_thickened_strokes.png",
+            "03_adaptive_threshold.png"
+          ]
+        }
+      ],
+      "notes": [
+        "Handwriting is numeric date entry next to the printed label תאריך.",
+        "The first separator is partly merged with the underline, creating ambiguity with 11.1.2026.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 2,
+      "folder": "region_02_handwritten_number_4",
+      "label": "handwritten number 4",
+      "box": [
+        321,
+        736,
+        763,
+        365
+      ],
+      "final_transcription": "4 4",
+      "words": [
+        {
+          "text": "4",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "Upper handwritten mark is clearly the numeral 4 with triangular top and vertical downstroke.",
+          "source_images": [
+            "01_original_crop.png",
+            "04_denoised.png",
+            "03_adaptive_threshold.png",
+            "02_upscaled_contrast.png",
+            "05_thickened_strokes.png",
+            "06_optional_line_removed.png"
+          ]
+        },
+        {
+          "text": "4",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "Lower handwritten mark is also clearly the numeral 4, matching the same stroke pattern.",
+          "source_images": [
+            "01_original_crop.png",
+            "04_denoised.png",
+            "03_adaptive_threshold.png",
+            "02_upscaled_contrast.png",
+            "05_thickened_strokes.png",
+            "06_optional_line_removed.png"
+          ]
+        }
+      ],
+      "notes": [
+        "The visible handwriting consists of two separate numeric marks, not Hebrew letters.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 3,
+      "folder": "region_03_handwritten_number_4",
+      "label": "handwritten number 4",
+      "box": [
+        321,
+        831,
+        763,
+        374
+      ],
+      "final_transcription": "4\n4",
+      "words": [
+        {
+          "text": "4",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "Upper handwritten mark is clearly the numeral 4.",
+          "source_images": [
+            "02_upscaled_contrast.png",
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "04_denoised.png",
+            "06_optional_line_removed.png",
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "4",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "Lower handwritten mark is clearly the numeral 4.",
+          "source_images": [
+            "02_upscaled_contrast.png",
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "04_denoised.png",
+            "06_optional_line_removed.png",
+            "05_thickened_strokes.png"
+          ]
+        }
+      ],
+      "notes": [
+        "The handwriting appears to be numerals rather than Hebrew letters.",
+        "There are two separate handwritten entries on two different lines.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 4,
+      "folder": "region_04_handwritten_number_8",
+      "label": "handwritten number 8",
+      "box": [
+        1371,
+        702,
+        732,
+        350
+      ],
+      "final_transcription": "8\nעמינדב",
+      "words": [
+        {
+          "text": "8",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "Single clear numeral on the upper line.",
+          "source_images": [
+            "06_optional_line_removed.png",
+            "03_adaptive_threshold.png",
+            "01_original_crop.png",
+            "04_denoised.png",
+            "05_thickened_strokes.png",
+            "02_upscaled_contrast.png"
+          ]
+        },
+        {
+          "text": "עמינדב",
+          "confidence": 0.8,
+          "alternatives": [
+            "עמנואל[?]",
+            "עמוד[?]"
+          ],
+          "reason": "Lower word visually fits ע-מ-י-נ-ד-ב; long descending middle stroke supports נ and left end looks like דב.",
+          "source_images": [
+            "03_adaptive_threshold.png",
+            "04_denoised.png"
+          ]
+        }
+      ],
+      "notes": [
+        "Printed context appears to be a street field, which is compatible with עמינדב but the reading is based on the handwriting.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 5,
+      "folder": "region_05_short_handwritten_Hebrew",
+      "label": "short handwritten Hebrew entry",
+      "box": [
+        705,
+        792,
+        1831,
+        350
+      ],
+      "final_transcription": "8 4\nעמינדב 4",
+      "words": [
+        {
+          "text": "8",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "clear handwritten numeral with two loops",
+          "source_images": [
+            "02_upscaled_contrast.png",
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "04_denoised.png",
+            "06_optional_line_removed.png",
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "4",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "clear handwritten numeral in upper-left field",
+          "source_images": [
+            "02_upscaled_contrast.png",
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "04_denoised.png",
+            "06_optional_line_removed.png",
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "עמינדב",
+          "confidence": 0.76,
+          "alternatives": [
+            "עמנואל[?]",
+            "אלנבי[?]"
+          ],
+          "reason": "letter sequence visually fits ע-מ-י-נ-ד-ב; long descending נ and leftmost ב are visible",
+          "source_images": [
+            "04_denoised.png",
+            "06_optional_line_removed.png"
+          ]
+        },
+        {
+          "text": "4",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "clear handwritten numeral in lower-left field",
+          "source_images": [
+            "02_upscaled_contrast.png",
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "04_denoised.png",
+            "06_optional_line_removed.png",
+            "05_thickened_strokes.png"
+          ]
+        }
+      ],
+      "notes": [
+        "There are multiple separate handwritten fields in the crop; transcription is given top-to-bottom, and within each line right-to-left.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 6,
+      "folder": "region_06_short_handwritten_Hebrew",
+      "label": "short handwritten Hebrew note",
+      "box": [
+        1834,
+        1095,
+        734,
+        321
+      ],
+      "final_transcription": "על דבר",
+      "words": [
+        {
+          "text": "על",
+          "confidence": 0.69,
+          "alternatives": [
+            "אל"
+          ],
+          "reason": "נראית למ״ד גבוהה וברורה; האות הימנית נראית יותר כע׳ אך יכולה להיקרא גם א׳.",
+          "source_images": [
+            "04_denoised.png"
+          ]
+        },
+        {
+          "text": "דבר",
+          "confidence": 0.8,
+          "alternatives": [
+            "דבר[?]"
+          ],
+          "reason": "שלוש אותיות נפרדות משמאל: ד׳ קטנה דמוית 3, אחריה ב׳, ולבסוף ר׳ מעוגלת.",
+          "source_images": [
+            "06_optional_line_removed.png",
+            "04_denoised.png"
+          ]
+        }
+      ],
+      "notes": [
+        "הקריאה מבוססת בעיקר על הצורה החזותית; ההקשר המודפס לא שימש להשלמה.",
+        "המילה הראשונה מעט מסופקת בגלל דמיון בין א׳ לע׳ בכתב היד.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 7,
+      "folder": "region_07_long_handwritten_Hebrew_",
+      "label": "long handwritten Hebrew note line 1",
+      "box": [
+        554,
+        1335,
+        2344,
+        410
+      ],
+      "final_transcription": "3 מפתחות לדלת[?] כניסה[?]",
+      "words": [
+        {
+          "text": "3",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "ספרה 3 ברורה מאוד בצד ימין.",
+          "source_images": [
+            "03_adaptive_threshold.png",
+            "01_original_crop.png",
+            "05_thickened_strokes.png",
+            "04_denoised.png",
+            "02_upscaled_contrast.png",
+            "06_optional_line_removed.png"
+          ]
+        },
+        {
+          "text": "מפתחות",
+          "confidence": 0.86,
+          "alternatives": [
+            "מפתח[?]"
+          ],
+          "reason": "המילה הארוכה על הקו נראית תואמת למבנה של מפתחות.",
+          "source_images": [
+            "03_adaptive_threshold.png",
+            "01_original_crop.png",
+            "04_denoised.png",
+            "02_upscaled_contrast.png",
+            "06_optional_line_removed.png"
+          ]
+        },
+        {
+          "text": "לדלת[?]",
+          "confidence": 0.38,
+          "alternatives": [
+            "לדירה[?]"
+          ],
+          "reason": "אחרי מפתחות יש מילה קצרה עם תחילת ל׳ גבוהה, אך האותיות חופפות לטקסט מודפס.",
+          "source_images": [
+            "01_original_crop.png",
+            "04_denoised.png"
+          ]
+        },
+        {
+          "text": "כניסה[?]",
+          "confidence": 0.29,
+          "alternatives": [
+            "[?]"
+          ],
+          "reason": "האשכול השמאלי יכול להתאים לכניסה, אבל הקווים מסובכים ולא חד-משמעיים.",
+          "source_images": [
+            "01_original_crop.png",
+            "04_denoised.png"
+          ]
+        }
+      ],
+      "notes": [
+        "שתי המילים השמאליות אינן ודאיות בגלל חפיפה עם הטקסט המודפס והסתבכות קווים.",
+        "visual reconciliation"
+      ]
+    },
+    {
+      "region": 8,
+      "folder": "region_08_long_handwritten_Hebrew_",
+      "label": "long handwritten Hebrew note line 2",
+      "box": [
+        437,
+        1504,
+        2519,
+        498
+      ],
+      "final_transcription": "3 מפתחות\nסניטריה (מודי[?] קרמיקה), גז, מחמם[?] מים",
+      "words": [
+        {
+          "text": "3",
+          "confidence": 0.99,
+          "alternatives": [],
+          "reason": "ספרה ברורה בראש השורה העליונה.",
+          "source_images": [
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "02_upscaled_contrast.png",
+            "04_denoised.png",
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "מפתחות",
+          "confidence": 0.95,
+          "alternatives": [],
+          "reason": "צורת האותיות מתאימה היטב למילה מפתחות.",
+          "source_images": [
+            "01_original_crop.png",
+            "03_adaptive_threshold.png",
+            "02_upscaled_contrast.png",
+            "04_denoised.png",
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "סניטריה",
+          "confidence": 0.77,
+          "alternatives": [
+            "סנטריה[?]"
+          ],
+          "reason": "המבנה הכללי והאות הפותחת דומים מאוד לסניטריה.",
+          "source_images": [
+            "01_original_crop.png",
+            "04_denoised.png"
+          ]
+        },
+        {
+          "text": "מודי[?]",
+          "confidence": 0.33,
+          "alternatives": [
+            "אור[?]",
+            "אלוני[?]"
+          ],
+          "reason": "המילה הראשונה בסוגריים נראית כשם ספק/מותג אך האותיות מטושטשות.",
+          "source_images": [
+            "04_denoised.png"
+          ]
+        },
+        {
+          "text": "קרמיקה",
+          "confidence": 0.74,
+          "alternatives": [],
+          "reason": "רצף האותיות בתוך הסוגריים מתאים לקרמיקה.",
+          "source_images": [
+            "01_original_crop.png",
+            "02_upscaled_contrast.png",
+            "04_denoised.png"
+          ]
+        },
+        {
+          "text": "גז",
+          "confidence": 0.91,
+          "alternatives": [],
+          "reason": "מילה קצרה וברורה אחרי הפסיק.",
+          "source_images": [
+            "01_original_crop.png",
+            "02_upscaled_contrast.png",
+            "04_denoised.png",
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "מחמם[?]",
+          "confidence": 0.55,
+          "alternatives": [
+            "מונה[?]",
+            "מטבח[?]"
+          ],
+          "reason": "המילה שלפני מים נראית כ-מחמם אך הכתב מחובר ולא חד.",
+          "source_images": [
+            "05_thickened_strokes.png"
+          ]
+        },
+        {
+          "text": "מים",
+          "confidence": 0.84,
+          "alternatives": [],
+          "reason": "נראות שתי ממים עם יוד קטנה ביניהן, מתאים למים.",
+          "source_images": [
+            "03_adaptive_threshold.png",
+            "05_thickened_strokes.png"
+          ]
+        }
+      ],
+      "notes": [
+        "השם בסוגריים אינו קריא בוודאות מלאה ונראה כשם של ספק קרמיקה.",
+        "המילה שלפני מים אינה חד-משמעית; מחמם הוא הקריאה הסבירה ביותר.",
+        "visual reconciliation"
+      ]
+    }
+  ]
+}

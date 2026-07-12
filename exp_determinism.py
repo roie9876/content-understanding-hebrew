@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stability probe on אישור (free-text heavy): single-draw vs vote, all regions.
 
-For every golden region, run M independent sessions of K fresh OCR draws (cache
-OFF), aggregate each session with the deterministic voter, and report how stable
+For every golden region, run M independent sessions of K fresh OCR draws,
+aggregate each session with the deterministic voter, and report how stable
 the VOTE is across sessions vs the single-draw variance.
 """
 import itertools
@@ -11,8 +11,6 @@ import difflib
 from concurrent.futures import ThreadPoolExecutor
 
 import handwriting_pipeline as hp
-
-hp.CACHE_ENABLED = False  # genuine calls, no replay
 
 INP = "sample/אישור מסירה -דירה 8.pdf"
 K, M = 4, 3  # draws per session, independent sessions

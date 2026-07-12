@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import functools
 import json
 import re
 import subprocess
@@ -83,27 +84,44 @@ def _load_regions(result_json: Path) -> list[dict]:
 
 
 def _match(golden: list[dict], current: list[dict]):
-    """Greedy nearest-center matching. Returns (pairs, extras) where pairs is a
-    list of (golden_region, current_region_or_None) and extras are unmatched
-    current regions."""
-    used: set[int] = set()
-    pairs: list[tuple[dict, dict | None]] = []
-    for g in golden:
-        gc = _center(g["box"])
-        best_d, best_i = None, None
-        for ci, c in enumerate(current):
-            if ci in used:
+    """Globally minimize center distance so overlapping boxes cannot cross-match."""
+    if not golden or not current:
+        return [(region, None) for region in golden], list(current)
+
+    costs = []
+    for golden_region in golden:
+        gx, gy = _center(golden_region["box"])
+        costs.append([
+            (gx - cx) ** 2 + (gy - cy) ** 2
+            for cx, cy in (_center(current_region["box"]) for current_region in current)
+        ])
+
+    @functools.lru_cache(maxsize=None)
+    def assign(golden_index: int, used_mask: int):
+        if golden_index == len(golden):
+            return 0.0, ()
+        choices = []
+        for current_index in range(len(current)):
+            if used_mask & (1 << current_index):
                 continue
-            cc = _center(c["box"])
-            d = (gc[0] - cc[0]) ** 2 + (gc[1] - cc[1]) ** 2
-            if best_d is None or d < best_d:
-                best_d, best_i = d, ci
-        if best_i is not None:
-            used.add(best_i)
-            pairs.append((g, current[best_i]))
-        else:
-            pairs.append((g, None))
-    extras = [c for ci, c in enumerate(current) if ci not in used]
+            tail_cost, tail = assign(golden_index + 1, used_mask | (1 << current_index))
+            choices.append((costs[golden_index][current_index] + tail_cost,
+                            (current_index,) + tail))
+        if not choices:
+            return float("inf"), ()
+        return min(choices, key=lambda choice: choice[0])
+
+    matched_count = min(len(golden), len(current))
+    if len(golden) <= len(current) and len(current) <= 15:
+        _cost, assignment = assign(0, 0)
+    else:
+        assignment = tuple(range(matched_count))
+    used = set(assignment)
+    pairs = [
+        (region, current[assignment[index]] if index < len(assignment) else None)
+        for index, region in enumerate(golden)
+    ]
+    extras = [region for index, region in enumerate(current) if index not in used]
     return pairs, extras
 
 
@@ -127,9 +145,9 @@ def _status(golden_text: str, current_text: str | None, stable: bool) -> tuple[s
     return ("DIVERGED", r, True)             # stable field genuinely changed -> fail
 
 
-def compare_sample(stem: str) -> dict:
+def compare_sample(stem: str, current_result: Path | None = None) -> dict:
     gpath = GOLDEN_DIR / stem / "handwriting_result.json"
-    cpath = OUTPUT_DIR / stem / "handwriting_result.json"
+    cpath = current_result or OUTPUT_DIR / stem / "handwriting_result.json"
     if not gpath.exists():
         return {"stem": stem, "error": f"no golden ({gpath})"}
     if not cpath.exists():
@@ -227,6 +245,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Regression check vs golden baseline.")
     ap.add_argument("--run", action="store_true", help="re-run the 3 samples before comparing")
     ap.add_argument("--update-golden", action="store_true", help="snapshot current output as golden")
+    ap.add_argument("--result", type=Path, help="score one saved handwriting_result.json")
+    ap.add_argument("--golden-stem", choices=[sample["stem"] for sample in SAMPLES],
+                    help="golden sample used with --result")
+    ap.add_argument("--json", action="store_true", help="print machine-readable report")
     args = ap.parse_args()
 
     if args.update_golden:
@@ -234,6 +256,16 @@ def main() -> int:
         return 0
     if args.run:
         _run_samples()
+
+    if args.result:
+        if not args.golden_stem:
+            ap.error("--result requires --golden-stem")
+        result = compare_sample(args.golden_stem, args.result)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        else:
+            _print_report(result)
+        return 1 if result.get("verdict") == "FAIL" or result.get("error") else 0
 
     results = [compare_sample(s["stem"]) for s in SAMPLES]
     for res in results:

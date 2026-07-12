@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>InkSight Document Intelligence</title>
+  <script>
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("scoutTheme");
+      const theme =
+        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <link rel="stylesheet" href="/styles.css?v=20260712-4" />
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <script src="/app.js?v=20260712-4" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="InkSight home">
+        <span class="brand-mark" aria-hidden="true"><i data-lucide="scan-text"></i></span>
+        <span>InkSight</span>
+      </a>
+      <div class="topbar-actions">
+        <span class="engine-state"><span class="pulse-dot"></span>Azure AI connected</span>
+        <button class="icon-button" id="themeButton" type="button" title="Switch theme" aria-label="Switch theme">
+          <i data-lucide="sun-moon"></i>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="upload-view" id="uploadView">
+        <div class="upload-heading">
+          <span class="eyebrow">DOCUMENT INTELLIGENCE</span>
+          <h1>Read every layer.</h1>
+          <p>Printed Hebrew, handwriting, structure, and confidence in one review workspace.</p>
+        </div>
+        <form class="drop-zone" id="uploadForm">
+          <input id="fileInput" name="document" type="file" accept=".pdf,.png,.jpg,.jpeg" hidden />
+          <div class="upload-icon"><i data-lucide="file-up"></i></div>
+          <div>
+            <strong>Drop a document here</strong>
+            <span>PDF, PNG, or JPEG · up to 100 MB</span>
+          </div>
+          <label class="model-picker">
+            <span>Vision model</span>
+            <select id="modelSelect" name="model_profile">
+              <option value="gpt-5.4" selected>GPT-5.4</option>
+              <option value="gpt-5.4-pro">GPT-5.4 Pro · medium reasoning (experimental, slower)</option>
+              <option value="gpt-5.6-luna">GPT-5.6 Luna (experimental)</option>
+              <option value="gpt-5.6-sol">GPT-5.6 Sol · low reasoning (experimental)</option>
+              <option value="gpt-5.6-sol-medium">GPT-5.6 Sol · medium reasoning (experimental, slower)</option>
+            </select>
+          </label>
+          <button class="primary-button" id="browseButton" type="button">
+            <i data-lucide="folder-open"></i><span>Choose document</span>
+          </button>
+        </form>
+        <p class="error-banner" id="uploadError" role="alert" hidden></p>
+        <section class="saved-runs" aria-labelledby="savedRunsTitle">
+          <div class="saved-runs-header">
+            <div>
+              <span class="eyebrow">LOCAL HISTORY</span>
+              <h2 id="savedRunsTitle">Saved analyses</h2>
+            </div>
+            <button class="icon-button" id="refreshRunsButton" type="button" title="Refresh saved analyses" aria-label="Refresh saved analyses">
+              <i data-lucide="refresh-cw"></i>
+            </button>
+          </div>
+          <div class="saved-runs-list" id="savedRunsList">
+            <div class="saved-runs-empty">Loading saved analyses…</div>
+          </div>
+        </section>
+      </section>
+
+      <section class="selection-view" id="selectionView" hidden>
+        <div class="selection-header">
+          <div class="document-identity">
+            <button class="icon-button" id="selectionBackButton" type="button" title="Choose another document" aria-label="Choose another document">
+              <i data-lucide="arrow-left"></i>
+            </button>
+            <div class="file-glyph"><i data-lucide="files"></i></div>
+            <div class="document-copy">
+              <h1 id="selectionFileName">Document</h1>
+              <span class="status-detail" id="selectionPageCount">0 pages</span>
+            </div>
+          </div>
+          <button class="primary-button" id="analyzeSelectedButton" type="button" title="Analyze selected pages" aria-label="Analyze selected pages">
+            <i data-lucide="sparkles"></i><span>Analyze selected</span>
+          </button>
+        </div>
+
+        <div class="selection-toolbar">
+          <label class="page-range-field">
+            <span>Pages</span>
+            <input id="pageRangeInput" type="text" inputmode="numeric" placeholder="1,3-5" aria-label="Pages to analyze" />
+          </label>
+          <button class="secondary-button" id="applyRangeButton" type="button">
+            <i data-lucide="check"></i><span>Apply</span>
+          </button>
+          <div class="selection-divider"></div>
+          <button class="secondary-button" id="selectAllButton" type="button">Select all</button>
+          <button class="secondary-button" id="clearSelectionButton" type="button">Clear</button>
+          <strong class="selection-count" id="selectionCount">0 selected</strong>
+        </div>
+
+        <p class="error-banner selection-error" id="selectionError" role="alert" hidden></p>
+
+        <div class="selection-layout">
+          <article class="page-preview-panel">
+            <div class="panel-header">
+              <div><span class="panel-kicker">PREVIEW</span><h2 id="previewPageLabel">Page 1</h2></div>
+              <button class="icon-button" id="previewOpenButton" type="button" title="Open page preview" aria-label="Open page preview">
+                <i data-lucide="maximize-2"></i>
+              </button>
+            </div>
+            <div class="page-preview-canvas">
+              <img id="selectionPreviewImage" alt="Document page preview" />
+            </div>
+          </article>
+          <aside class="thumbnail-panel">
+            <div class="sidebar-title"><span>Document pages</span><span id="thumbnailPageCount">0</span></div>
+            <div class="thumbnail-grid" id="thumbnailGrid"></div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="workspace" id="workspace" hidden>
+        <div class="document-header">
+          <div class="document-identity">
+            <button class="icon-button" id="newDocumentButton" type="button" title="New document" aria-label="New document">
+              <i data-lucide="arrow-left"></i>
+            </button>
+            <div class="file-glyph"><i data-lucide="file-text"></i></div>
+            <div class="document-copy">
+              <h1 id="fileName">Document</h1>
+              <div class="status-line"><span class="status-dot"></span><span id="statusMessage">Preparing document</span></div>
+              <span class="status-detail" id="statusDetail"></span>
+            </div>
+          </div>
+          <button class="secondary-button danger-button" id="cancelButton" type="button">
+            <i data-lucide="square"></i><span>Stop</span>
+          </button>
+        </div>
+
+        <div class="progress-track" aria-label="Document progress">
+          <span id="progressBar"></span>
+        </div>
+
+        <div class="metrics-strip">
+          <div class="metric"><span>Pages</span><strong id="pagesMetric">0 / 0</strong></div>
+          <div class="metric"><span>Model</span><strong id="modelMetric">GPT-5.4</strong></div>
+          <div class="metric"><span>Current stage</span><strong id="stageMetric">Queued</strong></div>
+          <div class="metric"><span>Total tokens</span><strong id="tokensMetric">0</strong></div>
+          <div class="metric"><span>Model calls</span><strong id="callsMetric">0</strong></div>
+          <div class="metric"><span>Total time</span><strong id="timeMetric">00:00</strong></div>
+        </div>
+
+        <div class="analysis-layout">
+          <aside class="page-sidebar">
+            <div class="sidebar-title"><span>Pages</span><span id="pageCountLabel">0</span></div>
+            <div class="page-list" id="pageList"></div>
+          </aside>
+
+          <section class="comparison-workspace">
+            <article class="viewer-panel">
+              <div class="panel-header">
+                <div><span class="panel-kicker">SOURCE</span><h2>Original page</h2></div>
+                <button class="icon-button" id="sourceOpenButton" type="button" title="Open original page" aria-label="Open original page">
+                  <i data-lucide="maximize-2"></i>
+                </button>
+              </div>
+              <div class="document-canvas" id="sourceCanvas">
+                <div class="canvas-empty"><i data-lucide="loader-circle"></i><span>Rendering source page</span></div>
+                <img id="sourceImage" alt="Original document page" hidden />
+              </div>
+            </article>
+
+            <div class="workspace-splitter" id="workspaceSplitter" role="separator" aria-label="Resize source and analysis panels" aria-orientation="vertical" aria-valuemin="20" aria-valuemax="80" aria-valuenow="50" tabindex="0">
+              <span aria-hidden="true"></span>
+            </div>
+
+            <article class="viewer-panel result-panel">
+              <div class="panel-header result-header">
+                <div><span class="panel-kicker">ANALYSIS</span><h2>Processed page</h2></div>
+                <div class="page-metrics">
+                  <span><i data-lucide="coins"></i><b id="pageTokens">0</b> tokens</span>
+                  <span><i data-lucide="timer"></i><b id="pageTime">--:--</b></span>
+                </div>
+              </div>
+              <div class="stage-tabs" role="tablist" aria-label="Analysis stage">
+                <button class="stage-tab active" type="button" data-view="content" role="tab" aria-selected="true">
+                  <i data-lucide="layout-template"></i><span>Content Understanding</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="detection" role="tab" aria-selected="false">
+                  <i data-lucide="scan"></i><span>Detection</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="candidates" role="tab" aria-selected="false">
+                  <i data-lucide="list-tree"></i><span>Candidates</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="decision" role="tab" aria-selected="false">
+                  <i data-lucide="git-compare-arrows"></i><span>Decision</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="handwriting" role="tab" aria-selected="false">
+                  <i data-lucide="scan-line"></i><span>Overlay</span><span class="red-key">Aa</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="merged" role="tab" aria-selected="false">
+                  <i data-lucide="file-output"></i><span>Merged document</span><span class="red-key">Aa</span>
+                </button>
+                <button class="stage-tab icon-tab" type="button" data-view="logs" role="tab" aria-selected="false" title="Page processing log" aria-label="Page processing log">
+                  <i data-lucide="terminal"></i>
+                </button>
+              </div>
+              <div class="document-canvas result-canvas" id="resultCanvas">
+                <div class="canvas-empty" id="resultEmpty"><i data-lucide="sparkles"></i><span id="resultEmptyText">Waiting for Content Understanding</span></div>
+                <pre class="content-output" id="contentOutput" dir="rtl" hidden></pre>
+                <iframe id="handwritingFrame" title="Handwriting analysis result" hidden></iframe>
+                <iframe id="mergedDocumentFrame" title="Merged printed and handwritten document" hidden></iframe>
+                <img id="regionsImage" alt="Detected handwriting regions" hidden />
+                <div class="admin-output" id="adminOutput" hidden></div>
+              </div>
+            </article>
+          </section>
+        </div>
+
+        <p class="error-banner workspace-error" id="jobError" role="alert" hidden></p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

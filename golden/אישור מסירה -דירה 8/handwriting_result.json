@@ -259,36 +259,18 @@
         734,
         321
       ],
-      "final_transcription": "על דבר",
+      "final_transcription": "גולדברג",
       "words": [
         {
-          "text": "על",
-          "confidence": 0.69,
-          "alternatives": [
-            "אל"
-          ],
-          "reason": "נראית למ״ד גבוהה וברורה; האות הימנית נראית יותר כע׳ אך יכולה להיקרא גם א׳.",
-          "source_images": [
-            "04_denoised.png"
-          ]
-        },
-        {
-          "text": "דבר",
-          "confidence": 0.8,
-          "alternatives": [
-            "דבר[?]"
-          ],
-          "reason": "שלוש אותיות נפרדות משמאל: ד׳ קטנה דמוית 3, אחריה ב׳, ולבסוף ר׳ מעוגלת.",
-          "source_images": [
-            "06_optional_line_removed.png",
-            "04_denoised.png"
-          ]
+          "text": "גולדברג",
+          "confidence": 1.0,
+          "alternatives": [],
+          "reason": "Human-verified transcription from the source document.",
+          "source_images": []
         }
       ],
       "notes": [
-        "הקריאה מבוססת בעיקר על הצורה החזותית; ההקשר המודפס לא שימש להשלמה.",
-        "המילה הראשונה מעט מסופקת בגלל דמיון בין א׳ לע׳ בכתב היד.",
-        "visual reconciliation"
+        "Human-verified golden transcription."
       ]
     },
     {
@@ -301,65 +283,18 @@
         2344,
         410
       ],
-      "final_transcription": "3 מפתחות לדלת[?] כניסה[?]",
+      "final_transcription": "3 מפתחות לדירה / של חניה, 2 מפתח ת.ד",
       "words": [
         {
-          "text": "3",
-          "confidence": 0.99,
+          "text": "3 מפתחות לדירה / של חניה, 2 מפתח ת.ד",
+          "confidence": 1.0,
           "alternatives": [],
-          "reason": "ספרה 3 ברורה מאוד בצד ימין.",
-          "source_images": [
-            "03_adaptive_threshold.png",
-            "01_original_crop.png",
-            "05_thickened_strokes.png",
-            "04_denoised.png",
-            "02_upscaled_contrast.png",
-            "06_optional_line_removed.png"
-          ]
-        },
-        {
-          "text": "מפתחות",
-          "confidence": 0.86,
-          "alternatives": [
-            "מפתח[?]"
-          ],
-          "reason": "המילה הארוכה על הקו נראית תואמת למבנה של מפתחות.",
-          "source_images": [
-            "03_adaptive_threshold.png",
-            "01_original_crop.png",
-            "04_denoised.png",
-            "02_upscaled_contrast.png",
-            "06_optional_line_removed.png"
-          ]
-        },
-        {
-          "text": "לדלת[?]",
-          "confidence": 0.38,
-          "alternatives": [
-            "לדירה[?]"
-          ],
-          "reason": "אחרי מפתחות יש מילה קצרה עם תחילת ל׳ גבוהה, אך האותיות חופפות לטקסט מודפס.",
-          "source_images": [
-            "01_original_crop.png",
-            "04_denoised.png"
-          ]
-        },
-        {
-          "text": "כניסה[?]",
-          "confidence": 0.29,
-          "alternatives": [
-            "[?]"
-          ],
-          "reason": "האשכול השמאלי יכול להתאים לכניסה, אבל הקווים מסובכים ולא חד-משמעיים.",
-          "source_images": [
-            "01_original_crop.png",
-            "04_denoised.png"
-          ]
+          "reason": "Human-verified transcription from the source document.",
+          "source_images": []
         }
       ],
       "notes": [
-        "שתי המילים השמאליות אינן ודאיות בגלל חפיפה עם הטקסט המודפס והסתבכות קווים.",
-        "visual reconciliation"
+        "Human-verified golden transcription."
       ]
     },
     {
@@ -372,108 +307,25 @@
         2519,
         498
       ],
-      "final_transcription": "3 מפתחות\nסניטריה (מודי[?] קרמיקה), גז, מחמם[?] מים",
+      "final_transcription": "מפתח הכניסה לדירה\nסניטריה (עוז קרמיקה), בניית, מחמם מים",
       "words": [
         {
-          "text": "3",
-          "confidence": 0.99,
+          "text": "מפתח הכניסה לדירה",
+          "confidence": 1.0,
           "alternatives": [],
-          "reason": "ספרה ברורה בראש השורה העליונה.",
-          "source_images": [
-            "01_original_crop.png",
-            "03_adaptive_threshold.png",
-            "02_upscaled_contrast.png",
-            "04_denoised.png",
-            "05_thickened_strokes.png"
-          ]
+          "reason": "Human-verified transcription from the source document.",
+          "source_images": []
         },
         {
-          "text": "מפתחות",
-          "confidence": 0.95,
+          "text": "סניטריה (עוז קרמיקה), בניית, מחמם מים",
+          "confidence": 1.0,
           "alternatives": [],
-          "reason": "צורת האותיות מתאימה היטב למילה מפתחות.",
-          "source_images": [
-            "01_original_crop.png",
-            "03_adaptive_threshold.png",
-            "02_upscaled_contrast.png",
-            "04_denoised.png",
-            "05_thickened_strokes.png"
-          ]
-        },
-        {
-          "text": "סניטריה",
-          "confidence": 0.77,
-          "alternatives": [
-            "סנטריה[?]"
-          ],
-          "reason": "המבנה הכללי והאות הפותחת דומים מאוד לסניטריה.",
-          "source_images": [
-            "01_original_crop.png",
-            "04_denoised.png"
-          ]
-        },
-        {
-          "text": "מודי[?]",
-          "confidence": 0.33,
-          "alternatives": [
-            "אור[?]",
-            "אלוני[?]"
-          ],
-          "reason": "המילה הראשונה בסוגריים נראית כשם ספק/מותג אך האותיות מטושטשות.",
-          "source_images": [
-            "04_denoised.png"
-          ]
-        },
-        {
-          "text": "קרמיקה",
-          "confidence": 0.74,
-          "alternatives": [],
-          "reason": "רצף האותיות בתוך הסוגריים מתאים לקרמיקה.",
-          "source_images": [
-            "01_original_crop.png",
-            "02_upscaled_contrast.png",
-            "04_denoised.png"
-          ]
-        },
-        {
-          "text": "גז",
-          "confidence": 0.91,
-          "alternatives": [],
-          "reason": "מילה קצרה וברורה אחרי הפסיק.",
-          "source_images": [
-            "01_original_crop.png",
-            "02_upscaled_contrast.png",
-            "04_denoised.png",
-            "05_thickened_strokes.png"
-          ]
-        },
-        {
-          "text": "מחמם[?]",
-          "confidence": 0.55,
-          "alternatives": [
-            "מונה[?]",
-            "מטבח[?]"
-          ],
-          "reason": "המילה שלפני מים נראית כ-מחמם אך הכתב מחובר ולא חד.",
-          "source_images": [
-            "05_thickened_strokes.png"
-          ]
-        },
-        {
-          "text": "מים",
-          "confidence": 0.84,
-          "alternatives": [],
-          "reason": "נראות שתי ממים עם יוד קטנה ביניהן, מתאים למים.",
-          "source_images": [
-            "03_adaptive_threshold.png",
-            "05_thickened_strokes.png"
-          ]
+          "reason": "Human-verified transcription from the source document.",
+          "source_images": []
         }
       ],
       "notes": [
-        "השם בסוגריים אינו קריא בוודאות מלאה ונראה כשם של ספק קרמיקה.",
-        "המילה שלפני מים אינה חד-משמעית; מחמם הוא הקריאה הסבירה ביותר.",
-        "visual reconciliation"
+        "Human-verified golden transcription."
       ]
     }
   ]

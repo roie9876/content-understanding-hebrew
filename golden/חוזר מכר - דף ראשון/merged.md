@@ -20,11 +20,11 @@
 
 **לבין:**
 
-טל׳: <span style="color:#d00">058329</span>
+טל׳: <span style="color:#d00">058328</span>
 
 מרח׳
 
-מייל: <span style="color:#d00">bi2504@gmail.com[?]</span>
+מייל: <span style="color:#d00">bi2504@gmail.com</span>
 
 שניהם ביחד ובערבות הדדית וכל  
 אחד לחוד (להלן: "הרוכש" או  

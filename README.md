@@ -6,7 +6,7 @@ Azure AI engines together:
 | Engine | Role |
 | --- | --- |
 | **Azure AI Content Understanding** | OCR of printed Hebrew + layout + structured field extraction, with confidence scores |
-| **Azure OpenAI GPT vision** (`gpt-5.4`) | Reads Hebrew **handwriting** (which classic OCR does not support) and separates printed vs handwritten text |
+| **Azure OpenAI GPT vision** (`gpt-5.4`, `gpt-5.6-luna`, or `gpt-5.6-sol`) | Reads Hebrew **handwriting** (which classic OCR does not support) and separates printed vs handwritten text |
 
 The two outputs are merged side-by-side so you can compare how each engine read the document.
 
@@ -21,7 +21,7 @@ The two outputs are merged side-by-side so you can compare how each engine read 
 flowchart LR
     A[Scanned PDF] --> B[Render page to PNG<br/>PyMuPDF]
     A --> C[Content Understanding<br/>custom analyzer]
-    B --> D[GPT-5.4 vision<br/>Responses API]
+    B --> D[GPT-5.x vision<br/>Responses API]
     C --> E[Printed text + fields<br/>+ confidence]
     D --> F[Handwritten text + fields]
     E & F --> G[out/result.json]
@@ -36,6 +36,56 @@ flowchart LR
   - an **Azure OpenAI** resource with a vision model deployment (`Cognitive Services OpenAI User`)
 
 Authentication is **Microsoft Entra ID only** — no API keys are stored in the repo.
+
+## Web UI
+
+The local review workspace supports document upload, live page/stage progress, page-level
+token and timing metrics, and side-by-side inspection of the original page against both
+Content Understanding and the final red handwriting overlay.
+
+```bash
+pip install -r requirements.txt
+az login
+python app.py
+```
+
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Temporary uploads are kept under
+`.ui_data/`. Every analysis is saved under `analysis_results/` using the original filename
+and local start time, for example `document.pdf__2026-07-12_10-30-45/`. Each run contains
+all page artifacts plus a `run.json` manifest and is excluded from Git because results may
+contain PII.
+
+The upload screen lists completed local analyses. Selecting one reopens the full source,
+detection, candidates, decision, final overlay, and logs without calling Azure again. Saved
+runs are restored from their manifests whenever the server starts.
+
+The UI hides Content Understanding's internal Markdown comments and figure descriptions while
+preserving the raw artifact on disk. Every upload performs fresh Azure analysis; OCR responses,
+Content Understanding responses, and completed document results are never replayed.
+
+For PDFs, upload is followed by a page-selection workspace before any Azure analysis
+starts. Users can inspect page previews, click individual page thumbnails, select all
+or clear the selection, or enter lists/ranges such as `1,3-5`. Only selected pages are
+scheduled and billed, while their original document page numbers are preserved in the
+results and combined Markdown.
+Multi-page uploads process two pages concurrently by default. The existing eight-worker
+OCR budget is divided between them, so handwriting still uses the same medium reasoning,
+full image resolution, enhancement views, and self-consistency voting. Tune with
+`PAGE_CONCURRENCY` and `MAX_WORKERS`; set `PAGE_CONCURRENCY=1` to restore sequential page
+processing. Each job also writes a persistent `.ui_data/outputs/<job-id>/pipeline.log`.
+
+The page workspace exposes the complete analysis trail for administrators:
+
+- **Content Understanding** appears as soon as its background call completes.
+- **Detection** lists every handwriting region with its page coordinates and numbered overlay.
+- **Candidates** updates after each vision draw and groups alternate readings by region.
+- **Decision** records the selected transcription, voting method, alternatives, word confidence,
+  and visual reasons.
+- **Final** shows the red handwriting overlay; **Logs** shows page-scoped pipeline events.
+
+While a page is active, the header reports child-process liveness, completed/total draws,
+failed or retrying draws, and the age of the latest pipeline event. Finished artifacts are also
+used to reconcile stale in-memory status so a completed page cannot remain displayed as running.
 
 ## Setup
 
@@ -115,7 +165,6 @@ A short summary is also printed to the console after each run.
 ├── extract_hebrew.py        # main pipeline (CU + GPT vision + merge)
 ├── handwriting_pipeline.py  # focused multi-pass handwriting OCR helper
 ├── compare_golden.py        # regression check: current output vs golden/
-├── seed_golden_cache.py     # seed the result-cache from golden/ (instant reproduction)
 ├── exp_determinism.py       # stability probe: single-draw vs self-consistency vote
 ├── azure_ocr_benchmark.py   # Azure Document Intelligence vs GPT-voting benchmark
 ├── requirements.txt         # Python dependencies
@@ -125,8 +174,7 @@ A short summary is also printed to the console after each run.
 ├── golden/                  # approved results per sample (regression baseline)
 ├── out/                     # extract_hebrew.py results (git-ignored)
 ├── output_handwriting/      # handwriting_pipeline.py results (git-ignored)
-├── results/                 # <name>_results.jpg per document (git-ignored)
-└── .cache/                  # response + result cache (git-ignored)
+└── results/                 # <name>_results.jpg per document (git-ignored)
 ```
 
 ## Handwriting pipeline (`handwriting_pipeline.py`)
@@ -137,7 +185,7 @@ single OCR pass. Per handwriting region it:
 1. **Detects** handwriting regions automatically (or takes manual crop boxes).
 2. Creates several **enhanced image versions** (upscale+contrast, adaptive threshold,
    denoise, thickened strokes, horizontal-line removal) and **overlapping chunks**.
-3. Sends every image to **GPT-5.4 vision** to transcribe *only* the handwriting — all calls
+3. Sends every image to the selected **GPT-5.x vision model** to transcribe *only* the handwriting — all calls
    run in parallel, with automatic retries so a timeout burst never drops a region.
 4. **Visually adjudicates** the final reading: it re-shows the best images + all candidate
    readings to the model and lets it decide from the strokes (not a blind majority vote),
@@ -228,7 +276,6 @@ done
 - `--no-merge` — skip `merged.md`
 - `--ocr-mode full|chunks|both` — which images to OCR (default `full`)
 - `--workers N` — parallel GPT calls in flight (`1` for easy debugging)
-- `--refresh-cache` — ignore the cache, recompute, and overwrite it (cache is off by default)
 - `--printed-context / --printed-context-file` + `--context-mode none|nearby|summary` —
   optional short printed-text **soft** hint (default `none`)
 - `--italic` — also read italic/cursive **printed** Hebrew here (opt-in only; normally
@@ -238,27 +285,21 @@ done
 The handwriting engine is a Vision LLM — Tesseract is intentionally not used (weak for
 Hebrew handwriting).
 
-## Consistency: self-consistency voting (deterministic where the input allows)
+## Quality authority and optional voting
 
-The Vision LLM is **non-deterministic** on ambiguous handwriting. Rather than replay a
-cached guess, the pipeline computes a **stable, honest** result on every run via
-**self-consistency voting**:
+The default quality path reads all seven enhanced images once, then performs final **visual
+adjudication** with the image evidence attached again. This matches the architecture used to
+produce the approved golden baseline: candidates are hints, while visible strokes remain the
+authority. If visual adjudication fails, the pipeline falls back to text reconciliation and then
+the best non-empty candidate. The seventh view preserves neighborhoods around thick stroke cores,
+which makes handwriting easier to distinguish from thin printed form text without removing the
+original crop from the evidence set.
 
-1. Each region is drawn **N times** (3 image versions × `VOTE_SEEDS`=3 fixed seeds = 9
-   genuine OCR draws).
-2. The draws are aggregated **deterministically in code** (no model call):
-   - **Structured fields** (date / phone / id / email / number) → format-constrained
-     majority vote. These are **truly deterministic + correct** (measured: date & numbers
-     1 distinct across fresh sessions, similarity 1.00).
-   - **Free text** → medoid + per-token majority: agreed tokens **lock**, the rest are
-     kept as `[?]` with alternatives.
-
-Measured on the free-text-heavy `אישור` sample (cache off, 3 fresh sessions): single draws
-were 9–12 of 12 distinct (chaos); the **vote lifts cross-session similarity to 0.5–0.8** and
-locks the readable skeleton (`3 מפתחות … מים`), flagging only the genuinely-ambiguous words
-`[?]`. That is the honest ceiling — genuinely-ambiguous cursive can't be made byte-identical
-across fresh draws, but it is never a different fabrication each run. `VOTE=0` restores the
-old (non-deterministic) reconcile path; `VOTE_SEEDS` sets the draws per version.
+Self-consistency voting remains available as an opt-in experiment with `VOTE=1`. It draws each
+image `VOTE_SEEDS` times and aggregates candidates deterministically. Structured values use
+format-constrained voting; free text uses a medoid and per-token agreement. This can improve
+stability, but it is not the default because text-only voting cannot recover strokes omitted by
+a crop or resolve visual ambiguity as well as the final image-aware adjudicator.
 
 **Why not a deterministic OCR engine?** `azure_ocr_benchmark.py` benchmarks Azure Document
 Intelligence (`prebuilt-read`) on the same crops: it is 100% deterministic but inaccurate on
@@ -267,7 +308,7 @@ deterministic engine trades too much accuracy, so GPT voting wins.
 
 ### Speed vs quality
 
-Measured on `אישור` (8 regions, cache off, 16 workers):
+Measured on `אישור` (8 regions, 16 workers):
 
 | Setting | Time | Cursive quality |
 |---|---|---|
@@ -281,42 +322,25 @@ cursive accuracy — so **medium is the default**. `GPT_READ_TIMEOUT` (default 9
 stuck call so it retries fast, taming worst-case tail latency. Speed/quality knobs:
 `OCR_REASONING`, `VOTE_SEEDS`, `--workers`, `GPT_READ_TIMEOUT`.
 
-### Reproducibility & speed (caching)
-
-- **Response cache** (`.cache/gpt`, `.cache/cu`) — **off by default**, so every run recomputes
-  the OCR genuinely (nothing is ever a replay). Opt in with `PIPELINE_CACHE=1` for fast,
-  byte-identical re-runs of the same document: each GPT/CU call is then memoized keyed on its
-  content **and seed**, so the N voting draws stay distinct genuine calls.
-- **Result cache** (`.cache/docs`, opt-in with `DOC_CACHE=1`) — stores the whole output dir
-  per input for instant re-serve. **Off by default** (we want genuine computation).
-- Each run reports `Total time (mm:ss)` and `GPT tokens (in/out/total)`; both are written to
-  `handwriting_result.json` (`elapsed`, `usage`, `cache_hits`). `--refresh-cache` recomputes.
-
 ### Golden dataset & regression checks
 
-`golden/` holds the approved result for each sample. To make the samples reproduce their
-approved golden **exactly and instantly**:
+`golden/` holds approved reference results. It is used only for regression comparison; every run
+performs fresh Azure analysis:
 
 ```bash
-python3 seed_golden_cache.py     # seed the result-cache from golden/ (run once / after edits)
 python3 compare_golden.py         # regression check: current output vs golden
 python3 compare_golden.py --run   # re-run the 3 samples, then compare
 ```
 
-After seeding, running the pipeline on any sample serves the golden in ~0.5 s. The
-comparator fails only on **structural** regressions (missing/empty regions, count change)
+The comparator fails only on **structural** regressions (missing/empty regions, count change)
 or a **stable** field (dates, numbers, IDs, emails) changing; volatile cursive/`[?]` fields
 are reported but never failed, since the model rewords them run-to-run.
 
-`.cache/` is git-ignored. For portable reproducibility, commit `golden/` and run
-`seed_golden_cache.py` on the new machine to rebuild the cache from golden.
-
 ## Notes & limitations
 
-- **Handwriting is inherently ambiguous.** GPT may read an unclear date/name differently
-  across runs — this is why results are cached (see above): once approved into `golden/`
-  and seeded, a document reproduces the same reading every time. Treat *new* handwriting
-  fields as *"needs review"*, especially where Content Understanding returns `null`.
+- **Handwriting is inherently ambiguous.** GPT may read an unclear date/name differently across
+  fresh runs. Treat uncertain handwriting as *"needs review"*, especially where candidates
+  disagree or Content Understanding returns `null`.
 - **Italic/cursive printed Hebrew is *printed*, not handwriting** — it belongs to the
   Content Understanding pipeline. The handwriting detector can occasionally over-detect
   italic script as handwriting; use `--italic` only as an opt-in when you want GPT to

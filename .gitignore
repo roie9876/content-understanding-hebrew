@@ -2,10 +2,9 @@
 /out/
 /output_handwriting/
 /results/
+/analysis_results/
+/.ui_data/
 run*.log
-
-# ---- Model-response cache (may embed transcriptions; machine-local) ----
-/.cache/
 
 # ---- Local config / secrets ----
 .env

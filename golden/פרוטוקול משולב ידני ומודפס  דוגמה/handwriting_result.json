@@ -13,25 +13,18 @@
         1133,
         259
       ],
-      "final_transcription": "14/11/14[?]",
+      "final_transcription": "28/04/26",
       "words": [
         {
-          "text": "14/11/14[?]",
-          "confidence": 0.58,
-          "alternatives": [
-            "14/11/16",
-            "14/10/14"
-          ],
-          "reason": "Looks like a handwritten date; both outer groups resemble 14, while the middle group is blurred and could be 10 or 11, and the last digit pair could also be 16.",
-          "source_images": [
-            "06_optional_line_removed.png"
-          ]
+          "text": "28/04/26",
+          "confidence": 1.0,
+          "alternatives": [],
+          "reason": "Human-verified transcription from the source document.",
+          "source_images": []
         }
       ],
       "notes": [
-        "Handwriting appears to be a date written in Western numerals next to the printed Hebrew word 'ביום'.",
-        "The printed underline and stroke overlap make the month/year slightly ambiguous.",
-        "visual reconciliation"
+        "Human-verified golden transcription."
       ]
     }
   ]

@@ -534,6 +534,19 @@ async function pollJob() {
   if (!activeJob) return;
   try {
     const response = await fetch(`/api/jobs/${activeJob.id}`);
+    if (response.status === 404) {
+      clearTimeout(pollTimer);
+      activeJob = null;
+      activeUpload = null;
+      selectedPages.clear();
+      fileInput.value = "";
+      workspace.hidden = true;
+      selectionView.hidden = true;
+      uploadView.hidden = false;
+      await loadSavedRuns();
+      setError(uploadError, "The server restarted and the active job is no longer available. Start a new analysis.");
+      return;
+    }
     if (!response.ok) throw new Error("Could not refresh processing status");
     activeJob = await response.json();
     renderJob();
@@ -768,9 +781,15 @@ document.querySelector("#clearSelectionButton").addEventListener("click", () => 
   renderPageSelection();
 });
 document.querySelector("#analyzeSelectedButton").addEventListener("click", analyzeSelectedPages);
+const isolatedMultiviewModels = new Set(["gpt-5.4", "gpt-5.6-sol"]);
 strategySelect.addEventListener("change", () => {
-  if (strategySelect.value === "isolated-multiview") {
+  if (strategySelect.value === "isolated-multiview" && !isolatedMultiviewModels.has(modelSelect.value)) {
     modelSelect.value = "gpt-5.6-sol";
+  }
+});
+modelSelect.addEventListener("change", () => {
+  if (strategySelect.value === "isolated-multiview" && !isolatedMultiviewModels.has(modelSelect.value)) {
+    strategySelect.value = "standard";
   }
 });
 document.querySelector("#selectionBackButton").addEventListener("click", () => {

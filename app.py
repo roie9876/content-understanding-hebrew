@@ -122,7 +122,7 @@ OCR_STRATEGIES = {
     "standard": {"label": "Standard core4 + visual reconciliation"},
     "isolated-multiview": {
         "label": "Experimental isolated multi-view (lined handwriting)",
-        "model_profiles": {"gpt-5.6-sol"},
+        "model_profiles": {"gpt-5.4", "gpt-5.6-sol"},
     },
 }
 
@@ -407,8 +407,20 @@ def _model_environment(profile_name: str) -> dict[str, str]:
 def _page_environment(model_profile: str, ocr_strategy: str) -> dict[str, str]:
     environment = _model_environment(model_profile)
     environment["OCR_STRATEGY"] = ocr_strategy
+    if model_profile == "gpt-5.4" and ocr_strategy == "standard":
+        environment["GPT_REASONING"] = "low"
+        environment["OCR_REASONING"] = "low"
+        environment["OCR_MAX_TOKENS"] = "4000"
+        environment["OCR_FINAL_ORIGINAL_RESCUE"] = "0"
+        environment["DETECTION_REASONING"] = "low"
+        environment["DETECTION_MAX_TOKENS"] = "2500"
+        environment["GPT_READ_TIMEOUT"] = "60"
     if ocr_strategy == "isolated-multiview":
-        environment["GPT_READ_TIMEOUT"] = "300"
+        environment["GPT_READ_TIMEOUT"] = "120" if model_profile == "gpt-5.4" else "240"
+        environment["ISOLATED_MULTIVIEW_WORKERS"] = "2"
+        environment["ISOLATED_MULTIVIEW_MAX_TOKENS"] = (
+            "6000" if model_profile == "gpt-5.4" else "1800"
+        )
     return environment
 
 
@@ -445,7 +457,7 @@ def _page_snapshot(job_id: str, job: dict, page_number: int) -> dict:
     if result:
         stage = "complete"
 
-    usage = (result or {}).get("usage", {})
+    usage = (result or {}).get("usage") or progress.get("usage") or {}
     with _lock:
         process = _processes.get(job_id, {}).get(page_number)
     process_alive = process is not None and process.poll() is None
@@ -769,7 +781,7 @@ def create_job():
     allowed_profiles = strategy.get("model_profiles")
     if allowed_profiles and model_profile not in allowed_profiles:
         return jsonify({
-            "error": "Experimental isolated multi-view currently requires GPT-5.6 Sol low."
+            "error": "Experimental isolated multi-view requires GPT-5.4 or GPT-5.6 Sol low."
         }), 400
     upload_id = request.form.get("upload_id")
     if upload_id:

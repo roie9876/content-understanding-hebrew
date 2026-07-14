@@ -86,8 +86,16 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel GPT calls in f
 # The always-on free win is CU running concurrently with region OCR (run_pipeline).
 OCR_REASONING = os.environ.get("OCR_REASONING", GPT_REASONING)       # per-image OCR effort
 OCR_MAX_SIDE = int(os.environ.get("OCR_MAX_SIDE", str(MAX_SEND_SIDE)))  # px cap for OCR images
+OCR_MAX_TOKENS = max(1800, int(os.environ.get("OCR_MAX_TOKENS", "10000")))
+OCR_FINAL_ORIGINAL_RESCUE = os.environ.get("OCR_FINAL_ORIGINAL_RESCUE", "1") != "0"
+DETECTION_REASONING = os.environ.get("DETECTION_REASONING", GPT_REASONING)
+DETECTION_MAX_TOKENS = max(1000, int(os.environ.get("DETECTION_MAX_TOKENS", "6000")))
 OCR_STRATEGY = os.environ.get("OCR_STRATEGY", "standard")
 ISOLATED_MULTIVIEW_STRATEGY = "isolated-multiview"
+ISOLATED_MULTIVIEW_WORKERS = max(1, int(os.environ.get("ISOLATED_MULTIVIEW_WORKERS", "2")))
+ISOLATED_MULTIVIEW_MAX_TOKENS = max(
+    1800, int(os.environ.get("ISOLATED_MULTIVIEW_MAX_TOKENS", "1800"))
+)
 
 # Content Understanding (for the printed-text layer used in the merged Markdown).
 CU_ENDPOINT = os.environ.get(
@@ -663,7 +671,8 @@ atexit.register(_copilot_bridge.stop)
 
 def _responses_text(content: list[dict], retries: int = 4,
                     max_tokens: int = 6000, reasoning: str | None = None,
-                    seed: int | None = None) -> str:
+                    seed: int | None = None,
+                    endpoint_limit: int | None = None) -> str:
     """POST to the Responses API and return the raw output text.
 
     Robust to timeouts / 429 / 5xx / empty output: retries with exponential
@@ -697,7 +706,10 @@ def _responses_text(content: list[dict], retries: int = 4,
     for attempt in range(retries + 1):
         backoff = min(30.0, 2.0 ** attempt) + random.uniform(0, 1.5)
         retry_after = backoff
-        for target in _ordered_gpt_targets():
+        ordered_targets = _ordered_gpt_targets()
+        if endpoint_limit is not None:
+            ordered_targets = ordered_targets[:max(1, endpoint_limit)]
+        for target in ordered_targets:
             target_payload = {**payload, "model": target["deployment"]}
             try:
                 r = requests.post(
@@ -725,6 +737,7 @@ def _responses_text(content: list[dict], retries: int = 4,
                     return _responses_text(
                         content, retries=retries, max_tokens=max_tokens,
                         reasoning=reasoning, seed=seed,
+                        endpoint_limit=endpoint_limit,
                     )
             if r.status_code in (408, 409, 429, 500, 502, 503, 504):
                 last_err = f"{target['name']} HTTP {r.status_code}"
@@ -757,9 +770,11 @@ def _responses_text(content: list[dict], retries: int = 4,
 
 def _responses_call(content: list[dict], retries: int = 2,
                     reasoning: str | None = None, max_tokens: int = 6000,
-                    seed: int | None = None) -> dict:
+                    seed: int | None = None,
+                    endpoint_limit: int | None = None) -> dict:
     return _loads_lenient(_responses_text(content, retries, max_tokens=max_tokens,
-                                          reasoning=reasoning, seed=seed))
+                                          reasoning=reasoning, seed=seed,
+                                          endpoint_limit=endpoint_limit))
 
 
 def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
@@ -767,7 +782,8 @@ def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
     return _responses_call([
         {"type": "input_text", "text": prompt},
         {"type": "input_image", "image_url": _to_data_uri(image, max_side=OCR_MAX_SIDE)},
-    ], retries=0, reasoning=OCR_REASONING, seed=seed)
+     ], retries=0, reasoning=OCR_REASONING, seed=seed,
+         max_tokens=OCR_MAX_TOKENS, endpoint_limit=1)
 
 
 def ocr_image_set(
@@ -789,7 +805,9 @@ cell/group order exactly as it appears spatially in the original crop.
             "image_url": _to_data_uri(image, max_side=OCR_MAX_SIDE),
         })
     result = _responses_call(
-        content, retries=0, reasoning=OCR_REASONING, seed=seed, max_tokens=10000,
+        content, retries=0, reasoning=OCR_REASONING, seed=seed,
+        max_tokens=OCR_MAX_TOKENS,
+        endpoint_limit=1,
     )
     result["evidence_views"] = [name for name, _image in images]
     return result
@@ -889,34 +907,66 @@ def run_isolated_multiview_plan(
 ) -> tuple[dict, list[dict], dict]:
     line_a, line_b, line_consensus = [], [], []
     final_words = []
-    details = {"strategy": ISOLATED_MULTIVIEW_STRATEGY, "lines": []}
+    workers = min(ISOLATED_MULTIVIEW_WORKERS, max(1, int(plan.get("draws", 1))))
+    details = {
+        "strategy": ISOLATED_MULTIVIEW_STRATEGY,
+        "concurrency": workers,
+        "max_output_tokens": ISOLATED_MULTIVIEW_MAX_TOKENS,
+        "lines": [],
+    }
     successful_calls = 0
 
-    for line in plan["lines"]:
-        units_a, units_b, units_consensus = [], [], []
-        detail_line = {"line": line["line"], "mode": line["mode"], "units": []}
-        for unit in line["units"]:
-            reads = []
+    draw_specs = []
+    ordered_lines = sorted(
+        enumerate(plan["lines"]),
+        key=lambda item: (item[1]["mode"] != "word_groups", item[0]),
+    )
+    for line_index, line in ordered_lines:
+        for unit_index, unit in enumerate(line["units"]):
             for pass_name, prompt, seed in (
                 ("a", SEGMENTED_PROMPT_A, 101),
                 ("b", SEGMENTED_PROMPT_B, 202),
             ):
-                try:
-                    result = _responses_call(
-                        _segmented_unit_content(prompt, unit["views"]),
-                        retries=0,
-                        reasoning=OCR_REASONING,
-                        max_tokens=1800,
-                        seed=seed,
-                    )
-                    successful_calls += 1
-                    if on_draw:
-                        on_draw(True)
-                except Exception as exc:
-                    result = {"transcription": "", "error": str(exc)}
-                    if on_draw:
-                        on_draw(False)
-                reads.append((pass_name, result, _segmented_read_text(result)))
+                draw_specs.append((line_index, unit_index, pass_name, prompt, seed, unit))
+
+    responses: dict[tuple[int, int, str], dict] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_specs = {
+            executor.submit(
+                _responses_call,
+                _segmented_unit_content(prompt, unit["views"]),
+                0,
+                OCR_REASONING,
+                ISOLATED_MULTIVIEW_MAX_TOKENS,
+                seed,
+            ): (line_index, unit_index, pass_name)
+            for line_index, unit_index, pass_name, prompt, seed, unit in draw_specs
+        }
+        for future in as_completed(future_specs):
+            line_index, unit_index, pass_name = future_specs[future]
+            try:
+                responses[(line_index, unit_index, pass_name)] = future.result()
+                successful_calls += 1
+                if on_draw:
+                    on_draw(True)
+            except Exception as exc:
+                responses[(line_index, unit_index, pass_name)] = {
+                    "transcription": "",
+                    "error": str(exc),
+                }
+                if on_draw:
+                    on_draw(False)
+
+    for line_index, line in enumerate(plan["lines"]):
+        units_a, units_b, units_consensus = [], [], []
+        detail_line = {"line": line["line"], "mode": line["mode"], "units": []}
+        for unit_index, unit in enumerate(line["units"]):
+            first = responses[(line_index, unit_index, "a")]
+            second = responses[(line_index, unit_index, "b")]
+            reads = [
+                ("a", first, _segmented_read_text(first)),
+                ("b", second, _segmented_read_text(second)),
+            ]
 
             first_text, second_text = reads[0][2], reads[1][2]
             consensus, similarity = _align_segmented_readings(first_text, second_text)
@@ -2721,7 +2771,16 @@ Each box should tightly cover the handwriting with a small margin."""
         {"type": "input_text", "text": prompt},
         {"type": "input_image", "image_url": _to_data_uri(det_img)},
     ]
-    regions = parse_response(_responses_call(content))
+    def detection_call(evidence: list[dict]) -> dict:
+        return _responses_call(
+            evidence,
+            retries=0,
+            reasoning=DETECTION_REASONING,
+            max_tokens=DETECTION_MAX_TOKENS,
+            endpoint_limit=1,
+        )
+
+    regions = parse_response(detection_call(content))
     penalty, issues = detection_geometry_penalty(regions, W, H)
     if issues:
         correction = (
@@ -2734,12 +2793,16 @@ Each box should tightly cover the handwriting with a small margin."""
             {"type": "input_text", "text": prompt + "\n\n" + correction},
             {"type": "input_image", "image_url": _to_data_uri(det_img)},
         ]
-        retry_regions = parse_response(_responses_call(retry_content))
-        repaired = repair_invalid_detection_regions(regions, retry_regions, W, H)
-        repaired_penalty, _ = detection_geometry_penalty(repaired, W, H)
-        if repaired_penalty < penalty:
-            print(f"[detect] geometry repair improved penalty {penalty:.1f} -> {repaired_penalty:.1f}")
-            regions = repaired
+        try:
+            retry_regions = parse_response(detection_call(retry_content))
+        except RuntimeError as exc:
+            print(f"[detect] geometry repair unavailable; keeping initial regions: {exc}")
+        else:
+            repaired = repair_invalid_detection_regions(regions, retry_regions, W, H)
+            repaired_penalty, _ = detection_geometry_penalty(repaired, W, H)
+            if repaired_penalty < penalty:
+                print(f"[detect] geometry repair improved penalty {penalty:.1f} -> {repaired_penalty:.1f}")
+                regions = repaired
     if needs_lower_detection_pass(regions, H):
         lower_top = round(H * 0.20)
         lower_page = page_img.crop((0, lower_top, W, H))
@@ -2762,14 +2825,19 @@ Each box must tightly cover one handwritten field or line with a small margin.""
             {"type": "input_text", "text": lower_prompt},
             {"type": "input_image", "image_url": _to_data_uri(lower_image)},
         ]
-        lower_regions = parse_response(
-            _responses_call(lower_content),
-            coordinate_inv=1.0 / lower_scale,
-            offset_y=lower_top,
-        )
-        if lower_regions:
-            print(f"[detect] lower-page coverage pass added {len(lower_regions)} candidate region(s)")
-            regions.extend(lower_regions)
+        try:
+            lower_response = detection_call(lower_content)
+        except RuntimeError as exc:
+            print(f"[detect] lower-page coverage unavailable; keeping initial regions: {exc}")
+        else:
+            lower_regions = parse_response(
+                lower_response,
+                coordinate_inv=1.0 / lower_scale,
+                offset_y=lower_top,
+            )
+            if lower_regions:
+                print(f"[detect] lower-page coverage pass added {len(lower_regions)} candidate region(s)")
+                regions.extend(lower_regions)
     colored_regions = detect_colored_pen_regions(page_img, regions)
     if colored_regions:
         regions = colored_regions
@@ -3208,6 +3276,7 @@ def run_pipeline(
         _write_json_atomic(out / "ocr_progress.json", {
             **draw_progress,
             "page": page,
+            "usage": _get_usage(),
             "updated_at": time.time(),
             "regions": [
                 {
@@ -3232,7 +3301,7 @@ def run_pipeline(
     if segmented_plans:
         print(
             f"[OCR] strategy={OCR_STRATEGY}: {draw_progress['total']} total draw(s); "
-            "isolated calls run sequentially"
+            f"up to {ISOLATED_MULTIVIEW_WORKERS} isolated calls run concurrently"
         )
     else:
         print(f"[OCR] {len(flat)} vision draws across {len(regions)} region(s) "
@@ -3332,7 +3401,7 @@ def run_pipeline(
         print(f"[OCR] {len(stranded)} region(s) still empty -> final retry of {len(retry_tasks)} call(s) ...")
         time.sleep(5)
         rescue_failures = _ocr_batch(retry_tasks)
-        if MULTI_IMAGE_OCR and rescue_failures:
+        if MULTI_IMAGE_OCR and rescue_failures and OCR_FINAL_ORIGINAL_RESCUE:
             still_stranded = [
                 ri for ri, _name, _evidence, _seed in rescue_failures
                 if not any(

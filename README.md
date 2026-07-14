@@ -60,12 +60,21 @@ detection, candidates, decision, final overlay, and logs without calling Azure a
 runs are restored from their manifests whenever the server starts.
 
 To reproduce the isolated multi-view experiment from the UI, upload a blue-handwritten lined
-image, keep **GPT-5.6 Sol · low reasoning**, and set **OCR strategy** to
+image, select either **GPT-5.4** (medium reasoning) or **GPT-5.6 Sol · low reasoning**, and set
+**OCR strategy** to
 **Experimental isolated multi-view · lined handwriting** before selecting **Analyze selected**.
 The strategy isolates lined rows, uses stable word groups only when geometry supports them, sends
 three faithful views of each unit through two candidate-blind reads, and aligns the results in
 code. Regions without valid colored lined geometry automatically use standard OCR. Experimental
 jobs use a longer timeout, run isolated calls sequentially, and can take substantially longer.
+GPT-5.4 uses a 120-second per-endpoint timeout; Sol-low uses 240 seconds. The strategy runs at
+most two independent draws concurrently. GPT-5.4 receives a larger output budget so reasoning
+does not repeatedly exhaust a Sol-sized cap and trigger endpoint failover. Stable word groups run
+before expensive whole-line audits. Other model profiles use the standard strategy.
+
+For the standard strategy, GPT-5.4 uses low reasoning throughout. Detection is a one-endpoint,
+2,500-token request with no hidden retries. OCR uses a 4,000-token budget; each attempt targets
+one rotating endpoint for at most 60 seconds, with one faithful rescue attempt.
 
 The UI hides Content Understanding's internal Markdown comments and figure descriptions while
 preserving the raw artifact on disk. Every upload performs fresh Azure analysis; OCR responses,

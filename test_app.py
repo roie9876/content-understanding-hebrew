@@ -309,6 +309,28 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(selected, [page["page"] for page in snapshot["pages"]])
         self.assertEqual(2, snapshot["selected_page_count"])
 
+    def test_page_snapshot_uses_live_progress_usage_before_final_result(self):
+        page_dir = self.output_dir / "page_0001"
+        page_dir.mkdir()
+        (page_dir / "ocr_progress.json").write_text(json.dumps({
+            "completed": 2,
+            "failed": 0,
+            "total": 10,
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 80,
+                "total_tokens": 200,
+                "calls": 2,
+            },
+        }))
+
+        snapshot = web_app._page_snapshot(self.job_id, web_app._jobs[self.job_id], 1)
+
+        self.assertEqual(2, snapshot["calls"])
+        self.assertEqual(200, snapshot["tokens"])
+        self.assertEqual(120, snapshot["input_tokens"])
+        self.assertEqual(80, snapshot["output_tokens"])
+
     def test_pipeline_log_is_tagged_and_persistent(self):
         web_app._jobs[self.job_id]["status"] = "running"
         web_app._jobs[self.job_id]["page_states"][2]["stage"] = "preparing"
@@ -374,7 +396,31 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("gpt-5.6-sol", environment["GPT_DEPLOYMENT"])
         self.assertEqual("low", environment["OCR_REASONING"])
         self.assertEqual("isolated-multiview", environment["OCR_STRATEGY"])
-        self.assertEqual("300", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("240", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("2", environment["ISOLATED_MULTIVIEW_WORKERS"])
+        self.assertEqual("1800", environment["ISOLATED_MULTIVIEW_MAX_TOKENS"])
+
+    def test_gpt54_isolated_multiview_uses_medium_profile_timeout(self):
+        environment = web_app._page_environment(
+            "gpt-5.4", "isolated-multiview",
+        )
+
+        self.assertEqual("gpt-5.4", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("isolated-multiview", environment["OCR_STRATEGY"])
+        self.assertEqual("120", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("2", environment["ISOLATED_MULTIVIEW_WORKERS"])
+        self.assertEqual("6000", environment["ISOLATED_MULTIVIEW_MAX_TOKENS"])
+
+    def test_gpt54_standard_uses_fast_ocr_profile(self):
+        environment = web_app._page_environment("gpt-5.4", "standard")
+
+        self.assertEqual("low", environment["GPT_REASONING"])
+        self.assertEqual("low", environment["OCR_REASONING"])
+        self.assertEqual("4000", environment["OCR_MAX_TOKENS"])
+        self.assertEqual("0", environment["OCR_FINAL_ORIGINAL_RESCUE"])
+        self.assertEqual("low", environment["DETECTION_REASONING"])
+        self.assertEqual("2500", environment["DETECTION_MAX_TOKENS"])
+        self.assertEqual("60", environment["GPT_READ_TIMEOUT"])
 
     def test_sol_none_profile_sets_fast_page_subprocess_environment(self):
         environment = web_app._model_environment("gpt-5.6-sol-none")
@@ -475,19 +521,50 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(400, response.status_code)
         self.assertEqual("Unsupported OCR strategy.", response.get_json()["error"])
 
-    def test_isolated_multiview_strategy_requires_sol_low(self):
+    def test_isolated_multiview_strategy_rejects_other_models(self):
         response = web_app.app.test_client().post(
             "/api/jobs",
             data={
                 "document": (io.BytesIO(b"not-used"), "document.png"),
-                "model_profile": "gpt-5.4",
+                "model_profile": "gpt-5.6-luna",
                 "ocr_strategy": "isolated-multiview",
             },
             content_type="multipart/form-data",
         )
 
         self.assertEqual(400, response.status_code)
-        self.assertIn("requires GPT-5.6 Sol low", response.get_json()["error"])
+        self.assertIn("requires GPT-5.4 or GPT-5.6 Sol low", response.get_json()["error"])
+
+    def test_isolated_multiview_strategy_accepts_gpt54(self):
+        upload_id = "gpt54-isolated-upload"
+        web_app._uploads[upload_id] = {
+            "id": upload_id,
+            "file_name": "document.png",
+            "input_path": str(self.output_dir / "document.png"),
+            "page_count": 1,
+            "created_at": time.time(),
+        }
+        try:
+            with patch.object(web_app.threading.Thread, "start"), \
+                 patch.object(web_app, "RESULTS_DIR", self.output_dir / "saved-runs"):
+                response = web_app.app.test_client().post(
+                    "/api/jobs",
+                    data={
+                        "upload_id": upload_id,
+                        "model_profile": "gpt-5.4",
+                        "ocr_strategy": "isolated-multiview",
+                        "pages": "1",
+                    },
+                )
+            payload = response.get_json()
+
+            self.assertEqual(202, response.status_code)
+            self.assertEqual("gpt-5.4", payload["model_profile"])
+            self.assertEqual("isolated-multiview", payload["ocr_strategy"])
+        finally:
+            if "payload" in locals() and payload.get("id"):
+                web_app._jobs.pop(payload["id"], None)
+            web_app._uploads.pop(upload_id, None)
 
     def test_create_job_uses_selected_pages_from_prepared_upload(self):
         upload_id = "prepared-upload"
@@ -733,6 +810,60 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertEqual(retry[0], repaired[0])
         self.assertEqual(original[1], repaired[1])
+
+    @patch.object(pipeline, "detect_colored_pen_regions")
+    @patch.object(pipeline, "add_handwriting_context", side_effect=lambda _image, box: box)
+    @patch.object(
+        pipeline, "refine_box_to_ink",
+        side_effect=lambda _image, box, color_hint=None: box,
+    )
+    @patch.object(pipeline, "_responses_call")
+    def test_detection_keeps_initial_regions_when_geometry_retry_fails(
+        self, responses_call, _refine, _context, colored_regions,
+    ):
+        responses_call.side_effect = [
+            {"regions": [{
+                "label": "handwritten number",
+                "box": [100, 500, 800, 100],
+            }]},
+            RuntimeError("[GPT] all endpoints failed: secondary empty output"),
+        ]
+        colored_regions.side_effect = lambda _image, regions: regions
+
+        regions = pipeline.detect_handwriting_regions(
+            Image.new("RGB", (1000, 1000), "white")
+        )
+
+        self.assertEqual(1, len(regions))
+        self.assertEqual("handwritten number", regions[0]["label"])
+        self.assertEqual(2, responses_call.call_count)
+
+    @patch.object(pipeline, "detect_colored_pen_regions")
+    @patch.object(pipeline, "add_handwriting_context", side_effect=lambda _image, box: box)
+    @patch.object(
+        pipeline, "refine_box_to_ink",
+        side_effect=lambda _image, box, color_hint=None: box,
+    )
+    @patch.object(pipeline, "_responses_call")
+    def test_detection_keeps_initial_regions_when_lower_pass_fails(
+        self, responses_call, _refine, _context, colored_regions,
+    ):
+        responses_call.side_effect = [
+            {"regions": [{
+                "label": "handwritten note",
+                "box": [100, 100, 200, 50],
+            }]},
+            RuntimeError("[GPT] all endpoints failed: primary read timeout"),
+        ]
+        colored_regions.side_effect = lambda _image, regions: regions
+
+        regions = pipeline.detect_handwriting_regions(
+            Image.new("RGB", (1000, 1000), "white")
+        )
+
+        self.assertEqual(1, len(regions))
+        self.assertEqual("handwritten note", regions[0]["label"])
+        self.assertEqual(2, responses_call.call_count)
 
     def test_detection_dedup_drops_oversized_containing_compact_field(self):
         regions = [
@@ -1004,6 +1135,7 @@ class ConcurrentJobTests(unittest.TestCase):
         pipeline.ocr_image(Image.new("RGB", (10, 10)), "read", seed=7)
 
         self.assertEqual(0, responses_call.call_args.kwargs["retries"])
+        self.assertEqual(1, responses_call.call_args.kwargs["endpoint_limit"])
 
     @patch("handwriting_pipeline._responses_call")
     def test_reconciliation_uses_fallbacks_instead_of_hidden_retries(self, responses_call):
@@ -1415,6 +1547,7 @@ class ConcurrentJobTests(unittest.TestCase):
 
         content = responses_call.call_args.args[0]
         self.assertEqual(4, sum(item["type"] == "input_image" for item in content))
+        self.assertEqual(1, responses_call.call_args.kwargs["endpoint_limit"])
         self.assertEqual(
             list(pipeline.CORE_OCR_VIEWS),
             result["evidence_views"],
@@ -1448,6 +1581,7 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("isolated_multiview_consensus", final["decision_status"])
         self.assertEqual(2, len(candidates))
         self.assertEqual(2, details["successful_calls"])
+        self.assertEqual(2, details["concurrency"])
         self.assertTrue(all(
             sum(item["type"] == "input_image" for item in call.args[0]) == 3
             for call in responses_call.call_args_list

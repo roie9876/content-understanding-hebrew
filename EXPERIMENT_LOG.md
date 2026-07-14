@@ -399,18 +399,163 @@ or reliability.
 
 ### EXP-20260714-10: Opt-in InkSight strategy integration
 
-- **Change**: Added an **OCR strategy** selector to InkSight. The experimental option is restricted
-  to GPT-5.6 Sol low and persists in `run.json`, live snapshots, and saved-run labels.
+- **Change**: Added an **OCR strategy** selector to InkSight. The experimental option supports
+  GPT-5.4 medium and GPT-5.6 Sol low, and persists in `run.json`, live snapshots, and saved-run
+  labels. Other model profiles are rejected by the API for this strategy.
 - **Runtime behavior**: Valid colored lined regions use adaptive isolation. Rows with 2-4 stable
   groups use per-group multi-view reads; over-segmented rows stay intact as one isolated line.
   Every unit gets original-with-form-line, blue-only, and enlarged/sharpened views, followed by two
-  candidate-blind calls and Python alignment. Invalid or failed regions fall back to standard OCR.
+  candidate-blind calls and Python alignment. At most two draws run concurrently. Invalid or failed
+  regions fall back to standard OCR. Stable grouped lines are scheduled first. GPT-5.4 uses a
+  larger output budget than Sol to avoid empty reasoning-only responses and duplicate failover.
 - **Decision behavior**: Experimental consensus bypasses candidate-fed visual reconciliation and
   is marked `isolated_multiview_consensus`; disagreements remain `[?]` and `needs_review`.
 - **Status**: **AVAILABLE**, opt-in only. Standard core4 remains the default.
 - **Validation**: Offline pipeline integration writes normal `handwriting_result.json`, region
   diagnostics, merged overlay artifacts, and never invokes visual reconciliation for a successful
   experimental plan.
+
+### EXP-20260714-11: GPT-5.4 isolation run exposed unsealed merge
+
+- **Artifact**: `analysis_results/01_original_crop.png__2026-07-14_16-04-56/`.
+- **Model/config**: GPT-5.4 medium, 6,000 output-token cap, two concurrent draws, 120-second
+  per-endpoint timeout.
+- **Raw isolation result**: 9/10 draws completed and one whole-line read failed. The two blind
+  candidates were highly uncertain, and Python agreement produced
+  `[?]\nס[?]ל כא[?] ה[?][?]ל\nהרב[?] [?][?][?][?]`.
+- **Cost**: 10:31 elapsed, 10,012 input tokens, 31,633 output tokens, 41,645 total usage tokens,
+  and 12 recorded GPT usage events including detection and merge.
+- **Unexpected merged result**: `merged.md` contained fluent text including `בנק הפועלים` and
+  `סניף פארק הירקון`, despite neither isolated candidate supporting that reconstruction.
+- **Root cause**: This was **not golden-data leakage**. `handwriting_pipeline.py` does not read the
+  golden dataset. The app's golden endpoint reads golden files only for post-run comparison.
+  However, `build_merged_markdown` made an additional unsealed vision call with the original page,
+  Content Understanding output, and isolated candidates. CU already contained close but garbled
+  forms such as `בנק הבו180ם`, `סני4 פארק ה׳רהון`, and `הרצא אמר`; the merge model reread the page
+  and semantically repaired them.
+- **Interpretation**: The fluent `merged.md` is a contextual full-page reconstruction, not evidence
+  that isolated OCR succeeded. It must not be scored as the isolation result.
+- **Historical controls**:
+  - In `analysis_results/01_original_crop.png__2026-07-14_10-35-43/`, standard Sol OCR supplied the
+    confident but wrong candidate `סניף פתח תקווה`; the semantic merge preserved that wrong anchor.
+  - In `analysis_results/01_original_crop.png__2026-07-14_10-46-15/`, all standard Sol handwriting
+    calls failed and supplied an empty candidate; the same full-page merge independently recovered
+    `סניף פארק הירקון` from CU plus the image, with only the final word still wrong.
+  - The isolated run used GPT-5.4 rather than Sol, so model choice is an additional confound.
+- **Causal conclusion**: Isolation may have helped only negatively by replacing a confident wrong
+  anchor with uncertainty. It supplied no demonstrated positive evidence for the recovered words,
+  and full-page reconstruction had already succeeded without isolation when no bad candidate was
+  present.
+- **Decision**: **REGRESSED for experimental evaluation**. Preserve `handwriting_result.json` as
+  the authoritative isolated result. A future change should disable semantic full-page merge for
+  isolated mode or label it as a separate, non-isolated reconstruction.
+
+### EXP-20260714-12: GPT-5.4 standard fast-profile full-document run
+
+- **Input**: The 21-region human-golden `חיוב חשבון1.pdf` sample.
+- **Artifact**: `analysis_results/חיוב חשבון1.pdf__2026-07-14_17-36-52/`.
+- **Model/config**: GPT-5.4 standard core4 strategy, low OCR and detection reasoning, 4,000 OCR
+  output-token cap, 2,500 detection cap, one endpoint per attempt, 60-second read timeout, and no
+  final original-image rescue.
+- **Raw OCR result**: 21/21 draws completed with no failed regions. Post-run comparison of
+  `handwriting_result.json` reported 40.0% exact text, 75.3% mean similarity, and 100.0% non-text
+  classification. The exact score is 8/20 text regions; the signature is scored separately.
+- **Cost and time**: 04:29 pipeline time, 63 GPT calls, 146,150 input tokens, 37,501 output tokens,
+  and 183,651 total tokens.
+- **Telemetry caveat**: The live snapshot near the end of OCR showed only 22 calls and 51,203
+  tokens, while final artifact parsing reported 63 calls and 183,651 tokens. Live usage is
+  therefore incomplete during concurrent work and must not be treated as final accounting.
+- **Merge caveat**: The job remained visibly in `merging` after region OCR completed, but the
+  current artifacts do not retain stage timestamps, so an exact semantic-merge duration cannot be
+  recovered. `merged.md` remains contextual reconstruction and was not used for the accuracy
+  figures above.
+- **Comparison caveat**: This run is faster than historical GPT-5.4 core4 runs, but pipeline and
+  prompt revisions differ, so it is not a controlled A/B against those artifacts.
+- **Decision**: **AVAILABLE / PROMISING for latency**. Preserve as the GPT-5.4 standard fast
+  profile while gathering matched repeated runs before making a quality claim.
+
+### EXP-20260714-13: GPT-5.4 fast profile on second document
+
+- **Input**: The 15-region human-golden `חיוב חשבון2.pdf` sample.
+- **Artifact**: `analysis_results/חיוב חשבון2.pdf__2026-07-14_17-44-15/`.
+- **Model/config**: Same GPT-5.4 standard fast profile as EXP-20260714-12.
+- **Raw OCR result**: Detection found 15 regions. All initial draws completed, one empty region was
+  retried, and no draw failed. Post-run comparison of `handwriting_result.json` reported 14.3%
+  exact text, 59.8% mean similarity, and 0.0% non-text classification. The exact score is 2/14
+  text regions; the signature region was returned as uncertain handwritten text rather than
+  `signature_non_text`.
+- **Cost and time**: 05:33 pipeline time, 48 GPT calls, 125,062 input tokens, 30,522 output tokens,
+  and 155,584 total tokens.
+- **Observed failure modes**: Digit spacing and substitution errors affected account/reference
+  numbers; difficult names, addresses, and margin notes were incomplete or incorrect; one colored
+  handwriting region was empty; and the signature classification failed.
+- **Decision**: **REGRESSED for accuracy on this document**. The fast profile remains useful for
+  latency experiments, but the two-document evidence does not support promoting it as a quality
+  default. Continue to score raw OCR rather than semantic merged output.
+
+### EXP-20260714-14: Optional detection repair caused two document failures
+
+- **Input**: `חיוב חשבון2.pdf`.
+- **Failed attempts**:
+  - GPT-5.4 isolated multi-view:
+    `analysis_results/חיוב חשבון2.pdf__2026-07-14_17-53-54/`.
+    The geometry-repair response was empty.
+  - GPT-5.6 Sol-low standard:
+    `analysis_results/חיוב חשבון2.pdf__2026-07-14_18-16-20/`.
+    The geometry-repair response exceeded the 90-second read timeout.
+- **Root cause**: Both primary detection calls returned parseable regions with a geometry issue.
+  The optional geometry-repair call then raised `RuntimeError`, which escaped
+  `detect_handwriting_regions` and failed the whole page. These were repair-stage failures, not
+  evidence that the models could not detect handwriting on this document.
+- **Change**: Geometry repair and the optional lower-page coverage pass now catch model-runtime
+  failures, emit a visible diagnostic, and retain the regions already detected. Primary detection
+  remains required; only supplemental calls are best-effort.
+- **Verification**: A detection-only GPT-5.4 fast-profile run on the exact rendered page completed
+  with 15 regions and improved geometry penalty from 10.6 to 0.0. The full suite passes 131 tests,
+  including explicit empty-output and timeout regression cases. A subsequent full InkSight
+  GPT-5.4 isolated run, `חיוב חשבון2.pdf__2026-07-14_18-28-43`, also found 15 regions, improved
+  geometry penalty from 11.3 to 0.0, and entered handwriting OCR instead of failing detection.
+- **Accounting caveat**: Failed/empty responses are not represented in successful usage events, so
+  the failed GPT-5.4 job's displayed zero calls and tokens was not its true request cost.
+- **Decision**: **ADOPTED / INFRASTRUCTURE**. The two runs remain inconclusive for isolated OCR
+  accuracy because they never reached OCR, but the shared detection failure is fixed.
+
+### EXP-20260714-15: GPT-5.4 isolated multi-view on second document
+
+- **Input**: The 15-region human-golden `חיוב חשבון2.pdf` sample.
+- **Artifact**: `analysis_results/חיוב חשבון2.pdf__2026-07-14_18-28-43/`.
+- **Model/config**: GPT-5.4 isolated multi-view. Only regions 4 and 9 produced valid isolated
+  plans; the other 13 regions fell back to standard OCR because segmentation requirements were
+  not met. The run planned 27 draws, made three empty-region retries, and recorded two timed-out
+  standard core4 attempts.
+- **Raw OCR result**: Post-run comparison of `handwriting_result.json` reported 14.3% exact text,
+  61.2% mean similarity, and 0.0% non-text classification. The exact score is 2/14 text regions;
+  the signature was returned as uncertain handwritten text.
+- **Cost and time**: 27:01 pipeline time, 57 GPT calls, 117,085 input tokens, 145,041 output tokens,
+  and 262,126 total tokens.
+- **Same-document standard comparison**: EXP-20260714-13 scored the same 2/14 exact and 0.0%
+  classification with 59.8% similarity, 05:33, 48 calls, and 155,584 tokens. Isolation improved
+  similarity by only 1.4 percentage points while taking 4.9 times longer and using 68% more tokens.
+- **Decision**: **REGRESSED**. This document provides no evidence that isolated multi-view improves
+  exact accuracy or classification, and its small similarity increase does not justify the severe
+  latency and token cost. Keep it experimental and opt-in only.
+
+### EXP-20260714-16: GPT-5.4 standard fast-profile repeat on second document
+
+- **Input**: The same 15-region human-golden `חיוב חשבון2.pdf` sample.
+- **Artifact**: `analysis_results/חיוב חשבון2.pdf__2026-07-14_19-07-26/`.
+- **Model/config**: Same GPT-5.4 standard fast profile as EXP-20260714-13.
+- **Raw OCR result**: 21.4% exact text, 52.7% mean similarity, and 0.0% non-text classification.
+  The exact score is 3/14 text regions; the signature was again classified as handwritten text.
+- **Cost and time**: 06:28 pipeline time, 49 GPT calls, 127,748 input tokens, 29,773 output tokens,
+  and 157,521 total tokens. All 15 initial draws completed, one empty region was retried, and no
+  draw ultimately failed.
+- **Repeatability**: The earlier same-profile run scored 2/14 exact and 59.8% similarity. The repeat
+  gained one exact field but lost 7.1 similarity points, confirming substantial output variance on
+  this document despite similar cost and runtime.
+- **Decision**: **REGRESSED / INCONCLUSIVE for quality**. The fast profile remains operationally
+  useful, but neither repeat supports it as a quality default and the two runs are not stable enough
+  to infer small accuracy improvements.
 
 # Experiment Template
 

@@ -1,19 +1,94 @@
 import io
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import app as web_app
 import compare_golden
 import handwriting_pipeline as pipeline
 
 
+class UploadFormatTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.upload_dir = Path(self.temp_dir.name) / "uploads"
+        self.upload_ids = []
+
+    def tearDown(self):
+        for upload_id in self.upload_ids:
+            web_app._uploads.pop(upload_id, None)
+        self.temp_dir.cleanup()
+
+    def _upload(self, data: bytes, file_name: str):
+        with patch.object(web_app, "UPLOAD_DIR", self.upload_dir):
+            return web_app.app.test_client().post(
+                "/api/uploads",
+                data={"document": (io.BytesIO(data), file_name)},
+                content_type="multipart/form-data",
+            )
+
+    def test_webp_upload_is_normalized_and_previewable(self):
+        source = io.BytesIO()
+        Image.new("RGB", (24, 16), "white").save(source, format="WEBP")
+
+        response = self._upload(source.getvalue(), "scan.webp")
+        payload = response.get_json()
+
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(1, payload["page_count"])
+        self.upload_ids.append(payload["id"])
+        upload = web_app._uploads[payload["id"]]
+        self.assertEqual(".png", Path(upload["input_path"]).suffix)
+        preview = web_app.app.test_client().get(payload["pages"][0]["preview_url"])
+        self.assertEqual(200, preview.status_code)
+        preview.close()
+
+    def test_heic_upload_is_normalized_and_previewable(self):
+        source = io.BytesIO()
+        Image.new("RGB", (24, 16), "white").save(source, format="HEIF")
+
+        response = self._upload(source.getvalue(), "scan.heic")
+        payload = response.get_json()
+
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(1, payload["page_count"])
+        self.upload_ids.append(payload["id"])
+        upload = web_app._uploads[payload["id"]]
+        self.assertEqual(".png", Path(upload["input_path"]).suffix)
+        preview = web_app.app.test_client().get(payload["pages"][0]["preview_url"])
+        self.assertEqual(200, preview.status_code)
+        preview.close()
+
+    def test_multiframe_tiff_upload_preserves_pages(self):
+        source = io.BytesIO()
+        first = Image.new("RGB", (24, 16), "white")
+        second = Image.new("RGB", (24, 16), "black")
+        first.save(source, format="TIFF", save_all=True, append_images=[second])
+
+        response = self._upload(source.getvalue(), "scan.tiff")
+        payload = response.get_json()
+
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(2, payload["page_count"])
+        self.upload_ids.append(payload["id"])
+        upload = web_app._uploads[payload["id"]]
+        self.assertEqual(".pdf", Path(upload["input_path"]).suffix)
+        for page in payload["pages"]:
+            preview = web_app.app.test_client().get(page["preview_url"])
+            self.assertEqual(200, preview.status_code)
+            preview.close()
+
+
 class ConcurrentJobTests(unittest.TestCase):
+    def test_customer_default_model_is_sol_low(self):
+        self.assertEqual("gpt-5.6-sol", web_app.DEFAULT_MODEL_PROFILE)
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.output_dir = Path(self.temp_dir.name)
@@ -90,6 +165,126 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(["first", "second"], [pair[1]["value"] for pair in pairs])
         self.assertEqual([], extras)
 
+    def test_golden_match_uses_spatial_assignment_above_fifteen_regions(self):
+        golden = [
+            {"box": [index * 100, 0, 10, 10], "final_transcription": str(index)}
+            for index in range(20)
+        ]
+        current = [
+            {"box": [index * 100, 0, 10, 10], "final_transcription": str(index)}
+            for index in reversed(range(20))
+        ]
+
+        pairs, extras = compare_golden._match(golden, current)
+
+        self.assertEqual([], extras)
+        self.assertEqual(
+            [region["final_transcription"] for region in golden],
+            [region["final_transcription"] for _golden, region in pairs],
+        )
+
+    def test_exact_golden_normalization_ignores_layout_not_characters(self):
+        self.assertEqual(
+            compare_golden._exact_norm("012123\n142 05686399"),
+            compare_golden._exact_norm("012123 142 05686399"),
+        )
+        self.assertNotEqual(
+            compare_golden._exact_norm("5252731"),
+            compare_golden._exact_norm("731 5252"),
+        )
+
+    def test_strict_golden_scores_text_and_signature_classification(self):
+        golden = {
+            "regions": [
+                {"box": [0, 0, 10, 10], "final_transcription": "12/7/26"},
+                {"box": [20, 0, 10, 10], "final_transcription": "",
+                 "human_classification": "signature_non_text"},
+            ]
+        }
+        current = {
+            "regions": [
+                {"box": [0, 0, 10, 10], "final_transcription": "12.7.26"},
+                {"box": [20, 0, 10, 10], "final_transcription": "",
+                 "classification": "signature_non_text"},
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(compare_golden, "GOLDEN_DIR", Path(temp_dir) / "golden"):
+            stem = "sample"
+            golden_dir = compare_golden.GOLDEN_DIR / stem
+            golden_dir.mkdir(parents=True)
+            (golden_dir / "handwriting_result.json").write_text(
+                json.dumps(golden), encoding="utf-8"
+            )
+            current_path = Path(temp_dir) / "current.json"
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+
+            result = compare_golden.compare_sample(stem, current_path)
+
+        self.assertEqual(1, result["strict"]["text_exact"])
+        self.assertEqual(1, result["strict"]["classification_correct"])
+        self.assertTrue(result["strict"]["pass"])
+
+    def test_merged_png_download_renders_merged_document(self):
+        page_dir = web_app._page_dir(web_app._jobs[self.job_id], 1)
+        page_dir.mkdir(parents=True)
+        Image.new("RGB", (12, 8), "white").save(page_dir / "merged.jpg")
+        (page_dir / "merged.md").write_text(
+            '# מסמך ממוזג\n\n<span style="color:#d00">כתב יד</span>',
+            encoding="utf-8",
+        )
+
+        response = web_app.app.test_client().get(
+            f"/api/jobs/{self.job_id}/pages/1/merged.png"
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("image/png", response.mimetype)
+        self.assertIn("attachment", response.headers["Content-Disposition"])
+        self.assertEqual(b"\x89PNG\r\n\x1a\n", response.data[:8])
+        with Image.open(io.BytesIO(response.data)) as image:
+            self.assertEqual((1800, 2546), image.size)
+
+    def test_golden_comparison_route_returns_similarity_and_rows(self):
+        result = {
+            "regions": [{
+                "box": [0, 0, 10, 10],
+                "label": "date",
+                "final_transcription": "12/7/26",
+                "classification": "handwritten_text",
+            }]
+        }
+        golden = {
+            "page": 1,
+            "regions": [{
+                "box": [0, 0, 10, 10],
+                "label": "date",
+                "final_transcription": "12/7/26",
+            }]
+        }
+        page_dir = web_app._page_dir(web_app._jobs[self.job_id], 1)
+        page_dir.mkdir(parents=True)
+        (page_dir / "handwriting_result.json").write_text(
+            json.dumps(result), encoding="utf-8"
+        )
+        golden_root = self.output_dir / "golden"
+        golden_dir = golden_root / "test"
+        golden_dir.mkdir(parents=True)
+        (golden_dir / "handwriting_result.json").write_text(
+            json.dumps(golden), encoding="utf-8"
+        )
+
+        with patch.object(compare_golden, "GOLDEN_DIR", golden_root):
+            response = web_app.app.test_client().get(
+                f"/api/jobs/{self.job_id}/pages/1/golden-comparison"
+            )
+
+        payload = response.get_json()
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(payload["available"])
+        self.assertEqual(100.0, payload["success_percent"])
+        self.assertEqual("12/7/26", payload["rows"][0]["golden"])
+
     def test_only_selected_pages_are_scheduled_and_exposed(self):
         selected = [2, 4]
         web_app._jobs[self.job_id]["selected_pages"] = selected
@@ -131,16 +326,27 @@ class ConcurrentJobTests(unittest.TestCase):
         environment = web_app._model_environment("gpt-5.6-luna")
 
         self.assertEqual(
-            "https://admin-9107-resource.services.ai.azure.com/openai/v1/",
+            os.environ.get("GPT_LUNA_ENDPOINT", "https://example.invalid/openai/v1/"),
             environment["GPT_ENDPOINT"],
         )
         self.assertEqual("gpt-5.6-luna", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("", environment["GPT_TARGETS"])
+
+    def test_gpt_54_profile_sets_two_endpoint_pool(self):
+        environment = web_app._model_environment("gpt-5.4")
+        targets = json.loads(environment["GPT_TARGETS"])
+
+        self.assertEqual(
+            [target["name"] for target in json.loads(os.environ.get("GPT_TARGETS", "[]"))],
+            [target["name"] for target in targets],
+        )
+        self.assertEqual(os.environ.get("GPT_DEPLOYMENT", "gpt-5.4"), targets[0]["deployment"])
 
     def test_gpt_54_pro_profile_sets_deployment_reasoning_and_timeout(self):
         environment = web_app._model_environment("gpt-5.4-pro")
 
         self.assertEqual(
-            "https://medical-summary.services.ai.azure.com/openai/v1/",
+            os.environ.get("GPT_PRO_ENDPOINT", os.environ.get("GPT_ENDPOINT")),
             environment["GPT_ENDPOINT"],
         )
         self.assertEqual("gpt-5.4-pro", environment["GPT_DEPLOYMENT"])
@@ -152,12 +358,60 @@ class ConcurrentJobTests(unittest.TestCase):
         environment = web_app._model_environment("gpt-5.6-sol")
 
         self.assertEqual(
-            "https://admin-9107-resource.services.ai.azure.com/openai/v1/",
+            os.environ.get("GPT_SOL_ENDPOINT", "https://example.invalid/openai/v1/"),
             environment["GPT_ENDPOINT"],
         )
         self.assertEqual("gpt-5.6-sol", environment["GPT_DEPLOYMENT"])
         self.assertEqual("low", environment["GPT_REASONING"])
         self.assertEqual("low", environment["OCR_REASONING"])
+        self.assertEqual("", environment["GPT_TARGETS"])
+
+    def test_isolated_multiview_reaches_page_subprocess_environment(self):
+        environment = web_app._page_environment(
+            "gpt-5.6-sol", "isolated-multiview",
+        )
+
+        self.assertEqual("gpt-5.6-sol", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("low", environment["OCR_REASONING"])
+        self.assertEqual("isolated-multiview", environment["OCR_STRATEGY"])
+        self.assertEqual("300", environment["GPT_READ_TIMEOUT"])
+
+    def test_sol_none_profile_sets_fast_page_subprocess_environment(self):
+        environment = web_app._model_environment("gpt-5.6-sol-none")
+
+        self.assertEqual(
+            os.environ.get("GPT_SOL_ENDPOINT", "https://example.invalid/openai/v1/"),
+            environment["GPT_ENDPOINT"],
+        )
+        self.assertEqual("gpt-5.6-sol", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("none", environment["GPT_REASONING"])
+        self.assertEqual("none", environment["OCR_REASONING"])
+        self.assertEqual("", environment["GPT_TARGETS"])
+
+    def test_copilot_opus_48_profile_uses_configured_gh_identity(self):
+        token_result = Mock(stdout="account-specific-token\n")
+        with patch.dict(os.environ, {"COPILOT_GITHUB_USER": "vision-user"}), \
+             patch.object(web_app.subprocess, "run", return_value=token_result) as run:
+            environment = web_app._model_environment("copilot-claude-opus-4.8")
+
+        self.assertEqual("github-copilot-sdk", environment["MODEL_BACKEND"])
+        self.assertEqual("claude-opus-4.8", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("account-specific-token", environment["COPILOT_GITHUB_TOKEN"])
+        self.assertEqual("1", environment["COPILOT_DISABLE_KEYTAR"])
+        self.assertIn("vision-user", run.call_args.args[0])
+
+    def test_copilot_gemini_35_flash_profile_uses_sdk_backend(self):
+        token_result = Mock(stdout="account-specific-token\n")
+        with patch.dict(os.environ, {"COPILOT_GITHUB_USER": "vision-user"}), \
+             patch.object(web_app.subprocess, "run", return_value=token_result):
+            environment = web_app._model_environment("copilot-gemini-3.5-flash")
+
+        self.assertEqual("github-copilot-sdk", environment["MODEL_BACKEND"])
+        self.assertEqual("gemini-3.5-flash", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("low", environment["GPT_REASONING"])
+        self.assertEqual("low", environment["OCR_REASONING"])
+        self.assertEqual("120", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("account-specific-token", environment["COPILOT_GITHUB_TOKEN"])
 
     def test_sol_medium_profile_sets_higher_reasoning_and_timeout(self):
         environment = web_app._model_environment("gpt-5.6-sol-medium")
@@ -207,6 +461,34 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(400, response.status_code)
         self.assertEqual("Unsupported model profile.", response.get_json()["error"])
 
+    def test_create_job_rejects_unknown_ocr_strategy(self):
+        response = web_app.app.test_client().post(
+            "/api/jobs",
+            data={
+                "document": (io.BytesIO(b"not-used"), "document.png"),
+                "model_profile": "gpt-5.6-sol",
+                "ocr_strategy": "unknown-strategy",
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Unsupported OCR strategy.", response.get_json()["error"])
+
+    def test_isolated_multiview_strategy_requires_sol_low(self):
+        response = web_app.app.test_client().post(
+            "/api/jobs",
+            data={
+                "document": (io.BytesIO(b"not-used"), "document.png"),
+                "model_profile": "gpt-5.4",
+                "ocr_strategy": "isolated-multiview",
+            },
+            content_type="multipart/form-data",
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("requires GPT-5.6 Sol low", response.get_json()["error"])
+
     def test_create_job_uses_selected_pages_from_prepared_upload(self):
         upload_id = "prepared-upload"
         web_app._uploads[upload_id] = {
@@ -224,6 +506,7 @@ class ConcurrentJobTests(unittest.TestCase):
                         data={
                             "upload_id": upload_id,
                             "model_profile": "gpt-5.4",
+                            "ocr_strategy": "standard",
                             "pages": "2,4-5",
                         },
                     )
@@ -231,6 +514,7 @@ class ConcurrentJobTests(unittest.TestCase):
 
             self.assertEqual(202, response.status_code)
             self.assertEqual([2, 4, 5], payload["selected_pages"])
+            self.assertEqual("standard", payload["ocr_strategy"])
             self.assertEqual([2, 4, 5], [page["page"] for page in payload["pages"]])
             self.assertEqual(3, payload["selected_page_count"])
         finally:
@@ -327,6 +611,10 @@ class ConcurrentJobTests(unittest.TestCase):
             region_dir / "result.json",
             {"label": "note", "final_transcription": "שלום", "vote": {"candidate_count": 3}},
         )
+        pipeline._write_json_atomic(
+            region_dir / "contextual_recheck.json",
+            {"final_transcription": "שלם[?]", "confidence": 0.4},
+        )
 
         response = web_app.app.test_client().get(f"/api/jobs/{self.job_id}/pages/1/diagnostics")
         payload = response.get_json()
@@ -335,8 +623,11 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(1, payload["detected"]["count"])
         self.assertEqual("שלום", payload["progress"]["regions"][0]["candidates"][0]["text"])
         self.assertEqual("שלום", payload["final_regions"][0]["final_transcription"])
+        self.assertEqual(
+            "שלם[?]", payload["final_regions"][0]["contextual_evidence"]["final_transcription"]
+        )
 
-    def test_full_mode_uses_all_seven_enhancement_candidates(self):
+    def test_full_mode_uses_four_candidates_and_saves_all_enhancements(self):
         page = Image.new("RGB", (800, 1000), "white")
         with tempfile.TemporaryDirectory() as output_dir:
             tasks, images = pipeline.prepare_region_images(
@@ -348,16 +639,18 @@ class ConcurrentJobTests(unittest.TestCase):
                 150,
             )
 
-        self.assertEqual(7, len(tasks))
+        self.assertEqual(list(pipeline.CORE_OCR_VIEWS), [name for name, _ in tasks])
         self.assertEqual(8, len(images))
 
-    def test_handwriting_context_expands_truncated_field(self):
+    def test_handwriting_context_keeps_compact_field_local(self):
         page = Image.new("RGB", (3400, 4400), "white")
 
         expanded = pipeline.add_handwriting_context(page, [1579, 559, 180, 308])
 
-        self.assertGreaterEqual(expanded[2], 700)
-        self.assertGreater(expanded[1] + expanded[3], 1000)
+        self.assertGreater(expanded[2], 180)
+        self.assertLess(expanded[2], 260)
+        self.assertEqual(559, expanded[1])
+        self.assertEqual(867, expanded[1] + expanded[3])
 
     def test_refiner_does_not_chain_compact_field_across_form(self):
         page_path = Path(
@@ -475,8 +768,8 @@ class ConcurrentJobTests(unittest.TestCase):
         deduplicated = pipeline.deduplicate_detection_regions(regions, 3400, 4400)
 
         self.assertEqual(2, len(deduplicated))
-        self.assertEqual([415, 669, 911, 615], deduplicated[0]["box"])
-        self.assertEqual([1285, 660, 1129, 615], deduplicated[1]["box"])
+        self.assertEqual([599, 824, 519, 357], deduplicated[0]["box"])
+        self.assertEqual([1369, 785, 1045, 395], deduplicated[1]["box"])
 
     def test_detection_dedup_merges_same_sized_duplicate_fields(self):
         regions = [
@@ -487,9 +780,21 @@ class ConcurrentJobTests(unittest.TestCase):
         deduplicated = pipeline.deduplicate_detection_regions(regions, 3400, 4400)
 
         self.assertEqual(1, len(deduplicated))
-        self.assertEqual([431, 658, 895, 744], deduplicated[0]["box"])
+        self.assertEqual([431, 658, 895, 642], deduplicated[0]["box"])
 
-    def test_midpage_handwriting_line_gets_horizontal_context_only(self):
+    def test_detection_dedup_overlap_chain_does_not_grow_crop(self):
+        regions = [
+            {"label": "field one", "box": [400, 700, 700, 300]},
+            {"label": "field one duplicate", "box": [430, 720, 680, 290]},
+            {"label": "field one retry", "box": [460, 740, 650, 280]},
+        ]
+
+        deduplicated = pipeline.deduplicate_detection_regions(regions, 3400, 4400)
+
+        self.assertEqual(1, len(deduplicated))
+        self.assertEqual([460, 740, 650, 280], deduplicated[0]["box"])
+
+    def test_midpage_handwriting_line_is_not_stretched_across_page(self):
         regions = [
             {"label": "handwritten name entry in mid upper line", "box": [1411, 1352, 929, 336]},
             {"label": "small form field", "box": [1411, 900, 600, 400]},
@@ -497,7 +802,7 @@ class ConcurrentJobTests(unittest.TestCase):
 
         widened = pipeline.widen_midpage_handwriting_lines(regions, 3400, 4400)
 
-        self.assertEqual([408, 1352, 2652, 336], widened[0]["box"])
+        self.assertEqual(regions[0]["box"], widened[0]["box"])
         self.assertEqual(regions[1]["box"], widened[1]["box"])
 
     def test_lower_detection_pass_runs_when_regions_only_cover_header(self):
@@ -521,9 +826,99 @@ class ConcurrentJobTests(unittest.TestCase):
         expanded = pipeline.add_handwriting_context(page, [437, 1569, 2380, 395])
 
         self.assertGreater(expanded[2], 2380)
-        self.assertLess(expanded[2], 2700)
+        self.assertLess(expanded[2], 2500)
         self.assertEqual(1569, expanded[1])
         self.assertEqual(1964, expanded[1] + expanded[3])
+
+    def test_compact_field_context_uses_local_not_page_padding(self):
+        page = Image.new("RGB", (3308, 4678), "white")
+
+        expanded = pipeline.add_handwriting_context(page, [500, 600, 220, 120])
+
+        self.assertEqual([483, 600, 254, 120], expanded)
+
+    def test_colorless_false_positive_is_removed_on_colored_pen_page(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((100, 100, 400, 120), fill=(30, 80, 190))
+        regions = [
+            {"label": "blue handwritten note", "box": [80, 80, 350, 80]},
+            {"label": "printed legal line", "box": [500, 500, 350, 80]},
+        ]
+
+        filtered = pipeline.filter_colorless_regions_on_colored_page(page, regions)
+
+        self.assertEqual([regions[0]], filtered)
+
+    def test_colored_refiner_does_not_absorb_adjacent_row(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((200, 300, 500, 320), fill=(25, 70, 200))
+        draw.rectangle((200, 500, 500, 520), fill=(25, 70, 200))
+
+        refined = pipeline.refine_box_to_ink(
+            page, [180, 275, 350, 80], color_hint="handwritten date"
+        )
+
+        self.assertLess(refined[1] + refined[3], 400)
+        self.assertGreaterEqual(refined[1], 260)
+
+    def test_colored_page_does_not_refine_printed_box_to_black_ink(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((100, 100, 400, 120), fill=(25, 70, 200))
+        draw.rectangle((500, 500, 900, 520), fill="black")
+        original = [480, 470, 440, 100]
+
+        refined = pipeline.refine_box_to_ink(page, original, color_hint="field")
+
+        self.assertEqual(original, refined)
+
+    def test_colored_geometry_splits_rows_and_drops_printed_region(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((200, 300, 500, 320), fill=(25, 70, 200))
+        draw.rectangle((220, 500, 520, 520), fill=(25, 70, 200))
+        draw.rectangle((100, 700, 900, 720), fill="black")
+        regions = [
+            {"label": "two handwritten rows", "box": [150, 250, 450, 350]},
+            {"label": "printed clause", "box": [80, 650, 840, 120]},
+        ]
+
+        tightened = pipeline.tighten_regions_to_colored_ink(page, regions)
+
+        self.assertEqual(2, len(tightened))
+        self.assertLess(tightened[0]["box"][1] + tightened[0]["box"][3], 400)
+        self.assertGreater(tightened[1]["box"][1], 400)
+
+    def test_colored_line_fragments_merge_without_merging_rows(self):
+        regions = [
+            {"label": "left fragment", "box": [100, 300, 200, 80]},
+            {"label": "right fragment", "box": [325, 305, 240, 75]},
+            {"label": "next row", "box": [100, 460, 465, 80]},
+        ]
+
+        merged = pipeline.merge_colored_line_fragments(regions)
+
+        self.assertEqual(2, len(merged))
+        self.assertEqual([100, 300, 465, 80], merged[0]["box"])
+        self.assertEqual(regions[2]["box"], merged[1]["box"])
+
+    def test_colored_page_finds_pen_region_model_missed(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((150, 250, 400, 280), fill=(25, 70, 200))
+        draw.rectangle((600, 700, 850, 730), fill=(25, 70, 200))
+        draw.rectangle((100, 500, 900, 520), fill="black")
+        model_regions = [
+            {"label": "model found first row", "box": [120, 220, 320, 100]},
+        ]
+
+        detected = pipeline.detect_colored_pen_regions(page, model_regions)
+
+        self.assertEqual(2, len(detected))
+        self.assertEqual("model found first row", detected[0]["label"])
+        self.assertEqual("colored handwriting", detected[1]["label"])
 
     def test_overlapping_long_lines_are_split_vertically(self):
         regions = [
@@ -698,6 +1093,452 @@ class ConcurrentJobTests(unittest.TestCase):
         guarded = pipeline.guard_visual_reconciliation(final, usable)
 
         self.assertEqual(final, guarded)
+
+    def test_numeric_order_guard_preserves_faithful_candidate_sequence(self):
+        usable = [
+            {"source": source, "ocr": {"full_transcription": text}}
+            for source, text in [
+                ("01_original_crop.png", "5252 731"),
+                ("04_denoised.png", "5252 731"),
+                ("02_upscaled_contrast.png", "731 5252"),
+            ]
+        ]
+
+        final = pipeline.finalize_region_semantics(
+            {"final_transcription": "731 5252", "words": [], "notes": []}, usable
+        )
+
+        self.assertEqual("5252 731", final["final_transcription"])
+        self.assertEqual("numeric_order_guard", final["decision_status"])
+        self.assertEqual("handwritten_text", final["classification"])
+
+    def test_candidate_protection_rejects_reorder_and_information_loss(self):
+        usable = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "5252 731", "words": []},
+        }]
+        reordered = pipeline.protect_faithful_candidate(
+            {"final_transcription": "731 5252", "words": []}, usable
+        )
+        shortened = pipeline.protect_faithful_candidate(
+            {"final_transcription": "5252", "words": []}, usable
+        )
+
+        self.assertEqual("5252 731", reordered["final_transcription"])
+        self.assertEqual("reordered", reordered["candidate_protection"]["reason"])
+        self.assertEqual("5252 731", shortened["final_transcription"])
+        self.assertEqual("lower_information", shortened["candidate_protection"]["reason"])
+
+    def test_contextual_recheck_is_adaptive(self):
+        easy = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "5298570", "words": [{"confidence": 0.95}]},
+        }]
+        difficult = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "שלום[?]", "words": [{"confidence": 0.4}]},
+        }]
+
+        self.assertFalse(pipeline.should_contextual_recheck(
+            {"classification": "handwritten_text", "final_transcription": "5298570"}, easy
+        ))
+        self.assertTrue(pipeline.should_contextual_recheck(
+            {"classification": "handwritten_text", "final_transcription": "שלום[?]"}, difficult
+        ))
+        self.assertTrue(pipeline.should_contextual_recheck(
+            {"classification": "handwritten_text", "final_transcription": "134/26"}, easy
+        ))
+
+    def test_contextual_images_include_larger_crop_and_full_page(self):
+        page = Image.new("RGB", (1000, 800), "white")
+        context, highlighted = pipeline.build_contextual_region_images(
+            page, [400, 300, 100, 60]
+        )
+
+        self.assertGreater(context.width, 100)
+        self.assertGreater(context.height, 60)
+        self.assertEqual((1000, 800), highlighted.size)
+
+    def test_nearby_printed_context_tracks_vertical_region_position(self):
+        markdown = "\n".join(f"line {index}" for index in range(20))
+
+        top = pipeline.nearby_printed_context(markdown, [0, 0, 100, 50], 1000, window=1)
+        bottom = pipeline.nearby_printed_context(
+            markdown, [0, 900, 100, 50], 1000, window=1
+        )
+
+        self.assertIn("line 0", top)
+        self.assertNotIn("line 19", top)
+        self.assertIn("line 19", bottom)
+        self.assertNotIn("line 0", bottom)
+
+    def test_contextual_acceptance_rejects_lower_information(self):
+        current = {"final_transcription": "בנק הפועלים", "words": []}
+        rejected = pipeline.accept_contextual_recheck(current, {
+            "final_transcription": "בנק", "confidence": 0.9,
+        })
+        accepted = pipeline.accept_contextual_recheck(current, {
+            "classification": "handwritten_text",
+            "final_transcription": "בנק הפועלים", "confidence": 0.8,
+        })
+
+        self.assertIs(current, rejected)
+        self.assertEqual("contextual_recheck", accepted["decision_status"])
+
+    def test_contextual_acceptance_uses_configured_confidence_floor(self):
+        current = {"final_transcription": "גבעתיים", "words": []}
+        below_floor = pipeline.accept_contextual_recheck(current, {
+            "classification": "handwritten_text",
+            "final_transcription": "בארותים",
+            "confidence": pipeline.CONTEXTUAL_RECHECK_MIN_CONFIDENCE - 0.01,
+        })
+        at_floor = pipeline.accept_contextual_recheck(current, {
+            "classification": "handwritten_text",
+            "final_transcription": "בארותיים",
+            "confidence": pipeline.CONTEXTUAL_RECHECK_MIN_CONFIDENCE,
+        })
+
+        self.assertIs(current, below_floor)
+        self.assertEqual("בארותיים", at_floor["final_transcription"])
+        self.assertEqual("contextual_recheck", at_floor["decision_status"])
+
+    def test_repeated_structured_field_uses_stronger_one_digit_match(self):
+        regions = [
+            {"label": "top form customer number"},
+            {"label": "bottom form customer number"},
+        ]
+        finals = [
+            {
+                "final_transcription": "5252 731",
+                "words": [{"text": "5252", "confidence": 0.99}],
+            },
+            {
+                "final_transcription": "6252731",
+                "confidence": 0.82,
+                "words": [],
+            },
+        ]
+
+        reconciled = pipeline.reconcile_repeated_structured_fields(finals, regions)
+
+        self.assertEqual("5252 731", reconciled[1]["final_transcription"])
+        self.assertEqual("cross_region_structured_consensus", reconciled[1]["decision_status"])
+        self.assertEqual("6252731", reconciled[1]["alternative_transcriptions"][0])
+
+    def test_repeated_structured_field_rejects_weak_or_non_identifier_matches(self):
+        weak = pipeline.reconcile_repeated_structured_fields(
+            [
+                {"final_transcription": "5252731", "confidence": 0.89},
+                {"final_transcription": "6252731", "confidence": 0.80},
+            ],
+            [
+                {"label": "top form customer number"},
+                {"label": "bottom form customer number"},
+            ],
+        )
+        dates = pipeline.reconcile_repeated_structured_fields(
+            [
+                {"final_transcription": "12/7/26", "confidence": 0.99},
+                {"final_transcription": "13/7/26", "confidence": 0.70},
+            ],
+            [{"label": "top date"}, {"label": "bottom date"}],
+        )
+
+        self.assertEqual("6252731", weak[1]["final_transcription"])
+        self.assertEqual("13/7/26", dates[1]["final_transcription"])
+
+    def test_contextual_acceptance_rejects_script_change_and_lost_structured_token(self):
+        hebrew = {"final_transcription": "ביוב", "words": []}
+        schedule = {"final_transcription": "O+ 1/8/26 31/8/26", "words": []}
+
+        self.assertIs(hebrew, pipeline.accept_contextual_recheck(hebrew, {
+            "classification": "mark_or_checkbox",
+            "final_transcription": "circle mark", "confidence": 0.95,
+        }))
+        self.assertIs(schedule, pipeline.accept_contextual_recheck(schedule, {
+            "classification": "handwritten_text",
+            "final_transcription": "1/8/26 31/8/26", "confidence": 0.95,
+        }))
+
+    def test_contextual_hebrew_prompt_withholds_candidate_to_avoid_anchoring(self):
+        page = Image.new("RGB", (1000, 800), "white")
+        captured = {}
+
+        def fake_call(content, **_kwargs):
+            captured["prompt"] = content[0]["text"]
+            return {"classification": "handwritten_text", "final_transcription": "בארותיים"}
+
+        with patch.object(pipeline, "_responses_call", side_effect=fake_call):
+            pipeline.contextual_region_recheck(
+                page,
+                {"box": [400, 300, 100, 60]},
+                {"final_transcription": "ראשל״צ"},
+            )
+
+        self.assertIn("withheld for an independent Hebrew reread", captured["prompt"])
+        self.assertNotIn("ראשל״צ", captured["prompt"])
+
+    def test_spatial_numeric_cells_are_assembled_left_to_right(self):
+        recheck = pipeline.assemble_spatial_numeric_cells({
+            "field_type": "numeric",
+            "final_transcription": "05686399 142 012123",
+            "numeric_cells": [
+                {"value": "142", "x": 0.50, "confidence": 0.9},
+                {"value": "05686399", "x": 0.82, "confidence": 0.8},
+                {"value": "012123", "x": 0.16, "confidence": 0.95},
+            ],
+        })
+
+        self.assertEqual("012123 142 05686399", recheck["final_transcription"])
+        self.assertTrue(recheck["spatial_numeric_assembly"])
+
+    def test_spatial_numeric_cells_group_adjacent_single_digits(self):
+        recheck = pipeline.assemble_spatial_numeric_cells({
+            "field_type": "numeric",
+            "final_transcription": "056 142 012",
+            "numeric_cells": [
+                {"value": "1", "x": 0.15},
+                {"value": "2", "x": 0.20},
+                {"value": "0", "x": 0.10},
+                {"value": "142", "x": 0.50},
+                {"value": "0", "x": 0.75},
+                {"value": "5", "x": 0.80},
+                {"value": "6", "x": 0.85},
+            ],
+        })
+
+        self.assertEqual("012 142 056", recheck["final_transcription"])
+        self.assertTrue(recheck["spatial_numeric_assembly"])
+
+    def test_spatial_numeric_cells_ignore_mixed_script(self):
+        original = {
+            "field_type": "numeric",
+            "final_transcription": "012123 142",
+            "numeric_cells": [
+                {"value": "012123", "x": 0.2},
+                {"value": "בנק", "x": 0.8},
+            ],
+        }
+
+        self.assertIs(original, pipeline.assemble_spatial_numeric_cells(original))
+
+    def test_signature_semantics_clear_transcription(self):
+        final = pipeline.finalize_region_semantics(
+            {
+                "classification": "signature_non_text",
+                "final_transcription": "[?]",
+                "words": [{"text": "[?]"}],
+            },
+            [],
+            signature_flourish=True,
+        )
+
+        self.assertEqual("", final["final_transcription"])
+        self.assertEqual([], final["words"])
+        self.assertEqual("signature_non_text", final["decision_status"])
+
+    def test_signature_geometry_rejects_separate_letter_components(self):
+        signature = Image.new("RGB", (200, 80), "white")
+        draw = ImageDraw.Draw(signature)
+        draw.line((10, 40, 190, 40), fill=(0, 70, 220), width=5)
+        draw.ellipse((70, 10, 120, 65), outline=(0, 70, 220), width=5)
+        word = Image.new("RGB", (200, 80), "white")
+        draw = ImageDraw.Draw(word)
+        draw.ellipse((20, 15, 60, 65), outline=(0, 70, 220), width=5)
+        draw.ellipse((85, 15, 125, 65), outline=(0, 70, 220), width=5)
+        draw.ellipse((150, 15, 190, 65), outline=(0, 70, 220), width=5)
+
+        self.assertTrue(pipeline.is_signature_flourish(signature))
+        self.assertFalse(pipeline.is_signature_flourish(word))
+
+    def test_mark_semantics_render_x_and_number(self):
+        final = pipeline.finalize_region_semantics(
+            {
+                "classification": "mark_or_checkbox",
+                "final_transcription": "1 X",
+                "marks": ["X"],
+                "digits": ["1"],
+            },
+            [],
+        )
+
+        self.assertEqual("סימון x ו המספר 1", final["final_transcription"])
+        self.assertEqual("structured_mark", final["decision_status"])
+
+    def test_empty_visual_result_preserves_multi_image_text_on_non_signature(self):
+        usable = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "ביוב", "words": [{"text": "ביוב"}]},
+        }]
+
+        final = pipeline.finalize_region_semantics(
+            {
+                "classification": "mark_or_checkbox",
+                "final_transcription": "",
+                "marks": [],
+                "words": [],
+            },
+            usable,
+            signature_flourish=False,
+        )
+
+        self.assertEqual("ביוב", final["final_transcription"])
+        self.assertEqual("handwritten_text", final["classification"])
+        self.assertEqual("nonempty_faithful_fallback", final["decision_status"])
+
+    def test_full_mode_ocr_uses_only_four_core_views(self):
+        image = Image.new("RGB", (80, 40), "white")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tasks, all_images = pipeline.prepare_region_images(
+                image,
+                {"box": [0, 0, 80, 40]},
+                temp_dir,
+                "full",
+                chunk_width=900,
+                overlap=150,
+            )
+
+        self.assertEqual(list(pipeline.CORE_OCR_VIEWS), [name for name, _ in tasks])
+        self.assertEqual(8, len(all_images))
+        self.assertIn("03_adaptive_threshold.png", dict(all_images))
+        self.assertIn("07_pen_stroke_isolated.png", dict(all_images))
+
+    @patch.object(pipeline, "_responses_call")
+    def test_multi_image_ocr_sends_four_labeled_views_in_one_call(self, responses_call):
+        responses_call.return_value = {"full_transcription": "5252731", "words": []}
+        images = [
+            (name, Image.new("RGB", (20, 10), "white"))
+            for name in pipeline.CORE_OCR_VIEWS
+        ]
+
+        result = pipeline.ocr_image_set(images, "read this")
+
+        content = responses_call.call_args.args[0]
+        self.assertEqual(4, sum(item["type"] == "input_image" for item in content))
+        self.assertEqual(
+            list(pipeline.CORE_OCR_VIEWS),
+            result["evidence_views"],
+        )
+        labels = [item["text"] for item in content if item["type"] == "input_text"]
+        self.assertTrue(all(any(name in label for label in labels) for name in pipeline.CORE_OCR_VIEWS))
+
+    @patch.object(pipeline, "_responses_call")
+    def test_isolated_multiview_plan_aligns_two_blind_reads(self, responses_call):
+        responses_call.side_effect = [
+            {"transcription": "סניף"},
+            {"transcription": "סניף"},
+        ]
+        views = [
+            ("original_with_form_line", Image.new("RGB", (20, 10), "white")),
+            ("blue_only", Image.new("RGB", (20, 10), "white")),
+            ("blue_only_enlarged", Image.new("RGB", (60, 30), "white")),
+        ]
+
+        final, candidates, details = pipeline.run_isolated_multiview_plan({
+            "lines": [{
+                "line": 1,
+                "mode": "word_groups",
+                "units": [{"unit_rtl": 1, "views": views, "metadata": {}}],
+            }],
+            "draws": 2,
+        })
+
+        self.assertEqual("סניף", final["final_transcription"])
+        self.assertFalse(final["needs_review"])
+        self.assertEqual("isolated_multiview_consensus", final["decision_status"])
+        self.assertEqual(2, len(candidates))
+        self.assertEqual(2, details["successful_calls"])
+        self.assertTrue(all(
+            sum(item["type"] == "input_image" for item in call.args[0]) == 3
+            for call in responses_call.call_args_list
+        ))
+
+    def test_isolated_multiview_pipeline_writes_standard_result_artifacts(self):
+        input_path = self.output_dir / "lined.png"
+        Image.new("RGB", (120, 80), "white").save(input_path)
+        output_dir = self.output_dir / "isolated-output"
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "סניף פארק",
+            "alternative_transcriptions": [],
+            "words": [],
+            "notes": ["experimental isolated multi-view consensus"],
+            "needs_review": False,
+            "decision_status": "isolated_multiview_consensus",
+        }
+        candidates = [
+            {"source": "isolated_multiview_a", "ocr": {"full_transcription": "סניף פארק"}},
+            {"source": "isolated_multiview_b", "ocr": {"full_transcription": "סניף פארק"}},
+        ]
+        plan = {"lines": [], "draws": 2}
+
+        with patch.object(pipeline, "OCR_STRATEGY", pipeline.ISOLATED_MULTIVIEW_STRATEGY), \
+             patch.object(pipeline, "detect_handwriting_regions", return_value=[{
+                 "label": "lined handwriting", "box": [0, 0, 120, 80],
+             }]), \
+             patch.object(pipeline, "prepare_isolated_multiview_plan", return_value=plan), \
+             patch.object(
+                 pipeline,
+                 "run_isolated_multiview_plan",
+                 return_value=(final, candidates, {"final_transcription": "סניף פארק"}),
+             ), \
+             patch.object(pipeline, "visual_reconcile_ocr_results") as visual_reconcile:
+            return_code = pipeline.run_pipeline(
+                str(input_path),
+                page=1,
+                dpi=400,
+                crops=None,
+                output_dir=str(output_dir),
+                chunk_width=900,
+                overlap=150,
+                ocr_mode="full",
+                auto_detect=True,
+                merge_md=False,
+            )
+
+        result = json.loads((output_dir / "handwriting_result.json").read_text())
+        region = result["regions"][0]
+        self.assertEqual(0, return_code)
+        self.assertEqual("isolated-multiview", result["ocr_strategy"])
+        self.assertEqual("סניף פארק", region["final_transcription"])
+        self.assertEqual("isolated_multiview_consensus", region["decision_status"])
+        self.assertTrue((output_dir / region["folder"] / "result.json").exists())
+        visual_reconcile.assert_not_called()
+
+    def test_responses_url_accepts_base_or_full_url(self):
+        self.assertEqual(
+            "https://example.test/openai/v1/responses",
+            pipeline._responses_url("https://example.test/openai/v1/"),
+        )
+        self.assertEqual(
+            "https://example.test/openai/v1/responses",
+            pipeline._responses_url("https://example.test/openai/v1/responses"),
+        )
+
+    @patch.object(pipeline, "_bearer", return_value="token")
+    @patch.object(pipeline.requests, "post")
+    def test_transient_error_immediately_fails_over_to_second_endpoint(self, post, _bearer):
+        success = Mock(status_code=200)
+        success.json.return_value = {
+            "output_text": '{"ok": true}',
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        post.side_effect = [pipeline.requests.exceptions.ReadTimeout("slow"), success]
+        targets = [
+            {"name": "one", "url": "https://one/responses", "deployment": "gpt-5.4"},
+            {"name": "two", "url": "https://two/responses", "deployment": "gpt-5.4"},
+        ]
+
+        with patch.object(pipeline, "GPT_TARGETS", targets), \
+             patch.object(pipeline, "_target_cursor", 0):
+            text = pipeline._responses_text(
+                [{"type": "input_text", "text": "test"}], retries=0
+            )
+
+        self.assertEqual('{"ok": true}', text)
+        self.assertEqual(2, post.call_count)
+        self.assertEqual("https://one/responses", post.call_args_list[0].args[0])
+        self.assertEqual("https://two/responses", post.call_args_list[1].args[0])
 
     @patch.object(pipeline, "_responses_call")
     def test_focused_recheck_uses_only_faithful_images(self, responses_call):

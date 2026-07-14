@@ -21,19 +21,20 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import functools
 import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-# The three sample documents that make up the golden dataset.
+# Human-verified sample documents that make up the golden dataset.
 SAMPLES = [
     {"stem": "אישור מסירה -דירה 8", "input": "sample/אישור מסירה -דירה 8.pdf", "args": []},
     {"stem": "חוזר מכר - דף ראשון", "input": "sample/חוזר מכר - דף ראשון.png", "args": []},
     {"stem": "פרוטוקול משולב ידני ומודפס  דוגמה",
      "input": "sample/פרוטוקול משולב ידני ומודפס  דוגמה.pdf", "args": []},
+    {"stem": "חיוב חשבון1", "input": "sample/חיוב חשבון1.pdf", "args": []},
+    {"stem": "חיוב חשבון2", "input": "sample/חיוב חשבון2.pdf", "args": []},
 ]
 
 OUTPUT_DIR = Path("output_handwriting")
@@ -57,9 +58,74 @@ def _ratio(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, _norm(a), _norm(b)).ratio()
 
 
+def _exact_norm(text: str) -> str:
+    """Canonical form for strict OCR accuracy: ignore layout and punctuation only."""
+    return re.sub(r"[^\w\u0590-\u05ff]", "", (text or "").replace("[?]", "")).lower()
+
+
 def _center(box: list[int]) -> tuple[float, float]:
     x, y, w, h = box
     return (x + w / 2.0, y + h / 2.0)
+
+
+def _minimum_cost_assignment(costs: list[list[float]]) -> tuple[int, ...]:
+    """Return globally optimal column indexes for a rectangular rows <= columns matrix."""
+    row_count = len(costs)
+    column_count = len(costs[0]) if costs else 0
+    if not row_count:
+        return ()
+    if row_count > column_count:
+        raise ValueError("assignment requires at least as many columns as rows")
+
+    row_potentials = [0.0] * (row_count + 1)
+    column_potentials = [0.0] * (column_count + 1)
+    matched_row = [0] * (column_count + 1)
+    predecessor = [0] * (column_count + 1)
+    for row in range(1, row_count + 1):
+        matched_row[0] = row
+        column = 0
+        minimums = [float("inf")] * (column_count + 1)
+        used = [False] * (column_count + 1)
+        while True:
+            used[column] = True
+            active_row = matched_row[column]
+            delta = float("inf")
+            next_column = 0
+            for candidate in range(1, column_count + 1):
+                if used[candidate]:
+                    continue
+                reduced = (
+                    costs[active_row - 1][candidate - 1]
+                    - row_potentials[active_row]
+                    - column_potentials[candidate]
+                )
+                if reduced < minimums[candidate]:
+                    minimums[candidate] = reduced
+                    predecessor[candidate] = column
+                if minimums[candidate] < delta:
+                    delta = minimums[candidate]
+                    next_column = candidate
+            for candidate in range(column_count + 1):
+                if used[candidate]:
+                    row_potentials[matched_row[candidate]] += delta
+                    column_potentials[candidate] -= delta
+                else:
+                    minimums[candidate] -= delta
+            column = next_column
+            if matched_row[column] == 0:
+                break
+        while True:
+            previous = predecessor[column]
+            matched_row[column] = matched_row[previous]
+            column = previous
+            if column == 0:
+                break
+
+    assignment = [-1] * row_count
+    for column in range(1, column_count + 1):
+        if matched_row[column]:
+            assignment[matched_row[column] - 1] = column - 1
+    return tuple(assignment)
 
 
 def _is_stable(text: str) -> bool:
@@ -96,29 +162,19 @@ def _match(golden: list[dict], current: list[dict]):
             for cx, cy in (_center(current_region["box"]) for current_region in current)
         ])
 
-    @functools.lru_cache(maxsize=None)
-    def assign(golden_index: int, used_mask: int):
-        if golden_index == len(golden):
-            return 0.0, ()
-        choices = []
-        for current_index in range(len(current)):
-            if used_mask & (1 << current_index):
-                continue
-            tail_cost, tail = assign(golden_index + 1, used_mask | (1 << current_index))
-            choices.append((costs[golden_index][current_index] + tail_cost,
-                            (current_index,) + tail))
-        if not choices:
-            return float("inf"), ()
-        return min(choices, key=lambda choice: choice[0])
-
-    matched_count = min(len(golden), len(current))
-    if len(golden) <= len(current) and len(current) <= 15:
-        _cost, assignment = assign(0, 0)
+    if len(golden) <= len(current):
+        assignment = _minimum_cost_assignment(costs)
     else:
-        assignment = tuple(range(matched_count))
-    used = set(assignment)
+        transposed = [list(column) for column in zip(*costs)]
+        current_to_golden = _minimum_cost_assignment(transposed)
+        assignment_by_golden = {
+            golden_index: current_index
+            for current_index, golden_index in enumerate(current_to_golden)
+        }
+        assignment = tuple(assignment_by_golden.get(index, -1) for index in range(len(golden)))
+    used = {index for index in assignment if index >= 0}
     pairs = [
-        (region, current[assignment[index]] if index < len(assignment) else None)
+        (region, current[assignment[index]] if assignment[index] >= 0 else None)
         for index, region in enumerate(golden)
     ]
     extras = [region for index, region in enumerate(current) if index not in used]
@@ -159,6 +215,10 @@ def compare_sample(stem: str, current_result: Path | None = None) -> dict:
     pairs, extras = _match(golden, current)
 
     rows, ratios, fails = [], [], 0
+    text_exact = 0
+    text_total = 0
+    classification_correct = 0
+    classification_total = 0
     for g, c in pairs:
         gt = g.get("final_transcription") or ""
         ct = None if c is None else (c.get("final_transcription") or "")
@@ -167,8 +227,24 @@ def compare_sample(stem: str, current_result: Path | None = None) -> dict:
         fails += int(is_fail)
         if label != "MISSING":
             ratios.append(r)
+        expected_classification = g.get("human_classification")
+        actual_classification = None if c is None else c.get("classification")
+        classification_match = None
+        if expected_classification:
+            classification_total += 1
+            classification_match = actual_classification == expected_classification
+            classification_correct += int(classification_match)
+        exact = None
+        if not expected_classification:
+            text_total += 1
+            exact = c is not None and _exact_norm(gt) == _exact_norm(ct or "")
+            text_exact += int(exact)
         rows.append({"golden_label": g.get("label", ""), "golden": gt,
-                     "current": ct, "status": label, "ratio": r, "stable": stable})
+                     "current": ct, "status": label, "ratio": r, "stable": stable,
+                     "exact": exact,
+                     "expected_classification": expected_classification,
+                     "actual_classification": actual_classification,
+                     "classification_match": classification_match})
 
     count_fail = len(current) != len(golden)
     avg = sum(ratios) / len(ratios) if ratios else 0.0
@@ -184,6 +260,21 @@ def compare_sample(stem: str, current_result: Path | None = None) -> dict:
         "golden_count": len(golden), "current_count": len(current),
         "count_fail": count_fail, "avg_ratio": avg, "md_ratio": md_ratio,
         "fails": fails, "verdict": verdict,
+        "strict": {
+            "text_exact": text_exact,
+            "text_total": text_total,
+            "text_accuracy": text_exact / text_total if text_total else 0.0,
+            "classification_correct": classification_correct,
+            "classification_total": classification_total,
+            "classification_accuracy": (
+                classification_correct / classification_total if classification_total else 1.0
+            ),
+            "pass": (
+                text_exact == text_total
+                and classification_correct == classification_total
+                and not count_fail
+            ),
+        },
         "usage": cur_data.get("usage"), "elapsed": cur_data.get("elapsed"),
     }
 
@@ -209,6 +300,10 @@ def _print_report(res: dict) -> None:
               f"{(ex.get('final_transcription') or '')[:60]!r}")
     md = f"{res['md_ratio']:.2f}" if res["md_ratio"] is not None else "n/a"
     print(f"  avg region similarity: {res['avg_ratio']:.2f}   merged.md similarity: {md}")
+    strict = res["strict"]
+    print(f"  strict human golden: {strict['text_exact']}/{strict['text_total']} exact text "
+          f"({strict['text_accuracy']:.1%}); "
+          f"{strict['classification_correct']}/{strict['classification_total']} classifications")
     u = res.get("usage") or {}
     if u or res.get("elapsed"):
         tok = (f"{u.get('total_tokens', 0):,} tokens "

@@ -29,20 +29,23 @@ from pathlib import Path
 import fitz  # PyMuPDF
 import requests
 from azure.identity import AzureCliCredential
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # --------------------------------------------------------------------------- #
 # Configuration (override with environment variables)
 # --------------------------------------------------------------------------- #
 CU_ENDPOINT = os.environ.get(
     "CU_ENDPOINT",
-    "https://ai-content-understanding-resource-2416.cognitiveservices.azure.com/",
+    "https://example.invalid/",
 ).rstrip("/") + "/"
 CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
 ANALYZER_ID = os.environ.get("CU_ANALYZER_ID", "hebrewHandoverForm")
 
 GPT_ENDPOINT = os.environ.get(
     "GPT_ENDPOINT",
-    "https://medical-summary.services.ai.azure.com/openai/v1/",
+    "https://example.invalid/openai/v1/",
 ).rstrip("/") + "/"
 GPT_DEPLOYMENT = os.environ.get("GPT_DEPLOYMENT", "gpt-5.4")
 # How many times to read each page with GPT and majority-vote the fields

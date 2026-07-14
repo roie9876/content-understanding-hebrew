@@ -4,6 +4,7 @@ const workspace = document.querySelector("#workspace");
 const uploadForm = document.querySelector("#uploadForm");
 const fileInput = document.querySelector("#fileInput");
 const modelSelect = document.querySelector("#modelSelect");
+const strategySelect = document.querySelector("#strategySelect");
 const uploadError = document.querySelector("#uploadError");
 const jobError = document.querySelector("#jobError");
 const sourceImage = document.querySelector("#sourceImage");
@@ -15,6 +16,8 @@ const handwritingFrame = document.querySelector("#handwritingFrame");
 const mergedDocumentFrame = document.querySelector("#mergedDocumentFrame");
 const regionsImage = document.querySelector("#regionsImage");
 const adminOutput = document.querySelector("#adminOutput");
+const goldenOutput = document.querySelector("#goldenOutput");
+const downloadPngButton = document.querySelector("#downloadPngButton");
 const selectionError = document.querySelector("#selectionError");
 const pageRangeInput = document.querySelector("#pageRangeInput");
 const thumbnailGrid = document.querySelector("#thumbnailGrid");
@@ -22,6 +25,10 @@ const selectionPreviewImage = document.querySelector("#selectionPreviewImage");
 const savedRunsList = document.querySelector("#savedRunsList");
 const comparisonWorkspace = document.querySelector(".comparison-workspace");
 const workspaceSplitter = document.querySelector("#workspaceSplitter");
+const resultCanvas = document.querySelector("#resultCanvas");
+const zoomLevel = document.querySelector("#zoomLevel");
+const zoomOutButton = document.querySelector("#zoomOutButton");
+const zoomInButton = document.querySelector("#zoomInButton");
 
 let activeJob = null;
 let activeUpload = null;
@@ -32,6 +39,22 @@ let activeView = "content";
 let pollTimer = null;
 let loadedContentUrl = null;
 let diagnosticRequest = 0;
+let goldenRequest = 0;
+let processZoom = Number(localStorage.getItem("inkSightProcessZoom")) || 100;
+
+function setProcessZoom(percent, persist = true) {
+  processZoom = Math.max(50, Math.min(200, Math.round(percent / 25) * 25));
+  resultCanvas.style.setProperty("--process-zoom", String(processZoom / 100));
+  zoomLevel.textContent = `${processZoom}%`;
+  zoomOutButton.disabled = processZoom === 50;
+  zoomInButton.disabled = processZoom === 200;
+  if (persist) localStorage.setItem("inkSightProcessZoom", String(processZoom));
+}
+
+zoomOutButton.addEventListener("click", () => setProcessZoom(processZoom - 25));
+zoomInButton.addEventListener("click", () => setProcessZoom(processZoom + 25));
+document.querySelector("#zoomResetButton").addEventListener("click", () => setProcessZoom(100));
+setProcessZoom(processZoom, false);
 
 function setSourcePanelWidth(percent, persist = true) {
   const clamped = Math.max(20, Math.min(80, percent));
@@ -224,7 +247,7 @@ function addAdminStat(container, label, value) {
   container.append(stat);
 }
 
-function regionDetails(region, candidateCount) {
+function regionDetails(region, candidateCount, countLabel = "evidence reads") {
   const details = createElement("details", "region-diagnostic");
   const summary = createElement("summary");
   summary.append(createElement("span", "region-index", region.region || "?"));
@@ -233,7 +256,7 @@ function regionDetails(region, candidateCount) {
     createElement("strong", "", region.label || `Region ${region.region || ""}`),
     createElement("span", "", `Box: ${(region.box || []).join(", ")}`),
   );
-  summary.append(title, createElement("span", "region-count", `${candidateCount} candidate${candidateCount === 1 ? "" : "s"}`));
+  summary.append(title, createElement("span", "region-count", `${candidateCount} ${countLabel}`));
   details.append(summary);
   return details;
 }
@@ -267,19 +290,41 @@ function renderDetection(diagnostics, page) {
 function renderCandidates(diagnostics) {
   const progress = diagnostics.progress || {};
   const regions = progress.regions || [];
+  const finalRegions = diagnostics.final_regions || [];
   const summary = createElement("div", "admin-summary");
   const completedDraws = Math.min(progress.completed || 0, progress.total || 0);
   addAdminStat(summary, "Completed draws", `${completedDraws} / ${progress.total || 0}`);
   addAdminStat(summary, "Failed attempts", progress.failed || 0);
   addAdminStat(summary, "Regions", regions.length);
   adminOutput.append(summary);
+  adminOutput.append(createElement(
+    "div",
+    "admin-empty",
+    "core4_multi is one model response synthesized from four image views. After reconciliation, visual and contextual reads appear below as separate evidence.",
+  ));
   const list = createElement("div", "diagnostic-list");
   regions.forEach((region, index) => {
-    const candidates = region.candidates || [];
-    const details = regionDetails(region, candidates.length);
-    if (index === 0 && candidates.length) details.open = true;
+    const rawCandidates = region.candidates || [];
+    const finalRegion = finalRegions[index] || {};
+    const evidence = rawCandidates.map((candidate) => ({
+      source: candidate.source === "core4_multi"
+        ? "core4_multi · 4 views / 1 response"
+        : candidate.source,
+      text: candidate.text,
+    }));
+    if (finalRegion.pre_context_transcription) {
+      evidence.push({ source: "visual adjudication", text: finalRegion.pre_context_transcription });
+    }
+    if (finalRegion.contextual_evidence) {
+      evidence.push({
+        source: "blind contextual reread",
+        text: finalRegion.contextual_evidence.final_transcription,
+      });
+    }
+    const details = regionDetails(region, evidence.length);
+    if (index === 0 && evidence.length) details.open = true;
     const body = createElement("div", "diagnostic-body");
-    candidates.forEach((candidate) => {
+    evidence.forEach((candidate) => {
       const row = createElement("div", "candidate");
       row.append(
         createElement("div", "candidate-source", candidate.source),
@@ -287,7 +332,7 @@ function renderCandidates(diagnostics) {
       );
       body.append(row);
     });
-    if (!candidates.length) body.append(createElement("div", "admin-empty", "No model response yet"));
+    if (!evidence.length) body.append(createElement("div", "admin-empty", "No model response yet"));
     details.append(body);
     list.append(details);
   });
@@ -307,7 +352,11 @@ function renderDecision(diagnostics) {
   const list = createElement("div", "diagnostic-list");
   regions.forEach((region, index) => {
     const candidates = region.per_image || [];
-    const details = regionDetails({ ...region, region: index + 1 }, candidates.length);
+    const details = regionDetails(
+      { ...region, region: index + 1 },
+      candidates.length,
+      "raw OCR responses",
+    );
     const body = createElement("div", "diagnostic-body");
     body.append(
       createElement("div", "decision-selected", region.final_transcription || "(empty final transcription)"),
@@ -433,7 +482,7 @@ async function loadSavedRuns() {
         <span class="saved-run-icon"><i data-lucide="history"></i></span>
         <span class="saved-run-copy">
           <strong>${escapeHtml(run.file_name)}</strong>
-          <span>${escapeHtml(formatRunDate(run.created_at))} · ${run.selected_page_count} ${run.selected_page_count === 1 ? "page" : "pages"} · ${escapeHtml(run.model_label)}</span>
+          <span>${escapeHtml(formatRunDate(run.created_at))} · ${run.selected_page_count} ${run.selected_page_count === 1 ? "page" : "pages"} · ${escapeHtml(run.model_label)}${run.ocr_strategy !== "standard" ? ` · ${escapeHtml(run.ocr_strategy_label)}` : ""}</span>
           <code>${escapeHtml(run.run_name)}</code>
         </span>
         <i class="saved-run-arrow" data-lucide="chevron-right"></i>`;
@@ -455,6 +504,7 @@ async function analyzeSelectedPages() {
   const formData = new FormData();
   formData.append("upload_id", activeUpload.id);
   formData.append("model_profile", modelSelect.value);
+  formData.append("ocr_strategy", strategySelect.value);
   formData.append("pages", formatPageSpec(selectedPages));
   const button = document.querySelector("#analyzeSelectedButton");
   button.disabled = true;
@@ -520,6 +570,8 @@ async function showResultView(page) {
   mergedDocumentFrame.hidden = true;
   regionsImage.hidden = true;
   adminOutput.hidden = true;
+  goldenOutput.hidden = true;
+  downloadPngButton.hidden = !(activeView === "merged" && page.stage === "complete" && page.merged_png_url);
 
   if (activeView === "content" && page.content_url) {
     contentOutput.hidden = false;
@@ -538,13 +590,16 @@ async function showResultView(page) {
   } else if (activeView === "handwriting" && page.handwriting_url) {
     handwritingFrame.hidden = false;
     if (handwritingFrame.src !== new URL(page.handwriting_url, location.href).href) handwritingFrame.src = page.handwriting_url;
-  } else if (activeView === "merged" && page.merged_document_url) {
+  } else if (activeView === "merged" && page.merged_document_url && page.stage === "complete") {
     mergedDocumentFrame.hidden = false;
     const mergedUrl = new URL(page.merged_document_url, location.href).href;
     if (mergedDocumentFrame.src !== mergedUrl) mergedDocumentFrame.src = page.merged_document_url;
+  } else if (activeView === "golden" && page.golden_comparison_url && page.stage === "complete") {
+    showGoldenComparison(page);
   } else if (["detection", "candidates", "decision", "logs"].includes(activeView)) {
     showAdminView(page);
   } else {
+    if (activeView === "merged") mergedDocumentFrame.src = "about:blank";
     resultEmpty.hidden = false;
     resultEmptyText.textContent = activeView === "content"
       ? "Waiting for Content Understanding"
@@ -552,7 +607,73 @@ async function showResultView(page) {
         ? "Waiting for handwriting analysis"
         : activeView === "merged"
           ? "Waiting for merged document"
+          : activeView === "golden"
+            ? "Waiting for completed results"
         : "Waiting for analysis data";
+  }
+}
+
+async function showGoldenComparison(page) {
+  const requestId = ++goldenRequest;
+  goldenOutput.hidden = false;
+  goldenOutput.replaceChildren(createElement("div", "admin-empty", "Loading human comparison…"));
+  try {
+    const response = await fetch(`${page.golden_comparison_url}?t=${Date.now()}`);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "Golden comparison is unavailable");
+    if (requestId !== goldenRequest) return;
+    if (!payload.available) {
+      goldenOutput.replaceChildren(createElement("div", "admin-empty", payload.reason || "No human golden is available for this page."));
+      return;
+    }
+
+    const header = document.createElement("div");
+    header.className = "golden-heading";
+    header.append(
+      createElement("div", "panel-kicker", "HUMAN VERIFIED"),
+      createElement("h3", "", "Result compared with golden"),
+      createElement("p", "", `${payload.matched_regions} human-verified regions aligned with ${payload.current_regions} detected regions.`),
+    );
+
+    const tableWrap = document.createElement("div");
+    tableWrap.className = "golden-table-wrap";
+    const table = document.createElement("table");
+    table.className = "golden-table";
+    table.innerHTML = "<thead><tr><th>Field</th><th>Human golden</th><th>OCR result</th><th>Similarity</th></tr></thead>";
+    const body = document.createElement("tbody");
+    payload.rows.forEach((row) => {
+      const tr = document.createElement("tr");
+      const score = Math.round((row.ratio || 0) * 100);
+      const scoreClass = score >= 90 ? "match-high" : score >= 70 ? "match-mid" : "match-low";
+      tr.innerHTML = `
+        <td class="golden-field">${escapeHtml(row.golden_label || "Region")}</td>
+        <td class="golden-text" dir="rtl">${escapeHtml(row.golden || "(non-text)")}</td>
+        <td class="golden-text" dir="rtl">${escapeHtml(row.current || "(empty)")}</td>
+        <td><span class="match-score ${scoreClass}">${score}%</span></td>`;
+      body.append(tr);
+    });
+    table.append(body);
+    tableWrap.append(table);
+
+    const summary = document.createElement("div");
+    summary.className = "golden-score-summary";
+    summary.innerHTML = `
+      <div class="golden-score-copy">
+        <span>Overall similarity to human results</span>
+        <strong>${payload.success_percent}%</strong>
+      </div>
+      <div class="golden-progress" role="progressbar" aria-label="Overall golden similarity" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${payload.success_percent}">
+        <span style="width:${Math.max(0, Math.min(100, payload.success_percent))}%"></span>
+      </div>
+      <div class="golden-secondary-scores">
+        <span>Exact text <b>${payload.exact_percent}%</b></span>
+        <span>Classification <b>${payload.classification_percent}%</b></span>
+      </div>`;
+    goldenOutput.replaceChildren(header, tableWrap, summary);
+  } catch (error) {
+    if (requestId === goldenRequest) {
+      goldenOutput.replaceChildren(createElement("div", "admin-empty", error.message));
+    }
   }
 }
 
@@ -577,7 +698,10 @@ function renderJob() {
   }
   document.querySelector("#statusDetail").textContent = liveParts.join(" · ");
   document.querySelector("#pagesMetric").textContent = `${activeJob.processed_pages} / ${activeJob.selected_page_count}`;
-  document.querySelector("#modelMetric").textContent = activeJob.model_label || activeJob.model_profile;
+  const modelLabel = activeJob.model_label || activeJob.model_profile;
+  document.querySelector("#modelMetric").textContent = activeJob.ocr_strategy !== "standard"
+    ? `${modelLabel} · ${activeJob.ocr_strategy_label}`
+    : modelLabel;
   document.querySelector("#stageMetric").textContent = stageLabels[activeJob.stage] || activeJob.stage;
   document.querySelector("#tokensMetric").textContent = formatNumber(activeJob.tokens);
   document.querySelector("#callsMetric").textContent = formatNumber(activeJob.calls);
@@ -644,6 +768,11 @@ document.querySelector("#clearSelectionButton").addEventListener("click", () => 
   renderPageSelection();
 });
 document.querySelector("#analyzeSelectedButton").addEventListener("click", analyzeSelectedPages);
+strategySelect.addEventListener("change", () => {
+  if (strategySelect.value === "isolated-multiview") {
+    modelSelect.value = "gpt-5.6-sol";
+  }
+});
 document.querySelector("#selectionBackButton").addEventListener("click", () => {
   activeUpload = null;
   selectedPages.clear();
@@ -669,6 +798,15 @@ document.querySelectorAll(".stage-tab").forEach((tab) => tab.addEventListener("c
 document.querySelector("#sourceOpenButton").addEventListener("click", () => {
   const page = activeJob?.pages.find((item) => item.page === activePage);
   if (page?.original_url) window.open(page.original_url, "_blank", "noopener");
+});
+
+downloadPngButton.addEventListener("click", () => {
+  const page = activeJob?.pages.find((item) => item.page === activePage);
+  if (!page?.merged_png_url) return;
+  const link = document.createElement("a");
+  link.href = page.merged_png_url;
+  link.download = "";
+  link.click();
 });
 
 document.querySelector("#cancelButton").addEventListener("click", async () => {

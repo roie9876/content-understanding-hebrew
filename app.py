@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -15,7 +16,15 @@ from pathlib import Path
 
 import fitz
 import markdown
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
+from dotenv import load_dotenv
+from PIL import Image, ImageOps
+from pillow_heif import register_heif_opener
+
+import compare_golden
+
+load_dotenv()
+register_heif_opener()
 
 
 ROOT = Path(__file__).resolve().parent
@@ -23,19 +32,28 @@ DATA_DIR = ROOT / ".ui_data"
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
 RESULTS_DIR = ROOT / "analysis_results"
-ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg"}
+IMAGE_EXTENSIONS = {
+    ".bmp", ".gif", ".heic", ".heif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp",
+}
+ALLOWED_EXTENSIONS = {".pdf", *IMAGE_EXTENSIONS}
+SUPPORTED_UPLOAD_TYPES = "PDF, PNG, JPEG, WebP, TIFF, BMP, GIF, HEIC, or HEIF"
 PAGE_CONCURRENCY = max(1, int(os.environ.get("PAGE_CONCURRENCY", "2")))
 TOTAL_OCR_WORKERS = max(1, int(os.environ.get("MAX_WORKERS", "8")))
+_PRIMARY_ENDPOINT = os.environ.get("GPT_ENDPOINT", "https://example.invalid/openai/v1/")
+_PRIMARY_DEPLOYMENT = os.environ.get("GPT_DEPLOYMENT", "gpt-5.4")
+_PRIMARY_TARGETS = json.loads(os.environ.get("GPT_TARGETS", "[]"))
+
 MODEL_PROFILES = {
     "gpt-5.4": {
         "label": "GPT-5.4",
-        "endpoint": "https://medical-summary.services.ai.azure.com/openai/v1/",
-        "deployment": "gpt-5.4",
+        "endpoint": _PRIMARY_ENDPOINT,
+        "deployment": _PRIMARY_DEPLOYMENT,
+        "targets": _PRIMARY_TARGETS,
     },
     "gpt-5.4-pro": {
         "label": "GPT-5.4 Pro · medium reasoning (experimental, slower)",
-        "endpoint": "https://medical-summary.services.ai.azure.com/openai/v1/",
-        "deployment": "gpt-5.4-pro",
+        "endpoint": os.environ.get("GPT_PRO_ENDPOINT", _PRIMARY_ENDPOINT),
+        "deployment": os.environ.get("GPT_PRO_DEPLOYMENT", "gpt-5.4-pro"),
         "environment": {
             "GPT_REASONING": "medium",
             "OCR_REASONING": "medium",
@@ -44,13 +62,22 @@ MODEL_PROFILES = {
     },
     "gpt-5.6-luna": {
         "label": "GPT-5.6 Luna (experimental)",
-        "endpoint": "https://admin-9107-resource.services.ai.azure.com/openai/v1/",
-        "deployment": "gpt-5.6-luna",
+        "endpoint": os.environ.get("GPT_LUNA_ENDPOINT", "https://example.invalid/openai/v1/"),
+        "deployment": os.environ.get("GPT_LUNA_DEPLOYMENT", "gpt-5.6-luna"),
+    },
+    "gpt-5.6-sol-none": {
+        "label": "GPT-5.6 Sol · Fast (no reasoning)",
+        "endpoint": os.environ.get("GPT_SOL_ENDPOINT", "https://example.invalid/openai/v1/"),
+        "deployment": os.environ.get("GPT_SOL_DEPLOYMENT", "gpt-5.6-sol"),
+        "environment": {
+            "GPT_REASONING": "none",
+            "OCR_REASONING": "none",
+        },
     },
     "gpt-5.6-sol": {
         "label": "GPT-5.6 Sol · low reasoning (experimental)",
-        "endpoint": "https://admin-9107-resource.services.ai.azure.com/openai/v1/",
-        "deployment": "gpt-5.6-sol",
+        "endpoint": os.environ.get("GPT_SOL_ENDPOINT", "https://example.invalid/openai/v1/"),
+        "deployment": os.environ.get("GPT_SOL_DEPLOYMENT", "gpt-5.6-sol"),
         "environment": {
             "GPT_REASONING": "low",
             "OCR_REASONING": "low",
@@ -58,16 +85,46 @@ MODEL_PROFILES = {
     },
     "gpt-5.6-sol-medium": {
         "label": "GPT-5.6 Sol · medium reasoning (experimental, slower)",
-        "endpoint": "https://admin-9107-resource.services.ai.azure.com/openai/v1/",
-        "deployment": "gpt-5.6-sol",
+        "endpoint": os.environ.get("GPT_SOL_ENDPOINT", "https://example.invalid/openai/v1/"),
+        "deployment": os.environ.get("GPT_SOL_DEPLOYMENT", "gpt-5.6-sol"),
         "environment": {
             "GPT_REASONING": "medium",
             "OCR_REASONING": "medium",
             "GPT_READ_TIMEOUT": "180",
         },
     },
+    "copilot-claude-opus-4.8": {
+        "label": "Claude Opus 4.8 · GitHub Copilot SDK (high cost, experimental)",
+        "endpoint": "copilot-sdk://local",
+        "deployment": "claude-opus-4.8",
+        "environment": {
+            "MODEL_BACKEND": "github-copilot-sdk",
+            "GPT_REASONING": "high",
+            "OCR_REASONING": "high",
+            "GPT_READ_TIMEOUT": "180",
+        },
+    },
+    "copilot-gemini-3.5-flash": {
+        "label": "Gemini 3.5 Flash · GitHub Copilot SDK (experimental)",
+        "endpoint": "copilot-sdk://local",
+        "deployment": "gemini-3.5-flash",
+        "environment": {
+            "MODEL_BACKEND": "github-copilot-sdk",
+            "GPT_REASONING": "low",
+            "OCR_REASONING": "low",
+            "GPT_READ_TIMEOUT": "120",
+        },
+    },
 }
-DEFAULT_MODEL_PROFILE = "gpt-5.4"
+DEFAULT_MODEL_PROFILE = "gpt-5.6-sol"
+DEFAULT_OCR_STRATEGY = "standard"
+OCR_STRATEGIES = {
+    "standard": {"label": "Standard core4 + visual reconciliation"},
+    "isolated-multiview": {
+        "label": "Experimental isolated multi-view (lined handwriting)",
+        "model_profiles": {"gpt-5.6-sol"},
+    },
+}
 
 app = Flask(__name__, static_folder="ui", static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
@@ -110,6 +167,7 @@ def _manifest_data(job_id: str, job: dict) -> dict:
         "run_name": job.get("run_name", Path(job["output_dir"]).name),
         "file_name": job["file_name"],
         "model_profile": job.get("model_profile", DEFAULT_MODEL_PROFILE),
+        "ocr_strategy": job.get("ocr_strategy", DEFAULT_OCR_STRATEGY),
         "page_count": job["page_count"],
         "selected_pages": _selected_pages(job),
         "status": job.get("status", "complete"),
@@ -142,6 +200,7 @@ def _job_from_manifest(manifest: dict, output_dir: Path) -> dict:
     return {
         "file_name": manifest["file_name"],
         "model_profile": manifest.get("model_profile", DEFAULT_MODEL_PROFILE),
+        "ocr_strategy": manifest.get("ocr_strategy", DEFAULT_OCR_STRATEGY),
         "input_path": "",
         "output_dir": str(output_dir),
         "run_name": manifest.get("run_name", output_dir.name),
@@ -186,6 +245,43 @@ def _page_count(path: Path) -> int:
         return len(document)
 
 
+def _flatten_image(image: Image.Image) -> Image.Image:
+    image = ImageOps.exif_transpose(image)
+    if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        flattened = Image.new("RGB", rgba.size, "white")
+        flattened.paste(rgba, mask=rgba.getchannel("A"))
+        return flattened
+    return image.convert("RGB")
+
+
+def _normalize_image_upload(source_path: Path, upload_folder: Path) -> Path:
+    frames: list[Image.Image] = []
+    with Image.open(source_path) as source:
+        for frame_number in range(getattr(source, "n_frames", 1)):
+            source.seek(frame_number)
+            frames.append(_flatten_image(source.copy()))
+    if not frames or any(frame.width < 1 or frame.height < 1 for frame in frames):
+        raise ValueError("The uploaded image has no readable frames.")
+    if len(frames) == 1:
+        normalized_path = upload_folder / "source.png"
+        frames[0].save(normalized_path, format="PNG")
+        return normalized_path
+
+    normalized_path = upload_folder / "source.pdf"
+    document = fitz.open()
+    try:
+        for frame in frames:
+            page = document.new_page(width=frame.width * 72 / 200, height=frame.height * 72 / 200)
+            encoded = io.BytesIO()
+            frame.save(encoded, format="PNG")
+            page.insert_image(page.rect, stream=encoded.getvalue())
+        document.save(normalized_path)
+    finally:
+        document.close()
+    return normalized_path
+
+
 def _parse_page_spec(spec: str, total: int) -> list[int]:
     if not spec or not spec.strip():
         raise ValueError("Select at least one page.")
@@ -220,21 +316,30 @@ def _selected_pages(job: dict) -> list[int]:
 
 def _save_upload(document) -> tuple[str, dict]:
     if not document or not document.filename:
-        raise ValueError("Choose a PDF, PNG, or JPEG document.")
+        raise ValueError(f"Choose a {SUPPORTED_UPLOAD_TYPES} document.")
     suffix = Path(document.filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
-        raise ValueError("Unsupported file type. Use PDF, PNG, JPG, or JPEG.")
+        raise ValueError(f"Unsupported file type. Use {SUPPORTED_UPLOAD_TYPES}.")
     upload_id = uuid.uuid4().hex
     upload_folder = UPLOAD_DIR / upload_id
     upload_folder.mkdir(parents=True, exist_ok=True)
     original_name = Path(document.filename).name or f"document{suffix}"
-    input_path = upload_folder / f"source{suffix}"
-    document.save(input_path)
+    uploaded_path = upload_folder / f"uploaded{suffix}"
+    document.save(uploaded_path)
+    input_path = None
     try:
+        input_path = (
+            uploaded_path.rename(upload_folder / "source.pdf")
+            if suffix == ".pdf"
+            else _normalize_image_upload(uploaded_path, upload_folder)
+        )
         page_count = _page_count(input_path)
     except Exception as exc:
-        input_path.unlink(missing_ok=True)
+        uploaded_path.unlink(missing_ok=True)
+        if input_path is not None:
+            input_path.unlink(missing_ok=True)
         raise ValueError("The uploaded document could not be opened.") from exc
+    uploaded_path.unlink(missing_ok=True)
     upload = {
         "id": upload_id,
         "file_name": original_name,
@@ -269,7 +374,41 @@ def _model_environment(profile_name: str) -> dict[str, str]:
         GPT_ENDPOINT=profile["endpoint"],
         GPT_DEPLOYMENT=profile["deployment"],
     )
+    if profile.get("targets"):
+        environment["GPT_TARGETS"] = json.dumps(profile["targets"])
+    else:
+        environment["GPT_TARGETS"] = ""
     environment.update(profile.get("environment", {}))
+    if environment.get("MODEL_BACKEND") == "github-copilot-sdk":
+        github_user = os.environ.get("COPILOT_GITHUB_USER", "").strip()
+        token_command = ["gh", "auth", "token", "--hostname", "github.com"]
+        if github_user:
+            token_command.extend(["--user", github_user])
+        try:
+            token_result = subprocess.run(
+                token_command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "GitHub Copilot SDK authentication failed; verify `gh auth status` and COPILOT_GITHUB_USER."
+            ) from exc
+        token = token_result.stdout.strip()
+        if not token:
+            raise RuntimeError("GitHub CLI returned an empty authentication token.")
+        environment["COPILOT_GITHUB_TOKEN"] = token
+        environment["COPILOT_DISABLE_KEYTAR"] = "1"
+    return environment
+
+
+def _page_environment(model_profile: str, ocr_strategy: str) -> dict[str, str]:
+    environment = _model_environment(model_profile)
+    environment["OCR_STRATEGY"] = ocr_strategy
+    if ocr_strategy == "isolated-multiview":
+        environment["GPT_READ_TIMEOUT"] = "300"
     return environment
 
 
@@ -330,6 +469,8 @@ def _page_snapshot(job_id: str, job: dict, page_number: int) -> dict:
         "content_url": _artifact_url(job_id, page_dir, "content_understanding.md"),
         "handwriting_url": _artifact_url(job_id, page_dir, "merged.html"),
         "merged_document_url": f"/api/jobs/{job_id}/pages/{page_number}/merged-document",
+        "merged_png_url": f"/api/jobs/{job_id}/pages/{page_number}/merged.png",
+        "golden_comparison_url": f"/api/jobs/{job_id}/pages/{page_number}/golden-comparison",
         "diagnostics_url": f"/api/jobs/{job_id}/pages/{page_number}/diagnostics",
     }
 
@@ -380,6 +521,10 @@ def _job_snapshot(job_id: str) -> dict:
         "model_profile": source.get("model_profile", DEFAULT_MODEL_PROFILE),
         "model_label": MODEL_PROFILES[
             source.get("model_profile", DEFAULT_MODEL_PROFILE)
+        ]["label"],
+        "ocr_strategy": source.get("ocr_strategy", DEFAULT_OCR_STRATEGY),
+        "ocr_strategy_label": OCR_STRATEGIES[
+            source.get("ocr_strategy", DEFAULT_OCR_STRATEGY)
         ]["label"],
         "status": source["status"],
         "stage": source.get("stage", "queued"),
@@ -465,6 +610,7 @@ def _run_page(job_id: str, page_number: int, workers: int) -> int:
             return -15
         input_path = job["input_path"]
         model_profile = job.get("model_profile", DEFAULT_MODEL_PROFILE)
+        ocr_strategy = job.get("ocr_strategy", DEFAULT_OCR_STRATEGY)
         page_output = _page_dir(job, page_number)
         job["page_states"][page_number].update(
             stage="preparing", message=f"Preparing page {page_number}",
@@ -478,6 +624,7 @@ def _run_page(job_id: str, page_number: int, workers: int) -> int:
         "--workers", str(workers),
         "--output", str(page_output),
     ]
+    environment = _page_environment(model_profile, ocr_strategy)
     process = subprocess.Popen(
         command,
         cwd=ROOT,
@@ -485,7 +632,7 @@ def _run_page(job_id: str, page_number: int, workers: int) -> int:
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
-        env=_model_environment(model_profile),
+        env=environment,
     )
     with _lock:
         _processes.setdefault(job_id, {})[page_number] = process
@@ -615,6 +762,15 @@ def create_job():
     model_profile = request.form.get("model_profile", DEFAULT_MODEL_PROFILE)
     if model_profile not in MODEL_PROFILES:
         return jsonify({"error": "Unsupported model profile."}), 400
+    ocr_strategy = request.form.get("ocr_strategy", DEFAULT_OCR_STRATEGY)
+    strategy = OCR_STRATEGIES.get(ocr_strategy)
+    if not strategy:
+        return jsonify({"error": "Unsupported OCR strategy."}), 400
+    allowed_profiles = strategy.get("model_profiles")
+    if allowed_profiles and model_profile not in allowed_profiles:
+        return jsonify({
+            "error": "Experimental isolated multi-view currently requires GPT-5.6 Sol low."
+        }), 400
     upload_id = request.form.get("upload_id")
     if upload_id:
         with _lock:
@@ -645,6 +801,7 @@ def create_job():
         _jobs[job_id] = {
             "file_name": upload["file_name"],
             "model_profile": model_profile,
+            "ocr_strategy": ocr_strategy,
             "upload_id": upload_id,
             "input_path": upload["input_path"],
             "output_dir": str(output_folder),
@@ -684,6 +841,8 @@ def list_runs():
             "run_name": run["run_name"],
             "file_name": run["file_name"],
             "model_label": run["model_label"],
+            "ocr_strategy": run["ocr_strategy"],
+            "ocr_strategy_label": run["ocr_strategy_label"],
             "selected_pages": run["selected_pages"],
             "selected_page_count": run["selected_page_count"],
             "created_at": run["created_at"],
@@ -717,6 +876,10 @@ def page_diagnostics(job_id: str, page_number: int):
     for region_dir in sorted(page_dir.glob("region_*")):
         result = _read_json(region_dir / "result.json")
         if result:
+            if not result.get("contextual_evidence"):
+                contextual_evidence = _read_json(region_dir / "contextual_recheck.json")
+                if contextual_evidence:
+                    result["contextual_evidence"] = contextual_evidence
             final_regions.append({"folder": region_dir.name, **result})
     page_log_prefix = f"[page {page_number}]"
     with _lock:
@@ -742,11 +905,20 @@ def merged_document(job_id: str, page_number: int):
     merged_path = _page_dir(job, page_number) / "merged.md"
     if not merged_path.exists():
         return jsonify({"error": "Merged document is not available yet."}), 404
-    body = markdown.markdown(
+    html = _merged_document_html(merged_path)
+    return app.response_class(html, mimetype="text/html")
+
+
+def _merged_document_body(merged_path: Path) -> str:
+    return markdown.markdown(
         merged_path.read_text(encoding="utf-8"),
         extensions=["extra", "sane_lists", "nl2br"],
     )
-    html = f"""<!doctype html>
+
+
+def _merged_document_html(merged_path: Path) -> str:
+    body = _merged_document_body(merged_path)
+    return f"""<!doctype html>
 <html lang="he" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 :root{{--paper:#fff;--ink:#202020;--line:#dedede}} *{{box-sizing:border-box}}
@@ -757,7 +929,98 @@ p{{margin:.65em 0}} ul,ol{{padding-right:1.7em}} table{{width:100%;border-collap
 span[style*="color:#d00"],span[style*="color: #d00"]{{color:#c5163a!important;font-weight:700}} a{{color:inherit}}
 @media(max-width:640px){{main{{width:100%;padding:24px 20px;box-shadow:none}}}}
 </style></head><body><main>{body}</main></body></html>"""
-    return app.response_class(html, mimetype="text/html")
+
+
+def _merged_document_png(merged_path: Path) -> io.BytesIO:
+    body = _merged_document_body(merged_path)
+    story = fitz.Story(
+        html=f'<main dir="rtl">{body}</main>',
+        user_css="""
+            body { color: #202020; font-family: sans-serif; line-height: 1.75; }
+            main { direction: rtl; }
+            h1 { font-size: 26pt; } h2 { font-size: 21pt; } h3 { font-size: 17pt; }
+            p { margin: 10pt 0; } ul, ol { padding-right: 24pt; }
+            table { border-collapse: collapse; width: 100%; }
+            th, td { border: 1px solid #dedede; padding: 7pt 10pt; text-align: right; }
+            span { color: #c5163a; font-weight: bold; }
+        """,
+    )
+    pdf_output = io.BytesIO()
+    writer = fitz.DocumentWriter(pdf_output)
+    more = True
+    while more:
+        device = writer.begin_page(fitz.Rect(0, 0, 900, 1273))
+        more, _ = story.place(fitz.Rect(52, 40, 848, 1233))
+        story.draw(device)
+        writer.end_page()
+    writer.close()
+
+    document = fitz.open(stream=pdf_output.getvalue(), filetype="pdf")
+    rendered_pages = []
+    for page in document:
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        rendered_pages.append(Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples))
+    document.close()
+
+    canvas = Image.new(
+        "RGB",
+        (max(image.width for image in rendered_pages), sum(image.height for image in rendered_pages)),
+        "white",
+    )
+    top = 0
+    for image in rendered_pages:
+        canvas.paste(image, (0, top))
+        top += image.height
+
+    output = io.BytesIO()
+    canvas.save(output, format="PNG", optimize=True)
+    output.seek(0)
+    return output
+
+
+@app.get("/api/jobs/<job_id>/pages/<int:page_number>/merged.png")
+def download_merged_png(job_id: str, page_number: int):
+    with _lock:
+        job = dict(_jobs[job_id]) if job_id in _jobs else None
+    if not job or page_number not in _selected_pages(job):
+        abort(404)
+    merged_path = _page_dir(job, page_number) / "merged.md"
+    if not merged_path.exists():
+        return jsonify({"error": "Merged document is not available yet."}), 404
+    output = _merged_document_png(merged_path)
+    download_name = f"{Path(job['file_name']).stem}-page-{page_number}-merged.png"
+    return send_file(output, mimetype="image/png", as_attachment=True, download_name=download_name)
+
+
+@app.get("/api/jobs/<job_id>/pages/<int:page_number>/golden-comparison")
+def golden_comparison(job_id: str, page_number: int):
+    with _lock:
+        job = dict(_jobs[job_id]) if job_id in _jobs else None
+    if not job or page_number not in _selected_pages(job):
+        abort(404)
+    result_path = _page_dir(job, page_number) / "handwriting_result.json"
+    if not result_path.exists():
+        return jsonify({"available": False, "reason": "Analysis is not complete yet."})
+    stem = Path(job["file_name"]).stem
+    golden_path = compare_golden.GOLDEN_DIR / stem / "handwriting_result.json"
+    golden_data = _read_json(golden_path)
+    if not golden_data or int(golden_data.get("page", 1)) != page_number:
+        return jsonify({"available": False, "reason": "No human golden is available for this page."})
+    comparison = compare_golden.compare_sample(stem, result_path)
+    if comparison.get("error"):
+        return jsonify({"available": False, "reason": comparison["error"]})
+    return jsonify({
+        "available": True,
+        "page": page_number,
+        "success_percent": round(comparison["avg_ratio"] * 100, 1),
+        "exact_percent": round(comparison["strict"]["text_accuracy"] * 100, 1),
+        "classification_percent": round(
+            comparison["strict"]["classification_accuracy"] * 100, 1
+        ),
+        "matched_regions": comparison["golden_count"],
+        "current_regions": comparison["current_count"],
+        "rows": comparison["rows"],
+    })
 
 
 @app.post("/api/jobs/<job_id>/cancel")

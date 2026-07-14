@@ -9,6 +9,7 @@ import base64
 import difflib
 import io
 import json
+import os
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ import requests
 
 import handwriting_pipeline as hp
 
-DI_ENDPOINT = "https://iai-docintelegent.cognitiveservices.azure.com/"
+DI_ENDPOINT = os.environ.get("DI_ENDPOINT", "https://example.invalid/").rstrip("/") + "/"
 API_VERSIONS = ["2024-11-30", "2023-07-31"]
 
 SAMPLES = [

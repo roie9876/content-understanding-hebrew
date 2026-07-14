@@ -59,6 +59,14 @@ The upload screen lists completed local analyses. Selecting one reopens the full
 detection, candidates, decision, final overlay, and logs without calling Azure again. Saved
 runs are restored from their manifests whenever the server starts.
 
+To reproduce the isolated multi-view experiment from the UI, upload a blue-handwritten lined
+image, keep **GPT-5.6 Sol · low reasoning**, and set **OCR strategy** to
+**Experimental isolated multi-view · lined handwriting** before selecting **Analyze selected**.
+The strategy isolates lined rows, uses stable word groups only when geometry supports them, sends
+three faithful views of each unit through two candidate-blind reads, and aligns the results in
+code. Regions without valid colored lined geometry automatically use standard OCR. Experimental
+jobs use a longer timeout, run isolated calls sequentially, and can take substantially longer.
+
 The UI hides Content Understanding's internal Markdown comments and figure descriptions while
 preserving the raw artifact on disk. Every upload performs fresh Azure analysis; OCR responses,
 Content Understanding responses, and completed document results are never replayed.
@@ -165,6 +173,7 @@ A short summary is also printed to the console after each run.
 ├── extract_hebrew.py        # main pipeline (CU + GPT vision + merge)
 ├── handwriting_pipeline.py  # focused multi-pass handwriting OCR helper
 ├── compare_golden.py        # regression check: current output vs golden/
+├── EXPERIMENT_LOG.md        # dated results, regressions, costs, and decisions
 ├── exp_determinism.py       # stability probe: single-draw vs self-consistency vote
 ├── azure_ocr_benchmark.py   # Azure Document Intelligence vs GPT-voting benchmark
 ├── requirements.txt         # Python dependencies
@@ -177,16 +186,24 @@ A short summary is also printed to the console after each run.
 └── results/                 # <name>_results.jpg per document (git-ignored)
 ```
 
+Real source documents and human golden transcriptions live locally under `sample/` and
+`golden/`. Both directories are ignored except for their README files because they can contain
+names, account numbers, IDs, handwriting, and other personal data. Use synthetic or fully
+anonymized fixtures for anything committed to Git.
+
+Every model, prompt, preprocessing, segmentation, voting, or adjudication experiment must add a
+dated entry to `EXPERIMENT_LOG.md`, including negative and inconclusive results.
+
 ## Handwriting pipeline (`handwriting_pipeline.py`)
 
 When handwriting is hard to read, this pipeline boosts accuracy by **not** relying on a
 single OCR pass. Per handwriting region it:
 
 1. **Detects** handwriting regions automatically (or takes manual crop boxes).
-2. Creates several **enhanced image versions** (upscale+contrast, adaptive threshold,
-   denoise, thickened strokes, horizontal-line removal) and **overlapping chunks**.
-3. Sends every image to the selected **GPT-5.x vision model** to transcribe *only* the handwriting — all calls
-   run in parallel, with automatic retries so a timeout burst never drops a region.
+2. Creates and saves seven **enhanced image versions** plus **overlapping chunks** for review.
+3. Sends the four benchmarked core views (original, upscaled contrast, denoised, and
+  line-removed) together in one **GPT-5.x vision** call per region. Optional transforms
+  are never retried; a stranded region gets bounded original/denoised rescue calls.
 4. **Visually adjudicates** the final reading: it re-shows the best images + all candidate
    readings to the model and lets it decide from the strokes (not a blind majority vote),
    returning per-word **confidence + a visual reason**. Falls back to text-only
@@ -287,13 +304,50 @@ Hebrew handwriting).
 
 ## Quality authority and optional voting
 
-The default quality path reads all seven enhanced images once, then performs final **visual
-adjudication** with the image evidence attached again. This matches the architecture used to
-produce the approved golden baseline: candidates are hints, while visible strokes remain the
-authority. If visual adjudication fails, the pipeline falls back to text reconciliation and then
-the best non-empty candidate. The seventh view preserves neighborhoods around thick stroke cores,
-which makes handwriting easier to distinguish from thin printed form text without removing the
-original crop from the evidence set.
+The default quality path reads four core views in one multi-image call, then performs final
+**visual adjudication** with the image evidence attached again. Candidates are hints, while
+visible strokes remain the authority. Deterministic guards preserve numeric cell order, prevent
+the adjudicator from erasing faithful non-empty text, and classify high-specificity signature
+flourishes and X/checkbox marks explicitly. All seven transforms are still saved for inspection.
+
+Set `OCR_MULTI_IMAGE=0` to run the four core views as independent calls. That mode is slower but
+is retained as a measured quality-first A/B fallback. No OCR, document, or golden-result cache is
+used in either mode.
+
+Blind contextual rereads that change a non-empty visual result must meet
+`CONTEXTUAL_RECHECK_MIN_CONFIDENCE` (default `0.60`). Disagreements are retained in the evidence
+and marked for review; the threshold can be raised for more conservative automatic acceptance.
+Repeated identifier fields also provide a document-local consistency check: equal-length numeric
+values that differ by exactly one digit are aligned only when the stronger field has at least
+`0.90` confidence and a `0.10` confidence margin. Dates and free text are never copied this way.
+
+Two later quality experiments are retained but disabled by default:
+
+- `OCR_SPATIAL_NUMERIC_CELLS=1` asks contextual adjudication for cell values and normalized
+  x-coordinates, then assembles valid numeric cells deterministically from left to right.
+- `OCR_NEARBY_CU_CONTEXT=1` adds a local reading-order window from Content Understanding as a
+  soft printed-text hint. This requires merged/CU output and remains experimental because CU
+  Markdown does not include reliable spatial coordinates.
+
+GPT-5.4 can use a two-endpoint pool configured locally in `.env`.
+
+The UI also offers high-cost experimental `Claude Opus 4.8 · GitHub Copilot SDK`. It uses the
+official `@github/copilot-sdk` Node package and image blob attachments, not an Azure/model API
+endpoint. Set `COPILOT_GITHUB_USER` to a login whose `gh` authentication has Opus 4.8 enabled,
+then run `npm install`. The app obtains that account's token with `gh auth token --user`, passes it
+only to the SDK child process, and disables Keychain probing. Tools, skills, memory, config
+discovery, and persistent Copilot sessions are disabled. Copilot calls consume the selected
+account's premium usage allowance; Opus 4.8 is marked high cost in Copilot.
+
+`Gemini 3.5 Flash · GitHub Copilot SDK` uses the same account-specific, Keychain-free bridge with
+the exact enabled vision model `gemini-3.5-flash`. It uses low reasoning and a shorter timeout as
+a speed-oriented experimental profile. GPT-5.4 remains the default until golden evaluation proves
+that another profile improves quality.
+
+Calls start on each endpoint in round-robin order. Connection failures, timeouts, 408/409/429,
+and transient 5xx responses immediately fail over to the other endpoint before normal backoff.
+Successful calls per endpoint are recorded under `usage.targets` in `handwriting_result.json`.
+Set `GPT_TARGETS` to a JSON array of `{name, endpoint, deployment}` objects to override the pool.
 
 Self-consistency voting remains available as an opt-in experiment with `VOTE=1`. It draws each
 image `VOTE_SEEDS` times and aggregates candidates deterministically. Structured values use
@@ -307,6 +361,34 @@ Hebrew handwriting (reads the printed body, garbles the cursive, sim ~0.1–0.4)
 deterministic engine trades too much accuracy, so GPT voting wins.
 
 ### Speed vs quality
+
+Measured on the 21-region human-verified `חיוב חשבון1` sample with GPT-5.4 medium reasoning:
+
+| Pipeline | Exact text | Mean similarity | Signature | Time | GPT calls | Tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| Original seven-view baseline | 5/20 | 0.683 | 0/1 | 26:20 | 167 | 475,850 |
+| Quality-fixed seven-view checkpoint | 5/20 | 0.744 | 1/1 | 18:53 | 168 | 496,472 |
+| Four independent core views | **7/20** | 0.746 | 1/1 | 12:17 | 105 | 341,970 |
+| Four-view multi-image default | 6/20 | **0.767** | 1/1 | **09:10** | **44** | **177,818** |
+
+The multi-image default cuts wall time by about 65%, calls by 74%, and tokens by 63% versus
+the original baseline while improving both exact accuracy and mean similarity. The independent
+mode produced one more exact field in this run; use it when that quality/cost tradeoff is preferred.
+
+Adaptive highlighted-context experiments on the same 21-region sample:
+
+| Experiment | Exact text | Mean similarity | Signature | Time | GPT calls | Tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| Fresh baseline | 6/20 | 0.749 | 1/1 | 16:16 | 45 | 188,224 |
+| Highlighted context v1 | 7/20 | 0.699 | 1/1 | 13:12 | 55 | 211,493 |
+| **Conservative highlighted context v2** | **8/20** | **0.798** | 1/1 | 21:47 | 61 | 255,899 |
+| Spatial numeric cells | 7/20 | 0.814 | 1/1 | 12:15 | 61 | 252,607 |
+| Nearby CU reading-order context | 7/20 | 0.750 | 1/1 | 13:31 | 59 | 253,120 |
+
+Conservative highlighted context v2 is the accepted checkpoint because it improved exact accuracy
+and mean similarity together. Spatial cells improved mean similarity but lost one exact field, so
+they remain opt-in. Nearby CU context regressed because Markdown reading order is not a reliable
+page-coordinate map; a future version should consume CU polygons before this can be enabled safely.
 
 Measured on `אישור` (8 regions, 16 workers):
 
@@ -325,7 +407,9 @@ stuck call so it retries fast, taming worst-case tail latency. Speed/quality kno
 ### Golden dataset & regression checks
 
 `golden/` holds approved reference results. It is used only for regression comparison; every run
-performs fresh Azure analysis:
+performs fresh Azure analysis. The report includes strict normalized exact-text accuracy over all
+human text regions and explicit non-text classification accuracy in addition to the legacy
+structural verdict:
 
 ```bash
 python3 compare_golden.py         # regression check: current output vs golden
@@ -335,6 +419,57 @@ python3 compare_golden.py --run   # re-run the 3 samples, then compare
 The comparator fails only on **structural** regressions (missing/empty regions, count change)
 or a **stable** field (dates, numbers, IDs, emails) changing; volatile cursive/`[?]` fields
 are reported but never failed, since the model rewords them run-to-run.
+
+### Full-agent model benchmark
+
+`agent_benchmark.py` runs a GitHub Copilot SDK agent end to end against the rendered page. The
+agent performs detection, transcription, classification, and merged Markdown generation in one
+tool-using session. The orchestrator enforces a fixed profile matrix and scores each immutable
+result only after inference, so human golden text is never included in the agent prompt or tools.
+
+```bash
+# Default: Sol low/medium/high plus GPT-5.4 medium
+python3 -u agent_benchmark.py --input "sample/חיוב חשבון1.pdf" --page 1
+
+# Any explicit subset of the six available profiles
+python3 -u agent_benchmark.py --input "sample/חיוב חשבון1.pdf" \
+  --profiles sol-low,sol-medium,sol-high,gpt-5.4-low,gpt-5.4-medium,gpt-5.4-high
+```
+
+Each run is saved under ignored `agent_benchmarks/<document>__<timestamp>/`. Every profile keeps
+its request metadata, agent event stream, raw response, normalized `handwriting_result.json`,
+merged Markdown, execution status, and golden score. The run root contains `summary.json` and a
+ranked `report.md`. Accuracy ranks before similarity and elapsed time.
+
+For customer environments where Gemini is unavailable, `sealed_hybrid_benchmark.py` runs an
+OpenAI-only ensemble: fresh GPT-5.4 and GPT-5.6 Sol-low staged pipelines produce independent
+candidates, then GPT-5.4 high reasoning adjudicates enlarged source crops. Candidate identities
+are hidden from the adjudicator as `primary` and `secondary`. The inference process does not load
+`compare_golden`; the evaluator is imported only after both candidate processes and the
+adjudicator have exited.
+
+```bash
+python3 -u sealed_hybrid_benchmark.py \
+  --input "sample/חיוב חשבון1.pdf" --page 1 --reasoning high
+```
+
+The generated `sealed_request.json` contains only neutral region identifiers, model candidates,
+crop paths, and inference configuration. A leakage guard rejects evaluation-related fields before
+the adjudicator starts. Anthropic is not part of this path because the measured Opus 4.8 baseline
+did not outperform GPT-5.4 on the human-golden document.
+
+The strongest repeatable customer-compatible configuration is three fresh GPT-5.6 Sol-low staged
+runs followed by deterministic spatial majority consensus. It makes no model call during reduction
+and never imports the golden evaluator:
+
+```bash
+python3 -u sol_consensus.py --input "sample/חיוב חשבון1.pdf" --page 1 --runs 3
+```
+
+On `חיוב חשבון1`, the three independent runs scored 11/20, 8/20, and 9/20 exact; consensus scored
+10/20 exact, 84.7% similarity, and 100% non-text classification. Sol-low is therefore the normal UI
+default. GitHub-only Gemini and Opus profiles remain available in backend code for controlled
+experiments but are intentionally hidden from the customer-facing picker.
 
 ## Notes & limitations
 
@@ -346,7 +481,8 @@ are reported but never failed, since the model rewords them run-to-run.
   italic script as handwriting; use `--italic` only as an opt-in when you want GPT to
   re-read italic (Content Understanding reads italic Hebrew less accurately).
 - **Sensitive data:** the sample documents and generated results can contain personal
-  information (names, ID numbers). `out/`, `output_handwriting/`, and `results/` are
+  information (names, ID numbers). `out/`, `output_handwriting/`, `results/`, and
+  `agent_benchmarks/` are
   git-ignored; review the `sample/` files before pushing this repo to any remote.
 - Content Understanding requires model deployments (`gpt-4.1` / `gpt-4.1-mini` /
   `text-embedding-3-large`) configured as defaults on the resource.

@@ -12,9 +12,9 @@
       document.documentElement.setAttribute("data-theme", theme);
     })();
   </script>
-  <link rel="stylesheet" href="/styles.css?v=20260712-4" />
+  <link rel="stylesheet" href="/styles.css?v=20260713-1" />
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/app.js?v=20260712-4" defer></script>
+  <script src="/app.js?v=20260713-1" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -39,20 +39,28 @@
           <p>Printed Hebrew, handwriting, structure, and confidence in one review workspace.</p>
         </div>
         <form class="drop-zone" id="uploadForm">
-          <input id="fileInput" name="document" type="file" accept=".pdf,.png,.jpg,.jpeg" hidden />
+          <input id="fileInput" name="document" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff,.bmp,.gif,.heic,.heif" hidden />
           <div class="upload-icon"><i data-lucide="file-up"></i></div>
           <div>
             <strong>Drop a document here</strong>
-            <span>PDF, PNG, or JPEG · up to 100 MB</span>
+            <span>PDF · PNG · JPEG · WebP · TIFF · BMP · GIF · HEIC · up to 100 MB</span>
           </div>
           <label class="model-picker">
             <span>Vision model</span>
             <select id="modelSelect" name="model_profile">
-              <option value="gpt-5.4" selected>GPT-5.4</option>
+              <option value="gpt-5.4">GPT-5.4</option>
               <option value="gpt-5.4-pro">GPT-5.4 Pro · medium reasoning (experimental, slower)</option>
               <option value="gpt-5.6-luna">GPT-5.6 Luna (experimental)</option>
-              <option value="gpt-5.6-sol">GPT-5.6 Sol · low reasoning (experimental)</option>
+              <option value="gpt-5.6-sol-none">GPT-5.6 Sol · Fast (no reasoning)</option>
+              <option value="gpt-5.6-sol" selected>GPT-5.6 Sol · low reasoning (recommended)</option>
               <option value="gpt-5.6-sol-medium">GPT-5.6 Sol · medium reasoning (experimental, slower)</option>
+            </select>
+          </label>
+          <label class="model-picker">
+            <span>OCR strategy</span>
+            <select id="strategySelect" name="ocr_strategy">
+              <option value="standard" selected>Standard core4 + visual reconciliation</option>
+              <option value="isolated-multiview">Experimental isolated multi-view · lined handwriting</option>
             </select>
           </label>
           <button class="primary-button" id="browseButton" type="button">
@@ -186,9 +194,25 @@
             <article class="viewer-panel result-panel">
               <div class="panel-header result-header">
                 <div><span class="panel-kicker">ANALYSIS</span><h2>Processed page</h2></div>
-                <div class="page-metrics">
-                  <span><i data-lucide="coins"></i><b id="pageTokens">0</b> tokens</span>
-                  <span><i data-lucide="timer"></i><b id="pageTime">--:--</b></span>
+                <div class="result-tools">
+                  <button class="download-png-button" id="downloadPngButton" type="button" hidden>
+                    <i data-lucide="download"></i><span>Download PNG</span>
+                  </button>
+                  <div class="zoom-controls" role="group" aria-label="Processed page zoom">
+                    <button class="icon-button" id="zoomOutButton" type="button" title="Zoom out" aria-label="Zoom out">
+                      <i data-lucide="zoom-out"></i>
+                    </button>
+                    <button class="zoom-level" id="zoomResetButton" type="button" title="Reset zoom" aria-label="Reset processed page zoom">
+                      <span id="zoomLevel">100%</span>
+                    </button>
+                    <button class="icon-button" id="zoomInButton" type="button" title="Zoom in" aria-label="Zoom in">
+                      <i data-lucide="zoom-in"></i>
+                    </button>
+                  </div>
+                  <div class="page-metrics">
+                    <span><i data-lucide="coins"></i><b id="pageTokens">0</b> tokens</span>
+                    <span><i data-lucide="timer"></i><b id="pageTime">--:--</b></span>
+                  </div>
                 </div>
               </div>
               <div class="stage-tabs" role="tablist" aria-label="Analysis stage">
@@ -203,6 +227,9 @@
                 </button>
                 <button class="stage-tab" type="button" data-view="decision" role="tab" aria-selected="false">
                   <i data-lucide="git-compare-arrows"></i><span>Decision</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="golden" role="tab" aria-selected="false">
+                  <i data-lucide="badge-check"></i><span>Golden comparison</span>
                 </button>
                 <button class="stage-tab" type="button" data-view="handwriting" role="tab" aria-selected="false">
                   <i data-lucide="scan-line"></i><span>Overlay</span><span class="red-key">Aa</span>
@@ -221,6 +248,7 @@
                 <iframe id="mergedDocumentFrame" title="Merged printed and handwritten document" hidden></iframe>
                 <img id="regionsImage" alt="Detected handwriting regions" hidden />
                 <div class="admin-output" id="adminOutput" hidden></div>
+                <div class="golden-output" id="goldenOutput" hidden></div>
               </div>
             </article>
           </section>

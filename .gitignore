@@ -3,12 +3,20 @@
 /output_handwriting/
 /results/
 /analysis_results/
+/agent_benchmarks/
 /.ui_data/
 run*.log
 
+# ---- Private source documents and human transcriptions ----
+/sample/*
+!/sample/README.md
+/golden/*
+!/golden/README.md
+
 # ---- Local config / secrets ----
 .env
-.env.local
+.env.*
+!.env.example
 
 # ---- Python ----
 __pycache__/
@@ -18,6 +26,7 @@ __pycache__/
 venv/
 env/
 .pytest_cache/
+node_modules/
 
 # ---- OS / editor ----
 .DS_Store

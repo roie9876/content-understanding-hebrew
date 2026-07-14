@@ -27,6 +27,7 @@ python handwriting_pipeline.py --input "sample/doc.pdf" --page 1 --dpi 400 \
 from __future__ import annotations
 
 import argparse
+import atexit
 import base64
 import collections
 import difflib
@@ -35,8 +36,10 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
+import uuid
 from html import escape
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,16 +51,30 @@ import numpy as np
 import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
 from azure.identity import AzureCliCredential
+from dotenv import load_dotenv
+from segmented_ocr import (
+    PROMPT_A as SEGMENTED_PROMPT_A,
+    PROMPT_B as SEGMENTED_PROMPT_B,
+    blue_pen_mask,
+    build_line_view_set,
+    build_word_view_sets,
+    segment_handwritten_lines,
+    segment_word_groups,
+)
+
+load_dotenv()
 
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 GPT_ENDPOINT = os.environ.get(
     "GPT_ENDPOINT",
-    "https://medical-summary.services.ai.azure.com/openai/v1/",
+    "https://example.invalid/openai/v1/",
 ).rstrip("/") + "/"
 GPT_DEPLOYMENT = os.environ.get("GPT_DEPLOYMENT", "gpt-5.4")
+GPT_TARGETS_JSON = os.environ.get("GPT_TARGETS", "")
 GPT_REASONING = os.environ.get("GPT_REASONING", "medium")  # low | medium | high
+MODEL_BACKEND = os.environ.get("MODEL_BACKEND", "azure-responses")
 SCOPE = "https://cognitiveservices.azure.com/.default"
 MAX_SEND_SIDE = int(os.environ.get("MAX_SEND_SIDE", "3000"))  # cap px sent to LLM
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel GPT calls in flight
@@ -69,23 +86,46 @@ MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel GPT calls in f
 # The always-on free win is CU running concurrently with region OCR (run_pipeline).
 OCR_REASONING = os.environ.get("OCR_REASONING", GPT_REASONING)       # per-image OCR effort
 OCR_MAX_SIDE = int(os.environ.get("OCR_MAX_SIDE", str(MAX_SEND_SIDE)))  # px cap for OCR images
+OCR_STRATEGY = os.environ.get("OCR_STRATEGY", "standard")
+ISOLATED_MULTIVIEW_STRATEGY = "isolated-multiview"
 
 # Content Understanding (for the printed-text layer used in the merged Markdown).
 CU_ENDPOINT = os.environ.get(
     "CU_ENDPOINT",
-    "https://ai-content-understanding-resource-2416.cognitiveservices.azure.com/",
+    "https://example.invalid/",
 ).rstrip("/") + "/"
 CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
 
 GPT_TEMPERATURE = float(os.environ.get("GPT_TEMPERATURE", "0"))
 GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
 GPT_READ_TIMEOUT = int(os.environ.get("GPT_READ_TIMEOUT", "90"))  # per-call read timeout (s); stuck calls retry fast
+CONTEXTUAL_RECHECK_MIN_CONFIDENCE = float(
+    os.environ.get("CONTEXTUAL_RECHECK_MIN_CONFIDENCE", "0.60")
+)
 
 # Visual adjudication is the quality authority by default: seven enhancement reads
 # become evidence, then the model re-reads the strokes to select the final text.
 # Self-consistency voting remains opt-in for experiments.
 VOTE_ENABLED = os.environ.get("VOTE", "0") not in ("", "0", "false", "False")
 VOTE_SEEDS = int(os.environ.get("VOTE_SEEDS", "3"))  # OCR draws per image version
+
+CORE_OCR_VIEWS = (
+    "01_original_crop.png",
+    "02_upscaled_contrast.png",
+    "04_denoised.png",
+    "06_optional_line_removed.png",
+)
+RETRYABLE_OCR_VIEWS = {
+    "01_original_crop.png",
+    "04_denoised.png",
+}
+MULTI_IMAGE_OCR = os.environ.get("OCR_MULTI_IMAGE", "1") not in ("", "0", "false", "False")
+SPATIAL_NUMERIC_CELLS = os.environ.get("OCR_SPATIAL_NUMERIC_CELLS", "0") not in (
+    "", "0", "false", "False"
+)
+NEARBY_CU_CONTEXT = os.environ.get("OCR_NEARBY_CU_CONTEXT", "0") not in (
+    "", "0", "false", "False"
+)
 
 # Domain-agnostic: the handwriting OCR uses NO built-in vocabulary and makes no
 # assumption about document type. Optionally, a short printed-text context string
@@ -95,6 +135,48 @@ VOTE_SEEDS = int(os.environ.get("VOTE_SEEDS", "3"))  # OCR draws per image versi
 _credential = AzureCliCredential()
 _token_cache: dict[str, tuple[float, str]] = {}
 _token_lock = threading.Lock()
+
+
+def _responses_url(endpoint: str) -> str:
+    normalized = endpoint.rstrip("/")
+    return normalized if normalized.endswith("/responses") else f"{normalized}/responses"
+
+
+def _load_gpt_targets() -> list[dict[str, str]]:
+    if GPT_TARGETS_JSON:
+        raw_targets = json.loads(GPT_TARGETS_JSON)
+        if not isinstance(raw_targets, list) or not raw_targets:
+            raise ValueError("GPT_TARGETS must be a non-empty JSON array")
+        targets = []
+        for index, raw in enumerate(raw_targets, 1):
+            if not isinstance(raw, dict) or not raw.get("endpoint"):
+                raise ValueError(f"GPT_TARGETS entry {index} requires an endpoint")
+            targets.append({
+                "name": str(raw.get("name") or f"endpoint-{index}"),
+                "url": _responses_url(str(raw["endpoint"])),
+                "deployment": str(raw.get("deployment") or GPT_DEPLOYMENT),
+            })
+        return targets
+    targets = [{
+        "name": "primary",
+        "url": _responses_url(GPT_ENDPOINT),
+        "deployment": GPT_DEPLOYMENT,
+    }]
+    return targets
+
+
+GPT_TARGETS = _load_gpt_targets()
+_target_lock = threading.Lock()
+_target_cursor = 0
+
+
+def _ordered_gpt_targets() -> list[dict[str, str]]:
+    """Round-robin the first target while preserving deterministic failover order."""
+    global _target_cursor
+    with _target_lock:
+        start = _target_cursor % len(GPT_TARGETS)
+        _target_cursor += 1
+    return GPT_TARGETS[start:] + GPT_TARGETS[:start]
 
 
 def _bearer() -> str:
@@ -111,15 +193,15 @@ def _bearer() -> str:
 # Token-usage accounting (thread-safe; GPT Responses API calls only)
 # --------------------------------------------------------------------------- #
 _usage_lock = threading.Lock()
-_usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0}
+_usage = {"input_tokens": 0, "output_tokens": 0, "calls": 0, "targets": {}}
 
 
 def _reset_usage() -> None:
     with _usage_lock:
-        _usage.update(input_tokens=0, output_tokens=0, calls=0)
+        _usage.update(input_tokens=0, output_tokens=0, calls=0, targets={})
 
 
-def _add_usage(resp: dict) -> None:
+def _add_usage(resp: dict, target_name: str) -> None:
     """Accumulate token usage from a GPT Responses API JSON response."""
     u = resp.get("usage") or {}
     it = u.get("input_tokens", u.get("prompt_tokens", 0)) or 0
@@ -128,6 +210,16 @@ def _add_usage(resp: dict) -> None:
         _usage["input_tokens"] += int(it)
         _usage["output_tokens"] += int(ot)
         _usage["calls"] += 1
+        targets = _usage["targets"]
+        targets[target_name] = targets.get(target_name, 0) + 1
+
+
+def _add_call_usage(target_name: str) -> None:
+    """Record a model call when its SDK does not expose token counts."""
+    with _usage_lock:
+        _usage["calls"] += 1
+        targets = _usage["targets"]
+        targets[target_name] = targets.get(target_name, 0) + 1
 
 
 def _get_usage() -> dict:
@@ -378,6 +470,33 @@ def build_context_block(printed_context: str) -> str:
     )
 
 
+def nearby_printed_context(
+    cu_markdown: str, box: list[int], page_height: int, window: int = 4,
+) -> str:
+    """Select a soft CU reading-order window near a region's vertical position."""
+    lines = []
+    for raw_line in (cu_markdown or "").splitlines():
+        line = raw_line.strip()
+        if (
+            not line
+            or line.startswith("<!--")
+            or line.startswith("![")
+            or re.fullmatch(r"</?(?:table|tr|thead|tbody)>", line, re.I)
+        ):
+            continue
+        line = re.sub(r"</?(?:td|th)(?:\s[^>]*)?>", " ", line, flags=re.I)
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = " ".join(line.split())
+        if line:
+            lines.append(line)
+    if not lines or page_height <= 0:
+        return ""
+    _x, y, _width, height = box
+    position = min(1.0, max(0.0, (y + height / 2) / page_height))
+    center = min(len(lines) - 1, round(position * (len(lines) - 1)))
+    return "\n".join(lines[max(0, center - window):center + window + 1])
+
+
 # --------------------------------------------------------------------------- #
 # 5. Vision-LLM OCR
 # --------------------------------------------------------------------------- #
@@ -393,8 +512,11 @@ def build_ocr_prompt(printed_context: str = "", italic: bool = False) -> str:
 
 Rules:
 - Read Hebrew right-to-left.
+- Read every numeric sequence left-to-right. Preserve the physical left-to-right order of
+    separate numeric cells or groups; never reverse numeric groups because the form is Hebrew.
 - Transcribe only the {written} text.
-- Ignore printed body text, form lines, stamps, signatures, and black redactions.
+- Ignore printed body text, form lines, stamps, and black redactions.
+- Describe visible X/checkbox marks in the structured mark fields.
 - The attached image is the source of truth.
 - Use printed context only to resolve ambiguous handwriting when the visible strokes support it.
 - Do not copy printed context as handwriting.
@@ -406,6 +528,8 @@ Rules:
 Return only JSON:
 {{
   "full_transcription": "...",
+    "marks": ["x"],
+    "digits": ["1"],
   "alternative_transcriptions": ["...", "..."],
   "words": [
     {{"text": "word", "confidence": 0.0, "alternatives": ["alt1", "alt2"], "reason": "short visual reason"}}
@@ -441,6 +565,102 @@ def _loads_lenient(text: str) -> dict:
         return {"_parse_error": str(e), "_raw": text}
 
 
+class _CopilotSdkBridge:
+    """One local Copilot CLI runtime shared by concurrent OCR sessions."""
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen | None = None
+        self.start_lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending_lock = threading.Lock()
+        self.pending: dict[str, object] = {}
+
+    def _start(self) -> None:
+        with self.start_lock:
+            if self.process is not None and self.process.poll() is None:
+                return
+            self.process = subprocess.Popen(
+                ["node", str(Path(__file__).with_name("copilot_sdk_bridge.mjs"))],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=sys.stderr,
+                text=True,
+                bufsize=1,
+                cwd=str(Path(__file__).resolve().parent),
+                start_new_session=True,
+            )
+            ready_line = self.process.stdout.readline() if self.process.stdout else ""
+            if not ready_line:
+                raise RuntimeError("GitHub Copilot SDK bridge exited during startup")
+            ready = json.loads(ready_line)
+            models = {model["id"]: model for model in ready.get("models", [])}
+            model = models.get(GPT_DEPLOYMENT)
+            if ready.get("type") != "ready" or not model or not model.get("vision") \
+                    or model.get("policy") == "disabled":
+                self.stop()
+                raise RuntimeError(
+                    f"Copilot model {GPT_DEPLOYMENT!r} is unavailable or lacks vision support"
+                )
+            threading.Thread(target=self._read_responses, daemon=True).start()
+
+    def _read_responses(self) -> None:
+        if not self.process or not self.process.stdout:
+            return
+        for line in self.process.stdout:
+            try:
+                response = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            with self.pending_lock:
+                destination = self.pending.get(response.get("id"))
+            if destination:
+                destination.put(response)
+
+    def call(self, content: list[dict], timeout_seconds: int) -> str:
+        import queue
+
+        self._start()
+        request_id = uuid.uuid4().hex
+        destination = queue.Queue(maxsize=1)
+        with self.pending_lock:
+            self.pending[request_id] = destination
+        try:
+            request = {
+                "id": request_id,
+                "model": GPT_DEPLOYMENT,
+                "content": content,
+                "timeoutSeconds": timeout_seconds,
+            }
+            with self.write_lock:
+                if not self.process or not self.process.stdin:
+                    raise RuntimeError("GitHub Copilot SDK bridge is not running")
+                self.process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+                self.process.stdin.flush()
+            try:
+                response = destination.get(timeout=timeout_seconds + 15)
+            except queue.Empty as exc:
+                raise RuntimeError("GitHub Copilot SDK request timed out") from exc
+            if not response.get("ok"):
+                raise RuntimeError(response.get("error") or "GitHub Copilot SDK request failed")
+            _add_call_usage("github-copilot-sdk")
+            return str(response.get("text") or "")
+        finally:
+            with self.pending_lock:
+                self.pending.pop(request_id, None)
+
+    def stop(self) -> None:
+        process, self.process = self.process, None
+        if process and process.poll() is None:
+            try:
+                os.killpg(process.pid, 15)
+            except OSError:
+                process.terminate()
+
+
+_copilot_bridge = _CopilotSdkBridge()
+atexit.register(_copilot_bridge.stop)
+
+
 def _responses_text(content: list[dict], retries: int = 4,
                     max_tokens: int = 6000, reasoning: str | None = None,
                     seed: int | None = None) -> str:
@@ -449,9 +669,22 @@ def _responses_text(content: list[dict], retries: int = 4,
     Robust to timeouts / 429 / 5xx / empty output: retries with exponential
     backoff + jitter so a transient burst never loses the call.
     """
+    if MODEL_BACKEND == "github-copilot-sdk":
+        last_error = ""
+        for attempt in range(retries + 1):
+            try:
+                text = _copilot_bridge.call(content, GPT_READ_TIMEOUT)
+                if text.strip():
+                    return text
+                last_error = "empty output"
+            except Exception as exc:
+                last_error = str(exc)
+            if attempt < retries:
+                time.sleep(min(4.0, 2.0 ** attempt) + random.uniform(0, 0.5))
+        raise RuntimeError(f"[Copilot SDK] {last_error}")
+
     use_seed = GPT_SEED if seed is None else seed
     payload = {
-        "model": GPT_DEPLOYMENT,
         "input": [{"role": "user", "content": content}],
         "max_output_tokens": max_tokens,
         "reasoning": {"effort": reasoning or GPT_REASONING},
@@ -460,57 +693,64 @@ def _responses_text(content: list[dict], retries: int = 4,
     }
     for _p in _unsupported_params:
         payload.pop(_p, None)
-    url = f"{GPT_ENDPOINT}responses"
     last_err = ""
     for attempt in range(retries + 1):
         backoff = min(30.0, 2.0 ** attempt) + random.uniform(0, 1.5)
-        try:
-            r = requests.post(
-                url,
-                headers={"Authorization": f"Bearer {_bearer()}", "Content-Type": "application/json"},
-                data=json.dumps(payload),
-                timeout=GPT_READ_TIMEOUT,
-            )
-        except requests.exceptions.RequestException as exc:  # timeout / connection reset
-            last_err = f"request error: {exc}"
-            if attempt < retries:
-                time.sleep(backoff)
-                continue
-            raise RuntimeError(f"[GPT] {last_err}")
-
-        if r.status_code == 400:
-            low = r.text.lower()
-            popped = False
-            for _p in ("temperature", "seed", "reasoning"):
-                if _p in low and _p in payload:
-                    payload.pop(_p, None)
-                    _unsupported_params.add(_p)
-                    popped = True
-            if popped:
-                return _responses_text(
-                    content, retries=retries, max_tokens=max_tokens,
-                    reasoning=reasoning, seed=seed,
+        retry_after = backoff
+        for target in _ordered_gpt_targets():
+            target_payload = {**payload, "model": target["deployment"]}
+            try:
+                r = requests.post(
+                    target["url"],
+                    headers={
+                        "Authorization": f"Bearer {_bearer()}",
+                        "Content-Type": "application/json",
+                    },
+                    data=json.dumps(target_payload),
+                    timeout=GPT_READ_TIMEOUT,
                 )
-        if r.status_code in (408, 409, 429, 500, 502, 503, 504):
-            last_err = f"HTTP {r.status_code}"
-            if attempt < retries:
-                wait = float(r.headers.get("retry-after", backoff))
-                time.sleep(wait)
+            except requests.exceptions.RequestException as exc:
+                last_err = f"{target['name']} request error: {exc}"
                 continue
-            raise RuntimeError(f"[GPT] {r.status_code} after retries: {r.text[:200]}")
-        if r.status_code != 200:
-            raise RuntimeError(f"[GPT] {r.status_code}: {r.text[:400]}")
-        resp_json = r.json()
-        _add_usage(resp_json)
-        text = _gpt_output_text(resp_json)
-        if not text.strip() and attempt < retries:
-            # 200 but empty output (reasoning consumed the whole budget) -> retry
-            # with a larger output budget.
-            last_err = "empty output"
-            payload["max_output_tokens"] = min(payload.get("max_output_tokens", max_tokens) + 4000, 32000)
-            time.sleep(backoff)
+
+            if r.status_code == 400:
+                low = r.text.lower()
+                popped = False
+                for _p in ("temperature", "seed", "reasoning"):
+                    if _p in low and _p in payload:
+                        payload.pop(_p, None)
+                        _unsupported_params.add(_p)
+                        popped = True
+                if popped:
+                    return _responses_text(
+                        content, retries=retries, max_tokens=max_tokens,
+                        reasoning=reasoning, seed=seed,
+                    )
+            if r.status_code in (408, 409, 429, 500, 502, 503, 504):
+                last_err = f"{target['name']} HTTP {r.status_code}"
+                retry_after = max(
+                    retry_after,
+                    float(r.headers.get("retry-after", backoff)),
+                )
+                continue
+            if r.status_code != 200:
+                raise RuntimeError(
+                    f"[GPT] {target['name']} HTTP {r.status_code}: {r.text[:400]}"
+                )
+            resp_json = r.json()
+            _add_usage(resp_json, target["name"])
+            text = _gpt_output_text(resp_json)
+            if text.strip():
+                return text
+            last_err = f"{target['name']} empty output"
+            payload["max_output_tokens"] = min(
+                payload.get("max_output_tokens", max_tokens) + 4000,
+                32000,
+            )
+        if attempt < retries:
+            time.sleep(retry_after)
             continue
-        return text
+        raise RuntimeError(f"[GPT] all endpoints failed: {last_err}")
 
     raise RuntimeError(f"[GPT] failed after retries: {last_err}")
 
@@ -528,6 +768,212 @@ def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
         {"type": "input_text", "text": prompt},
         {"type": "input_image", "image_url": _to_data_uri(image, max_side=OCR_MAX_SIDE)},
     ], retries=0, reasoning=OCR_REASONING, seed=seed)
+
+
+def ocr_image_set(
+    images: list[tuple[str, Image.Image]], prompt: str, seed: int | None = None,
+) -> dict:
+    """Read one region once from several labeled renderings of the same strokes."""
+    instruction = prompt + """
+
+All attached images show the SAME region. Compare them as complementary evidence and
+return one transcription, not one answer per image. The original crop is authoritative;
+enhancements may clarify strokes but must not introduce characters. Preserve numeric
+cell/group order exactly as it appears spatially in the original crop.
+"""
+    content: list[dict] = [{"type": "input_text", "text": instruction}]
+    for name, image in images:
+        content.append({"type": "input_text", "text": f"Image view: {name}"})
+        content.append({
+            "type": "input_image",
+            "image_url": _to_data_uri(image, max_side=OCR_MAX_SIDE),
+        })
+    result = _responses_call(
+        content, retries=0, reasoning=OCR_REASONING, seed=seed, max_tokens=10000,
+    )
+    result["evidence_views"] = [name for name, _image in images]
+    return result
+
+
+def _segmented_unit_content(
+    prompt: str, views: list[tuple[str, Image.Image]],
+) -> list[dict]:
+    content: list[dict] = [{
+        "type": "input_text",
+        "text": prompt + """
+
+All attached views are faithful renderings of the SAME isolated handwriting unit.
+They contain no neighboring word or line. Compare only their shared strokes; a form line or
+image enhancement is not an additional character and does not provide semantic context.
+""",
+    }]
+    for view_name, image in views:
+        content.append({"type": "input_text", "text": f"View: {view_name}"})
+        content.append({"type": "input_image", "image_url": _to_data_uri(image)})
+    return content
+
+
+def _segmented_read_text(result: dict) -> str:
+    return " ".join(str(result.get("transcription", "")).strip().split())
+
+
+def _align_segmented_readings(first: str, second: str) -> tuple[str, float]:
+    matcher = difflib.SequenceMatcher(None, first, second)
+    consensus: list[str] = []
+    for operation, first_start, first_end, _second_start, _second_end in matcher.get_opcodes():
+        if operation == "equal":
+            consensus.append(first[first_start:first_end])
+        elif not consensus or consensus[-1] != "[?]":
+            consensus.append("[?]")
+    return "".join(consensus).strip() or "[?]", round(matcher.ratio(), 4)
+
+
+def prepare_isolated_multiview_plan(
+    original_crop: Image.Image, region_dir: Path,
+) -> dict:
+    lines, line_metadata, mask = segment_handwritten_lines(original_crop)
+    if not 2 <= len(lines) <= 6:
+        raise ValueError(f"requires 2-6 lined handwriting rows, detected {len(lines)}")
+    Image.fromarray(mask * 255).save(region_dir / "10_segmented_blue_mask.png")
+
+    plan_lines = []
+    artifact = {"strategy": ISOLATED_MULTIVIEW_STRATEGY, "lines": []}
+    for line_index, (line, metadata) in enumerate(zip(lines, line_metadata), start=1):
+        words, word_metadata = segment_word_groups(line)
+        if 2 <= len(words) <= 4:
+            mode = "word_groups"
+            view_sets = build_word_view_sets(
+                original_crop, metadata, words, word_metadata,
+            )
+            unit_metadata = word_metadata
+        else:
+            mode = "whole_line"
+            view_sets = [build_line_view_set(original_crop, line, metadata)]
+            unit_metadata = [{
+                "word_rtl": 1,
+                "box": [0, 0, line.width, line.height],
+                "blue_pixels": int(blue_pen_mask(line).sum()),
+            }]
+
+        units = []
+        artifact_line = {"line": line_index, "mode": mode, "box": metadata["box"], "units": []}
+        for unit_index, (views, unit_info) in enumerate(
+            zip(view_sets, unit_metadata), start=1,
+        ):
+            saved_views = []
+            for view_name, image in views:
+                file_name = (
+                    f"seg_line_{line_index:02d}_unit_{unit_index:02d}_{view_name}.png"
+                )
+                image.save(region_dir / file_name)
+                saved_views.append(file_name)
+            units.append({
+                "unit_rtl": unit_index,
+                "views": views,
+                "metadata": unit_info,
+            })
+            artifact_line["units"].append({
+                "unit_rtl": unit_index,
+                "box": unit_info["box"],
+                "views": saved_views,
+            })
+        plan_lines.append({"line": line_index, "mode": mode, "units": units})
+        artifact["lines"].append(artifact_line)
+
+    _write_json_atomic(region_dir / "segmented_multiview_plan.json", artifact)
+    return {"lines": plan_lines, "draws": sum(len(line["units"]) * 2 for line in plan_lines)}
+
+
+def run_isolated_multiview_plan(
+    plan: dict, on_draw=None,
+) -> tuple[dict, list[dict], dict]:
+    line_a, line_b, line_consensus = [], [], []
+    final_words = []
+    details = {"strategy": ISOLATED_MULTIVIEW_STRATEGY, "lines": []}
+    successful_calls = 0
+
+    for line in plan["lines"]:
+        units_a, units_b, units_consensus = [], [], []
+        detail_line = {"line": line["line"], "mode": line["mode"], "units": []}
+        for unit in line["units"]:
+            reads = []
+            for pass_name, prompt, seed in (
+                ("a", SEGMENTED_PROMPT_A, 101),
+                ("b", SEGMENTED_PROMPT_B, 202),
+            ):
+                try:
+                    result = _responses_call(
+                        _segmented_unit_content(prompt, unit["views"]),
+                        retries=0,
+                        reasoning=OCR_REASONING,
+                        max_tokens=1800,
+                        seed=seed,
+                    )
+                    successful_calls += 1
+                    if on_draw:
+                        on_draw(True)
+                except Exception as exc:
+                    result = {"transcription": "", "error": str(exc)}
+                    if on_draw:
+                        on_draw(False)
+                reads.append((pass_name, result, _segmented_read_text(result)))
+
+            first_text, second_text = reads[0][2], reads[1][2]
+            consensus, similarity = _align_segmented_readings(first_text, second_text)
+            units_a.append(first_text or "[?]")
+            units_b.append(second_text or "[?]")
+            units_consensus.append(consensus)
+            alternatives = [text for text in (first_text, second_text) if text and text != consensus]
+            final_words.append({
+                "text": consensus,
+                "confidence": 1.0 if first_text == second_text and first_text else similarity,
+                "alternatives": list(dict.fromkeys(alternatives)),
+                "reason": "agreement across two candidate-blind isolated multi-view reads",
+                "source_images": [name for name, _image in unit["views"]],
+            })
+            detail_line["units"].append({
+                "unit_rtl": unit["unit_rtl"],
+                "read_a": reads[0][1],
+                "read_b": reads[1][1],
+                "read_a_text": first_text,
+                "read_b_text": second_text,
+                "consensus": consensus,
+                "similarity": similarity,
+            })
+
+        line_a.append(" ".join(units_a))
+        line_b.append(" ".join(units_b))
+        line_consensus.append(" ".join(units_consensus))
+        details["lines"].append(detail_line)
+
+    if not successful_calls:
+        raise RuntimeError("all isolated multi-view OCR calls failed")
+    full_a = "\n".join(line_a)
+    full_b = "\n".join(line_b)
+    final_text = "\n".join(line_consensus)
+    alternatives = [text for text in (full_a, full_b) if text and text != final_text]
+    candidates = [
+        {"source": "isolated_multiview_a", "ocr": {"full_transcription": full_a}},
+        {"source": "isolated_multiview_b", "ocr": {"full_transcription": full_b}},
+    ]
+    final = {
+        "classification": "handwritten_text",
+        "final_transcription": final_text,
+        "alternative_transcriptions": list(dict.fromkeys(alternatives)),
+        "words": final_words,
+        "notes": [
+            "experimental isolated multi-view consensus; no candidate or neighboring line supplied",
+        ],
+        "needs_review": "[?]" in final_text or full_a != full_b,
+        "decision_status": "isolated_multiview_consensus",
+    }
+    details.update({
+        "read_a": full_a,
+        "read_b": full_b,
+        "final_transcription": final_text,
+        "successful_calls": successful_calls,
+    })
+    return final, candidates, details
 
 
 # --------------------------------------------------------------------------- #
@@ -877,7 +1323,12 @@ _FAITHFUL_VISUAL_SOURCES = {
 
 
 def _is_faithful_source(source: str) -> bool:
-    return source in _FAITHFUL_VISUAL_SOURCES or source.startswith("chunk_")
+    return (
+        source in _FAITHFUL_VISUAL_SOURCES
+        or source.startswith("chunk_")
+        or source.startswith("core4_multi")
+        or source.startswith("core2_faithful_retry")
+    )
 
 
 def guard_visual_reconciliation(final: dict, usable: list[dict]) -> dict:
@@ -953,6 +1404,522 @@ def guard_visual_reconciliation(final: dict, usable: list[dict]) -> dict:
         "selected_supporting_sources": exact_support,
     }
     return guarded
+
+
+def _numeric_sequence(text: str) -> str | None:
+    """Return visible digits when text contains no letters, or None for non-numeric text."""
+    cleaned = (text or "").replace("[?]", "")
+    if re.search(r"[A-Za-z\u0590-\u05ff]", cleaned):
+        return None
+    digits = "".join(re.findall(r"\d", cleaned))
+    return digits if len(digits) >= 2 else None
+
+
+def preserve_numeric_candidate_order(final: dict, usable: list[dict]) -> dict:
+    """Prevent RTL adjudication from permuting an otherwise agreed numeric sequence."""
+    final_digits = _numeric_sequence(final.get("final_transcription", ""))
+    if not final_digits:
+        return final
+    candidates = []
+    for result in usable:
+        text = (result.get("ocr") or {}).get("full_transcription", "")
+        digits = _numeric_sequence(text)
+        if digits and len(digits) == len(final_digits) and sorted(digits) == sorted(final_digits):
+            candidates.append((result.get("source", ""), text, digits))
+    if not candidates:
+        return final
+    counts = collections.Counter(digits for _source, _text, digits in candidates)
+
+    def rank(candidate: tuple[str, str, str]) -> tuple[int, int]:
+        source, _text, digits = candidate
+        source_priority = {
+            "01_original_crop.png": 3,
+            "04_denoised.png": 2,
+            "02_upscaled_contrast.png": 1,
+        }.get(source.split("#", 1)[0], 0)
+        return counts[digits], source_priority
+
+    source, text, digits = max(candidates, key=rank)
+    if digits == final_digits or counts[digits] < 2:
+        return final
+    ordered = dict(final)
+    ordered["final_transcription"] = text.strip()
+    ordered.setdefault("alternative_transcriptions", []).insert(
+        0, final.get("final_transcription", "")
+    )
+    ordered.setdefault("notes", []).append(
+        "numeric-order guard: preserved the candidate sequence supported by faithful images"
+    )
+    ordered["decision_status"] = "numeric_order_guard"
+    ordered["numeric_order_gate"] = {
+        "rejected_transcription": final.get("final_transcription", ""),
+        "selected_source": source,
+        "selected_support": counts[digits],
+    }
+    return ordered
+
+
+def _information_text(text: str) -> str:
+    return re.sub(r"[^\w\u0590-\u05ff]", "", (text or "").replace("[?]", ""))
+
+
+def _structured_result_confidence(final: dict) -> float:
+    if final.get("confidence") is not None:
+        return float(final.get("confidence") or 0.0)
+    confidences = []
+    for word in final.get("words") or []:
+        if isinstance(word, dict) and word.get("confidence") is not None:
+            confidences.append(float(word.get("confidence") or 0.0))
+    return sum(confidences) / len(confidences) if confidences else 0.0
+
+
+def reconcile_repeated_structured_fields(finals: list[dict], regions: list[dict]) -> list[dict]:
+    """Use a stronger duplicate identifier to repair one-digit OCR drift."""
+    position_words = re.compile(
+        r"\b(?:top|bottom|upper|lower|middle|left|right|form|handwritten|entry)\b",
+        re.I,
+    )
+    identifier_words = re.compile(r"\b(?:account|customer|reference|identifier|number|id)\b", re.I)
+    groups: dict[str, list[int]] = collections.defaultdict(list)
+    for index, region in enumerate(regions):
+        label = str(region.get("label") or "")
+        normalized_label = " ".join(position_words.sub(" ", label).lower().split())
+        if identifier_words.search(normalized_label):
+            groups[normalized_label].append(index)
+
+    reconciled = [dict(final) for final in finals]
+    for indexes in groups.values():
+        for left_offset, left_index in enumerate(indexes):
+            for right_index in indexes[left_offset + 1:]:
+                left = reconciled[left_index]
+                right = reconciled[right_index]
+                left_digits = "".join(re.findall(r"\d", left.get("final_transcription", "")))
+                right_digits = "".join(re.findall(r"\d", right.get("final_transcription", "")))
+                if len(left_digits) < 4 or len(left_digits) != len(right_digits):
+                    continue
+                if sum(a != b for a, b in zip(left_digits, right_digits)) != 1:
+                    continue
+                left_confidence = _structured_result_confidence(left)
+                right_confidence = _structured_result_confidence(right)
+                winner_index, loser_index = (
+                    (left_index, right_index)
+                    if left_confidence >= right_confidence
+                    else (right_index, left_index)
+                )
+                winner_confidence = max(left_confidence, right_confidence)
+                loser_confidence = min(left_confidence, right_confidence)
+                if winner_confidence < 0.90 or winner_confidence - loser_confidence < 0.10:
+                    continue
+                winner = reconciled[winner_index]
+                loser = dict(reconciled[loser_index])
+                rejected = loser.get("final_transcription", "")
+                selected = winner.get("final_transcription", "")
+                loser["final_transcription"] = selected
+                alternatives = loser.setdefault("alternative_transcriptions", [])
+                if rejected and rejected != selected and rejected not in alternatives:
+                    alternatives.insert(0, rejected)
+                loser.setdefault("notes", []).append(
+                    "cross-region consensus: matched the stronger repeated identifier"
+                )
+                loser["decision_status"] = "cross_region_structured_consensus"
+                loser["cross_region_consensus"] = {
+                    "matched_region": winner_index + 1,
+                    "rejected_transcription": rejected,
+                    "winner_confidence": winner_confidence,
+                    "loser_confidence": loser_confidence,
+                }
+                reconciled[loser_index] = loser
+    return reconciled
+
+
+def protect_faithful_candidate(final: dict, usable: list[dict]) -> dict:
+    """Do not replace faithful OCR with a reordered or lower-information adjudication."""
+    faithful = [
+        result for result in usable
+        if _is_faithful_source(result.get("source", ""))
+        and _information_text((result.get("ocr") or {}).get("full_transcription", ""))
+    ]
+    if not faithful:
+        return final
+    candidate = max(
+        faithful,
+        key=lambda result: len(_information_text(
+            (result.get("ocr") or {}).get("full_transcription", "")
+        )),
+    )
+    candidate_ocr = candidate.get("ocr") or {}
+    candidate_text = candidate_ocr.get("full_transcription", "")
+    candidate_info = _information_text(candidate_text)
+    final_text = final.get("final_transcription", "")
+    final_info = _information_text(final_text)
+    if not final_info:
+        return final
+    same_characters = (
+        len(candidate_info) >= 2
+        and candidate_info != final_info
+        and collections.Counter(candidate_info) == collections.Counter(final_info)
+    )
+    lower_information = (
+        len(candidate_info) >= 4
+        and len(final_info) < 0.72 * len(candidate_info)
+    )
+    if not same_characters and not lower_information:
+        return final
+    protected = dict(final)
+    protected["final_transcription"] = candidate_text
+    protected["words"] = candidate_ocr.get("words", [])
+    if not protected.get("marks"):
+        protected["classification"] = "handwritten_text"
+    protected.setdefault("alternative_transcriptions", []).insert(0, final_text)
+    protected.setdefault("notes", []).append(
+        "candidate-protection guard: preserved faithful spatial order/information"
+    )
+    protected["decision_status"] = "faithful_candidate_protected"
+    protected["candidate_protection"] = {
+        "rejected_transcription": final_text,
+        "selected_source": candidate.get("source"),
+        "reason": "reordered" if same_characters else "lower_information",
+    }
+    return protected
+
+
+def should_contextual_recheck(final: dict, usable: list[dict]) -> bool:
+    """Escalate uncertain or language-bearing fields; leave clean numeric fields fast."""
+    if final.get("classification") in {"signature_non_text", "no_handwriting"}:
+        return False
+    texts = [
+        (result.get("ocr") or {}).get("full_transcription", "")
+        for result in usable
+        if (result.get("ocr") or {}).get("full_transcription", "").strip()
+    ]
+    candidate = max(texts, key=lambda text: len(_information_text(text)), default="")
+    final_text = final.get("final_transcription", "")
+    combined = f"{candidate} {final_text}"
+    if not _information_text(final_text):
+        return True
+    if "[?]" in combined:
+        return True
+    compact_final = re.sub(r"\s+", "", final_text)
+    if re.search(r"\d[/.-]\d", compact_final) and not re.fullmatch(
+        r"\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}", compact_final
+    ):
+        return True
+    if final.get("alternative_transcriptions"):
+        return True
+    if re.search(r"[\u0590-\u05ff]", combined):
+        return True
+    confidences = [
+        float(word.get("confidence", 0.0) or 0.0)
+        for result in usable
+        for word in ((result.get("ocr") or {}).get("words") or [])
+    ]
+    if confidences and min(confidences) < 0.65:
+        return True
+    if candidate and final_text:
+        similarity = difflib.SequenceMatcher(
+            None, _norm_read(candidate), _norm_read(final_text)
+        ).ratio()
+        if similarity < 0.85:
+            return True
+    return False
+
+
+def build_contextual_region_images(
+    page_img: Image.Image, box: list[int],
+) -> tuple[Image.Image, Image.Image]:
+    """Return a larger local crop and full page, both with the target outlined."""
+    page_width, page_height = page_img.size
+    x, y, width, height = box
+    horizontal_pad = max(round(width * 1.1), round(page_width * 0.08))
+    vertical_pad = max(round(height * 1.8), round(page_height * 0.025))
+    left = max(0, x - horizontal_pad)
+    top = max(0, y - vertical_pad)
+    right = min(page_width, x + width + horizontal_pad)
+    bottom = min(page_height, y + height + vertical_pad)
+    context = page_img.crop((left, top, right, bottom)).convert("RGB")
+    context_draw = ImageDraw.Draw(context)
+    context_draw.rectangle(
+        (x - left, y - top, x + width - left, y + height - top),
+        outline=(220, 20, 20), width=max(4, round(min(context.size) * 0.008)),
+    )
+    highlighted_page = page_img.convert("RGB").copy()
+    page_draw = ImageDraw.Draw(highlighted_page)
+    page_draw.rectangle(
+        (x, y, x + width, y + height),
+        outline=(220, 20, 20), width=max(8, round(min(page_img.size) * 0.003)),
+    )
+    return context, highlighted_page
+
+
+def contextual_region_recheck(
+    page_img: Image.Image, region: dict, candidate: dict, printed_context: str = "",
+) -> tuple[dict, tuple[Image.Image, Image.Image]]:
+    """Re-read a difficult field with local form labels and page-level position."""
+    context_image, highlighted_page = build_contextual_region_images(page_img, region["box"])
+    candidate_text = candidate.get("final_transcription", "")
+    candidate_has_hebrew = bool(re.search(r"[\u0590-\u05ff]", candidate_text))
+    candidate_hint = "(withheld for an independent Hebrew reread)" if candidate_has_hebrew \
+        else candidate_text or "(none)"
+    preservation_rule = "" if candidate_has_hebrew else """
+- Preserve all visible words/digits and their grouping. Do not shorten or reorder the candidate
+  unless the highlighted visual evidence clearly proves the correction."""
+    context_block = build_context_block(printed_context)
+    numeric_cell_rules = ""
+    numeric_cell_schema = ""
+    if SPATIAL_NUMERIC_CELLS:
+        numeric_cell_rules = """
+- For numeric fields split across visible cells, return each cell separately in numeric_cells.
+  Set x to the cell center measured from the LEFT edge of the red rectangle (0.0 to 1.0)."""
+        numeric_cell_schema = """
+  "numeric_cells": [
+    {"value": "visible digits", "x": 0.0, "confidence": 0.0}
+  ],"""
+    prompt = f"""Re-read the handwriting inside the RED rectangle on this Hebrew form.
+
+You receive a larger local crop and the full page so nearby printed labels, table cells,
+and field position are visible. Transcribe ONLY handwriting inside the red rectangle.
+
+Current OCR candidate: {candidate_hint}
+
+Rules:
+- The visible strokes are authoritative; the candidate is only a hint.
+- Use nearby printed labels only to identify the field type, never copy them as handwriting.
+- Read Hebrew words right-to-left, but digits and numeric cells in physical left-to-right order.
+{numeric_cell_rules}
+{preservation_rule}
+- Return uncertainty as [?]. Classify signatures and marks explicitly.
+{context_block}
+Return JSON only:
+{{
+  "classification": "handwritten_text | mark_or_checkbox | signature_non_text | no_handwriting",
+  "field_type": "date | numeric | name | address | free_text | mark | signature | unknown",
+  "final_transcription": "...",
+{numeric_cell_schema}
+  "confidence": 0.0,
+  "alternative_transcriptions": [],
+  "words": [],
+  "notes": []
+}}
+"""
+    result = _responses_call([
+        {"type": "input_text", "text": prompt},
+        {"type": "input_text", "text": "Larger context crop with target rectangle:"},
+        {"type": "input_image", "image_url": _to_data_uri(context_image)},
+        {"type": "input_text", "text": "Full page with the same target rectangle:"},
+        {"type": "input_image", "image_url": _to_data_uri(highlighted_page)},
+    ], retries=0, max_tokens=10000)
+    return result, (context_image, highlighted_page)
+
+
+def assemble_spatial_numeric_cells(recheck: dict) -> dict:
+    """Assemble numeric table cells in physical left-to-right order."""
+    if recheck.get("field_type") != "numeric":
+        return recheck
+    raw_cells = recheck.get("numeric_cells")
+    if not isinstance(raw_cells, list) or len(raw_cells) < 2:
+        return recheck
+    cells = []
+    for cell in raw_cells:
+        if not isinstance(cell, dict):
+            return recheck
+        value = str(cell.get("value", "")).strip()
+        try:
+            x_position = float(cell.get("x"))
+        except (TypeError, ValueError):
+            return recheck
+        cleaned_value = value.replace("[?]", "")
+        if (
+            not 0.0 <= x_position <= 1.0
+            or re.search(r"[A-Za-z\u0590-\u05ff]", cleaned_value)
+            or not re.search(r"\d", cleaned_value)
+        ):
+            return recheck
+        cells.append((x_position, value, float(cell.get("confidence", 0.0) or 0.0)))
+    cells.sort(key=lambda cell: cell[0])
+    if any(right[0] - left[0] < 0.01 for left, right in zip(cells, cells[1:])):
+        return recheck
+    groups: list[list[tuple[float, str, float]]] = []
+    for cell in cells:
+        if (
+            groups
+            and len(groups[-1][-1][1].replace("[?]", "")) == 1
+            and len(cell[1].replace("[?]", "")) == 1
+            and cell[0] - groups[-1][-1][0] <= 0.09
+        ):
+            groups[-1].append(cell)
+        else:
+            groups.append([cell])
+    assembled_text = " ".join("".join(cell[1] for cell in group) for group in groups)
+    current_info = _information_text(recheck.get("final_transcription", ""))
+    assembled_info = _information_text(assembled_text)
+    if current_info and len(assembled_info) < 0.72 * len(current_info):
+        return recheck
+    assembled = dict(recheck)
+    assembled["final_transcription"] = assembled_text
+    assembled["numeric_cells"] = [
+        {"value": value, "x": x_position, "confidence": confidence}
+        for x_position, value, confidence in cells
+    ]
+    assembled.setdefault("notes", []).append(
+        "numeric cells assembled deterministically by physical x-coordinate"
+    )
+    assembled["spatial_numeric_assembly"] = True
+    return assembled
+
+
+def accept_contextual_recheck(current: dict, recheck: dict) -> dict:
+    """Accept a contextual read only when it is non-empty and not less informative."""
+    if SPATIAL_NUMERIC_CELLS:
+        recheck = assemble_spatial_numeric_cells(recheck)
+    if recheck.get("classification") in {"signature_non_text", "no_handwriting"}:
+        return current
+    if recheck.get("classification") == "mark_or_checkbox" and not recheck.get("marks"):
+        return current
+    current_info = _information_text(current.get("final_transcription", ""))
+    recheck_info = _information_text(recheck.get("final_transcription", ""))
+    if not recheck_info:
+        return current
+    if current_info and len(recheck_info) < 0.72 * len(current_info):
+        return current
+    current_has_hebrew = bool(re.search(r"[\u0590-\u05ff]", current_info))
+    recheck_has_hebrew = bool(re.search(r"[\u0590-\u05ff]", recheck_info))
+    if current_has_hebrew and not recheck_has_hebrew:
+        return current
+    structured_pattern = re.compile(r"(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|[O0]\+)", re.I)
+    current_structured = {
+        token.upper().replace(".", "/").replace("-", "/")
+        for token in structured_pattern.findall(current.get("final_transcription", ""))
+    }
+    recheck_structured = {
+        token.upper().replace(".", "/").replace("-", "/")
+        for token in structured_pattern.findall(recheck.get("final_transcription", ""))
+    }
+    if not current_structured.issubset(recheck_structured):
+        return current
+    confidence = float(recheck.get("confidence", 0.0) or 0.0)
+    if confidence < CONTEXTUAL_RECHECK_MIN_CONFIDENCE and recheck_info != current_info:
+        return current
+    accepted = dict(recheck)
+    accepted.setdefault("alternative_transcriptions", []).append(
+        current.get("final_transcription", "")
+    )
+    accepted.setdefault("notes", []).append("adaptive highlighted-context recheck")
+    accepted["decision_status"] = "contextual_recheck"
+    accepted["contextual_recheck"] = True
+    return accepted
+
+
+def is_signature_flourish(image: Image.Image) -> bool:
+    """High-specificity blue-ink signature gate based on one dominant crossing stroke."""
+    rgb = np.asarray(image.convert("RGB"))
+    red = rgb[:, :, 0].astype(np.int16)
+    green = rgb[:, :, 1].astype(np.int16)
+    blue = rgb[:, :, 2].astype(np.int16)
+    mask = (
+        (blue - red >= 24)
+        & (blue - green >= 17)
+        & (blue <= 245)
+    ).astype(np.uint8)
+    ink_area = int(mask.sum())
+    if ink_area < 100:
+        return False
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask, 8)
+    if count <= 1:
+        return False
+    largest = max(stats[1:], key=lambda stat: int(stat[cv2.CC_STAT_AREA]))
+    dominance = int(largest[cv2.CC_STAT_AREA]) / ink_area
+    width_fraction = int(largest[cv2.CC_STAT_WIDTH]) / max(1, image.width)
+    return dominance >= 0.78 and width_fraction >= 0.78
+
+
+def finalize_region_semantics(
+    final: dict, usable: list[dict], signature_flourish: bool = False,
+) -> dict:
+    """Apply explicit non-text semantics and deterministic numeric ordering."""
+    resolved = protect_faithful_candidate(
+        preserve_numeric_candidate_order(final, usable), usable
+    )
+    classification = resolved.get("classification")
+    if classification not in {
+        "handwritten_text", "mark_or_checkbox", "signature_non_text", "no_handwriting"
+    }:
+        candidate_classes = [
+            (result.get("ocr") or {}).get("classification")
+            for result in usable
+            if (result.get("ocr") or {}).get("classification") in {
+                "handwritten_text", "mark_or_checkbox", "signature_non_text", "no_handwriting"
+            }
+        ]
+        notes = " ".join(str(note) for note in resolved.get("notes", [])).lower()
+        if candidate_classes and collections.Counter(candidate_classes).most_common(1)[0][1] >= 2:
+            classification = collections.Counter(candidate_classes).most_common(1)[0][0]
+        elif "signature" in notes or "חתימה" in notes:
+            classification = "signature_non_text"
+        elif resolved.get("marks"):
+            classification = "mark_or_checkbox"
+        else:
+            classification = "handwritten_text"
+    resolved["classification"] = classification
+    if (
+        not signature_flourish
+        and not _norm_read(resolved.get("final_transcription", ""))
+        and classification not in {"signature_non_text", "no_handwriting"}
+        and not resolved.get("marks")
+    ):
+        faithful_nonempty = [
+            result for result in usable
+            if _is_faithful_source(result.get("source", ""))
+            and _norm_read((result.get("ocr") or {}).get("full_transcription", ""))
+        ]
+        if faithful_nonempty:
+            selected = max(
+                faithful_nonempty,
+                key=lambda result: len(_norm_read(
+                    (result.get("ocr") or {}).get("full_transcription", "")
+                )),
+            )
+            selected_ocr = selected.get("ocr") or {}
+            resolved["final_transcription"] = selected_ocr.get("full_transcription", "")
+            resolved["words"] = selected_ocr.get("words", [])
+            resolved["classification"] = "handwritten_text"
+            resolved["decision_status"] = "nonempty_faithful_fallback"
+            resolved.setdefault("notes", []).append(
+                "empty-output guard: preserved non-empty faithful OCR on a non-signature crop"
+            )
+    if classification == "signature_non_text" and not signature_flourish:
+        classification = "handwritten_text"
+        resolved["classification"] = classification
+        if not _norm_read(resolved.get("final_transcription", "")):
+            faithful_nonempty = [
+                result for result in usable
+                if _is_faithful_source(result.get("source", ""))
+                and _norm_read((result.get("ocr") or {}).get("full_transcription", ""))
+            ]
+            if faithful_nonempty:
+                selected = max(
+                    faithful_nonempty,
+                    key=lambda result: len(_norm_read(
+                        (result.get("ocr") or {}).get("full_transcription", "")
+                    )),
+                )
+                selected_ocr = selected.get("ocr") or {}
+                resolved["final_transcription"] = selected_ocr.get("full_transcription", "")
+                resolved["words"] = selected_ocr.get("words", [])
+                resolved["decision_status"] = "false_signature_faithful_fallback"
+                resolved.setdefault("notes", []).append(
+                    "signature gate rejected: crop contains multiple letter-like stroke components"
+                )
+    if classification in {"signature_non_text", "no_handwriting"}:
+        resolved["final_transcription"] = ""
+        resolved["words"] = []
+        resolved["decision_status"] = classification
+    elif classification == "mark_or_checkbox":
+        marks = [str(mark).lower() for mark in resolved.get("marks", [])]
+        digits = [str(digit) for digit in resolved.get("digits", []) if str(digit).isdigit()]
+        if any(mark in {"x", "×"} for mark in marks) and digits:
+            resolved["final_transcription"] = f"סימון x ו המספר {' '.join(digits)}"
+            resolved["decision_status"] = "structured_mark"
+    return resolved
 
 
 def focused_faithful_recheck(
@@ -1060,10 +2027,14 @@ def visual_reconcile_ocr_results(
     selected = _select_visual_images(image_tasks, results)
     if not selected:
         raise RuntimeError("visual reconcile: no images to show")
-    usable = [r for r in results if (r.get("ocr") or {}).get("full_transcription")]
+    usable = [
+        r for r in results
+        if (r.get("ocr") or {}).get("full_transcription")
+        or (r.get("ocr") or {}).get("classification")
+    ]
 
     candidates = "\n\n".join(
-        f"[{r['source']}]\n{(r.get('ocr') or {}).get('full_transcription', '')}" for r in usable
+        f"[{r['source']}]\n{json.dumps(r.get('ocr') or {}, ensure_ascii=False)}" for r in usable
     ) or "(none)"
     readings = [
         (r.get("ocr") or {}).get("full_transcription", "")
@@ -1094,10 +2065,13 @@ Rules:
 - Do not majority-vote blindly.
 - Look at the handwriting strokes visually.
 - Read Hebrew right-to-left.
+- Read every numeric sequence left-to-right and preserve the physical left-to-right order
+    of numeric cells/groups. Never reverse numeric groups because the document is Hebrew.
 - Ignore printed text unless it helps understand the form field.
 - Do not copy printed context as handwriting.
 - Do not invent unsupported words.
 - Mark uncertain words with [?].
+- Classify signatures and checkbox/mark regions explicitly; never transcribe a signature as text.
 - Return JSON only.
 {context_block}
 Candidate OCR readings (hints only):
@@ -1108,7 +2082,10 @@ Deterministic agreement summary across candidates (hint only, not ground truth):
 
 Return ONLY a single JSON object:
 {{
+    "classification": "handwritten_text | mark_or_checkbox | signature_non_text | no_handwriting",
   "final_transcription": "best Hebrew transcription, right-to-left",
+    "marks": ["x"],
+    "digits": ["1"],
   "alternative_transcriptions": ["..."],
   "words": [
     {{"text": "word", "confidence": 0.0, "alternatives": ["alt1"], "reason": "short visual reason"}}
@@ -1155,6 +2132,11 @@ def refine_box_to_ink(
     color_refined = refine_box_to_colored_ink(page_img, box, y0, y1, color_hint)
     if color_refined is not None:
         return color_refined
+    rgb = np.array(page_img.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    colored_page = (hsv[:, :, 1] >= 70) & (hsv[:, :, 2] <= 245)
+    if int(colored_page.sum()) >= W * H * 0.00035:
+        return box
     gray = np.array(page_img.convert("L"))[y0:y1, :]
     if gray.size == 0:
         return box
@@ -1245,6 +2227,7 @@ def refine_box_to_colored_ink(
     seeds = [
         component for component in components
         if component[0] < x + width and component[2] > x
+        and component[1] < y + height and component[3] > y
     ]
     if not seeds or sum(component[4] for component in seeds) < 20:
         return None
@@ -1348,20 +2331,167 @@ def add_handwriting_context(page_img: Image.Image, box: list[int]) -> list[int]:
     """Shape refined boxes without losing strokes or absorbing neighboring lines."""
     W, H = page_img.size
     x, y, w, h = box
-    narrow_field = w < W * 0.12
-    if narrow_field:
-        xpad = int(W * 0.08)
-        top = max(0, y - max(int(H * 0.01), int(h * 0.20)))
-        bottom = min(H, y + h + max(int(H * 0.01), int(h * 0.60)))
-    else:
-        # refine_box_to_ink already adds 35% vertical padding. Shifting this band
-        # down clipped the intended line and absorbed the following line.
-        xpad = max(int(W * 0.01), int(w * 0.03))
-        top = y
-        bottom = min(H, y + h)
+    # refine_box_to_ink already pads the detected stroke bounds. Page-relative
+    # padding made compact fields absorb adjacent rows on high-resolution pages.
+    xpad = max(8, min(int(W * 0.012), int(w * 0.08)))
+    top = y
+    bottom = min(H, y + h)
     left = max(0, x - xpad)
     right = min(W, x + w + xpad)
     return [left, top, right - left, bottom - top]
+
+
+def filter_colorless_regions_on_colored_page(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Reject printed-text false positives when the page is filled with colored pen."""
+    rgb = np.array(page_img.convert("RGB"))
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    colored = (hsv[:, :, 1] >= 70) & (hsv[:, :, 2] <= 245)
+    if int(colored.sum()) < page_img.width * page_img.height * 0.00035:
+        return regions
+
+    kept = []
+    for region in regions:
+        x, y, width, height = region["box"]
+        local = colored[y:y + height, x:x + width]
+        minimum_pixels = max(18, round(min(width, height) * 0.12))
+        if int(local.sum()) >= minimum_pixels:
+            kept.append(region)
+    return kept
+
+
+def tighten_regions_to_colored_ink(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Replace model geometry with local pen-pixel bands on colored-ink pages."""
+    rgb = np.array(page_img.convert("RGB")).astype(np.int16)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    pen = (
+        (blue - red >= 24)
+        & (blue - green >= 17)
+        & (blue <= 245)
+    )
+    if int(pen.sum()) < page_img.width * page_img.height * 0.0002:
+        return regions
+
+    tightened = []
+    for region in regions:
+        x, y, width, height = region["box"]
+        local = pen[y:y + height, x:x + width]
+        if local.size == 0:
+            continue
+        row_counts = local.sum(axis=1)
+        active_rows = row_counts >= max(3, round(width * 0.002))
+        active_rows = cv2.dilate(
+            active_rows.astype(np.uint8).reshape(-1, 1),
+            np.ones((25, 1), np.uint8),
+        ).ravel().astype(bool)
+        starts = np.flatnonzero(active_rows & ~np.r_[False, active_rows[:-1]])
+        ends = np.flatnonzero(active_rows & ~np.r_[active_rows[1:], False]) + 1
+        for band_index, (start, end) in enumerate(zip(starts, ends), 1):
+            band = local[start:end]
+            ys, xs = np.where(band)
+            if len(xs) < max(25, round(width * 0.08)):
+                continue
+            left = max(0, x + int(xs.min()) - 12)
+            right = min(page_img.width, x + int(xs.max()) + 13)
+            top = max(0, y + start + int(ys.min()) - 12)
+            bottom = min(page_img.height, y + start + int(ys.max()) + 13)
+            label = region.get("label") or "handwriting"
+            if len(starts) > 1:
+                label = f"{label} band {band_index}"
+            tightened.append({
+                "label": label,
+                "box": [
+                    int(left), int(top), int(right - left), int(bottom - top),
+                ],
+            })
+    return tightened
+
+
+def merge_colored_line_fragments(regions: list[dict]) -> list[dict]:
+    """Join adjacent pen fragments only when they occupy the same text line."""
+    merged = [dict(region, box=list(region["box"])) for region in regions]
+    changed = True
+    while changed:
+        changed = False
+        for first_index, first in enumerate(merged):
+            fx, fy, fw, fh = first["box"]
+            for second_index in range(first_index + 1, len(merged)):
+                second = merged[second_index]
+                sx, sy, sw, sh = second["box"]
+                vertical_overlap = max(0, min(fy + fh, sy + sh) - max(fy, sy))
+                if vertical_overlap < 0.60 * min(fh, sh):
+                    continue
+                horizontal_gap = max(0, max(fx, sx) - min(fx + fw, sx + sw))
+                if horizontal_gap > max(90, round(max(fh, sh) * 0.75)):
+                    continue
+                left, top = min(fx, sx), min(fy, sy)
+                right = max(fx + fw, sx + sw)
+                bottom = max(fy + fh, sy + sh)
+                first["box"] = [left, top, right - left, bottom - top]
+                merged[first_index] = first
+                del merged[second_index]
+                changed = True
+                break
+            if changed:
+                break
+    return merged
+
+
+def detect_colored_pen_regions(
+    page_img: Image.Image, model_regions: list[dict],
+) -> list[dict]:
+    """Detect all blue pen components; model regions provide labels, not boxes."""
+    rgb = np.array(page_img.convert("RGB")).astype(np.int16)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    pen = (
+        (blue - red >= 24)
+        & (blue - green >= 17)
+        & (blue <= 245)
+    ).astype(np.uint8) * 255
+    page_height, page_width = pen.shape
+    if int((pen > 0).sum()) < page_width * page_height * 0.0002:
+        return []
+    pen = cv2.morphologyEx(
+        pen, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (35, 7)),
+    )
+    pen = cv2.dilate(
+        pen, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 7))
+    )
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(pen, 8)
+    components = []
+    for index in range(1, count):
+        x, y, width, height, area = (int(value) for value in stats[index])
+        if (
+            area < 180 or width < 25 or height < 12
+            or width >= page_width * 0.55 or height >= page_height * 0.08
+        ):
+            continue
+        left, top = max(0, x - 12), max(0, y - 12)
+        right = min(page_width, x + width + 12)
+        bottom = min(page_height, y + height + 12)
+        components.append({
+            "label": "colored handwriting",
+            "box": [left, top, right - left, bottom - top],
+        })
+    components = merge_colored_line_fragments(components)
+    for component in components:
+        x, y, width, height = component["box"]
+        best_score, best_label = 0.0, None
+        for model_region in model_regions:
+            mx, my, mw, mh = model_region["box"]
+            intersection = max(0, min(x + width, mx + mw) - max(x, mx)) \
+                * max(0, min(y + height, my + mh) - max(y, my))
+            score = intersection / max(1, width * height)
+            if score > best_score:
+                best_score = score
+                best_label = model_region.get("label")
+        if best_label and best_score >= 0.20:
+            component["label"] = best_label
+    return components
 
 
 def detection_geometry_penalty(
@@ -1491,14 +2621,8 @@ def deduplicate_detection_regions(
                 )
             )
             if duplicate:
-                preferred_index = smaller_index
-                preferred = kept[preferred_index]
-                left = min(fx, sx)
-                top = min(fy, sy)
-                right = max(fx + fw, sx + sw)
-                bottom = max(fy + fh, sy + sh)
-                preferred["box"] = [left, top, right - left, bottom - top]
-                kept[preferred_index] = preferred
+                # Keep the tighter crop. Unioning duplicate boxes lets a chain of
+                # nearby fields grow into one page-sized region.
                 remove.add(larger_index)
     return [region for index, region in enumerate(kept) if index not in remove]
 
@@ -1506,24 +2630,8 @@ def deduplicate_detection_regions(
 def widen_midpage_handwriting_lines(
     regions: list[dict], page_width: int, page_height: int,
 ) -> list[dict]:
-    """Restore horizontal context for clipped handwritten lines in document bodies."""
-    widened = [dict(region, box=list(region["box"])) for region in regions]
-    for region in widened:
-        x, y, width, height = region["box"]
-        center_y = y + height / 2
-        label = region.get("label", "").lower()
-        is_line = any(term in label for term in ("line", "note", "name entry"))
-        if not (
-            is_line
-            and width >= 2.4 * height
-            and page_height * 0.28 <= center_y <= page_height * 0.48
-            and width < page_width * 0.72
-        ):
-            continue
-        left = min(x, round(page_width * 0.12))
-        right = max(x + width, round(page_width * 0.90))
-        region["box"] = [left, y, min(page_width, right) - left, height]
-    return widened
+    """Preserve local detector geometry for compatibility with older callers."""
+    return [dict(region, box=list(region["box"])) for region in regions]
 
 
 def needs_lower_detection_pass(regions: list[dict], page_height: int) -> bool:
@@ -1662,8 +2770,14 @@ Each box must tightly cover one handwritten field or line with a small margin.""
         if lower_regions:
             print(f"[detect] lower-page coverage pass added {len(lower_regions)} candidate region(s)")
             regions.extend(lower_regions)
-    regions = deduplicate_detection_regions(regions, W, H)
-    return widen_midpage_handwriting_lines(regions, W, H)
+    colored_regions = detect_colored_pen_regions(page_img, regions)
+    if colored_regions:
+        regions = colored_regions
+    else:
+        regions = merge_colored_line_fragments(
+            tighten_regions_to_colored_ink(page_img, regions)
+        )
+    return deduplicate_detection_regions(regions, W, H)
 
 
 def normalize_detected_paragraph_blocks(
@@ -1922,8 +3036,8 @@ def prepare_region_images(
     ocr_mode: str, chunk_width: int, overlap: int,
 ) -> tuple[list[tuple[str, Image.Image]], list[tuple[str, Image.Image]]]:
     """Crop + enhance + chunk a region and save the images. Returns
-    (ocr_tasks, all_images): ocr_tasks is the reduced set sent to per-image OCR
-    (#4); all_images is the full set kept for the visual-reconcile authority."""
+    (ocr_tasks, all_images): ocr_tasks contains the four human-benchmarked core
+    views; all_images retains every transform for visual inspection/reconciliation."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     x, y, w, h = region["box"]
@@ -1941,7 +3055,7 @@ def prepare_region_images(
     all_images = list(versions.items()) + list(chunk_images.items())
     ocr_tasks: list[tuple[str, Image.Image]] = []
     if ocr_mode in ("full", "both"):
-        ocr_tasks += list(versions.items())
+        ocr_tasks += [(name, versions[name]) for name in CORE_OCR_VIEWS]
     if ocr_mode in ("chunks", "both"):
         ocr_tasks += list(chunk_images.items())
     return ocr_tasks, all_images
@@ -1961,6 +3075,12 @@ def run_pipeline(
     out.mkdir(parents=True, exist_ok=True)
     _reset_usage()
     _t_start = time.time()
+    print(
+        "[GPT] endpoint pool: "
+        + ", ".join(
+            f"{target['name']} ({target['deployment']})" for target in GPT_TARGETS
+        )
+    )
 
     # ---- load / render ---------------------------------------------------- #
     ext = Path(input_path).suffix.lower()
@@ -2041,12 +3161,48 @@ def run_pipeline(
     # Self-consistency: draw each image version VOTE_SEEDS times (distinct seeds)
     # so the deterministic aggregation has multiple genuine samples to vote over.
     vote_seeds = list(range(1, VOTE_SEEDS + 1)) if VOTE_ENABLED else [None]
-    flat = [(ri, f"{name}#s{s}" if s is not None else name, img, s)
-            for ri, tasks in enumerate(region_tasks)
-            for name, img in tasks
-            for s in vote_seeds]
+    segmented_plans: dict[int, dict] = {}
+    standard_regions = set(range(len(regions)))
+    if OCR_STRATEGY == ISOLATED_MULTIVIEW_STRATEGY:
+        for ri, images in enumerate(region_images):
+            try:
+                segmented_plans[ri] = prepare_isolated_multiview_plan(
+                    dict(images)["01_original_crop.png"], region_dirs[ri],
+                )
+                standard_regions.discard(ri)
+                print(
+                    f"[OCR] region {ri + 1}: isolated multi-view plan with "
+                    f"{segmented_plans[ri]['draws']} blind draw(s)"
+                )
+            except Exception as exc:
+                print(
+                    f"[OCR] region {ri + 1}: isolated multi-view unavailable "
+                    f"({exc}); using standard OCR"
+                )
+
+    def _standard_tasks(indices: set[int]) -> list[tuple]:
+        if MULTI_IMAGE_OCR:
+            return [
+                (ri, f"core4_multi#s{s}" if s is not None else "core4_multi",
+                 region_tasks[ri], s)
+                for ri in sorted(indices)
+                for s in vote_seeds
+            ]
+        return [
+            (ri, f"{name}#s{s}" if s is not None else name, image, s)
+            for ri in sorted(indices)
+            for name, image in region_tasks[ri]
+            for s in vote_seeds
+        ]
+
+    flat = _standard_tasks(standard_regions)
     region_results: list[list[dict]] = [[] for _ in regions]
-    draw_progress = {"completed": 0, "failed": 0, "total": len(flat)}
+    segmented_finals: list[dict | None] = [None for _ in regions]
+    draw_progress = {
+        "completed": 0,
+        "failed": 0,
+        "total": len(flat) + sum(plan["draws"] for plan in segmented_plans.values()),
+    }
 
     def _publish_ocr_progress() -> None:
         _write_json_atomic(out / "ocr_progress.json", {
@@ -2073,32 +3229,77 @@ def run_pipeline(
         })
 
     _publish_ocr_progress()
-    print(f"[OCR] {len(flat)} vision draws across {len(regions)} region(s) "
-          f"({len(vote_seeds)} seed(s)/version), {MAX_WORKERS} in parallel ...")
+    if segmented_plans:
+        print(
+            f"[OCR] strategy={OCR_STRATEGY}: {draw_progress['total']} total draw(s); "
+            "isolated calls run sequentially"
+        )
+    else:
+        print(f"[OCR] {len(flat)} vision draws across {len(regions)} region(s) "
+              f"({len(vote_seeds)} seed(s)/version), {MAX_WORKERS} in parallel ...")
 
     def _ocr_batch(tasks):
-        """Run a batch of (region_idx, name, image, seed) OCR draws in parallel.
+        """Run a batch of (region_idx, name, image evidence, seed) OCR draws in parallel.
         Appends successes to region_results; returns the tasks that failed."""
         failed = []
         workers = max(1, min(MAX_WORKERS, len(tasks)))
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut_meta = {ex.submit(ocr_image, img, prompt, seed): (ri, name, img, seed)
-                        for ri, name, img, seed in tasks}
+            fut_meta = {
+                ex.submit(
+                    ocr_image_set if isinstance(evidence, list) else ocr_image,
+                    evidence,
+                    prompt,
+                    seed,
+                ): (ri, name, evidence, seed)
+                for ri, name, evidence, seed in tasks
+            }
             for fut in as_completed(fut_meta):
-                ri, name, img, seed = fut_meta[fut]
+                ri, name, evidence, seed = fut_meta[fut]
                 try:
                     region_results[ri].append({"source": name, "ocr": fut.result()})
                     draw_progress["completed"] += 1
                 except Exception as exc:
-                    failed.append((ri, name, img, seed))
+                    failed.append((ri, name, evidence, seed))
                     draw_progress["failed"] += 1
                     print(f"   region {ri + 1} {name} failed: {exc}", file=sys.stderr)
                 _publish_ocr_progress()
         return failed
 
-    # First pass + up to 2 extra retry rounds so a timeout burst never drops a region.
-    failures = _ocr_batch(flat)
+    def _retryable(task) -> bool:
+        source = task[1].split("#", 1)[0]
+        return source.startswith("chunk_") or source in RETRYABLE_OCR_VIEWS
+
+    # Retry only faithful evidence. Optional derived transforms are one-shot so a
+    # slow enhancement cannot dominate tail latency.
+    failures = _ocr_batch(flat) if flat else []
+    for ri, plan in segmented_plans.items():
+        def _segmented_progress(success: bool) -> None:
+            draw_progress["completed" if success else "failed"] += 1
+            _publish_ocr_progress()
+
+        try:
+            final, candidates, details = run_isolated_multiview_plan(
+                plan, on_draw=_segmented_progress,
+            )
+            segmented_finals[ri] = final
+            region_results[ri].extend(candidates)
+            _write_json_atomic(
+                region_dirs[ri] / "segmented_multiview_result.json", details,
+            )
+            _publish_ocr_progress()
+        except Exception as exc:
+            print(
+                f"[OCR] region {ri + 1}: isolated multi-view failed ({exc}); "
+                "running standard fallback",
+                file=sys.stderr,
+            )
+            fallback = _standard_tasks({ri})
+            draw_progress["total"] += len(fallback)
+            _publish_ocr_progress()
+            failures.extend(_ocr_batch(fallback))
+
     for rnd in range(1, 3):
+        failures = [task for task in failures if _retryable(task)]
         if not failures:
             break
         print(f"[OCR] retry round {rnd}: re-running {len(failures)} failed call(s) ...")
@@ -2107,57 +3308,147 @@ def run_pipeline(
 
     # Safety net: any region that still has NO successful reading -> retry its images once more.
     stranded = [ri for ri in range(len(regions))
-                if not any((r.get("ocr") or {}).get("full_transcription") for r in region_results[ri])]
+                if not any(
+                    (r.get("ocr") or {}).get("full_transcription")
+                    or (r.get("ocr") or {}).get("classification")
+                    for r in region_results[ri]
+                )]
     if stranded:
-        retry_tasks = [(ri, f"{name}#r{k}", img, 900 + k)
-                       for ri in stranded for k, (name, img) in enumerate(region_tasks[ri])]
+        if MULTI_IMAGE_OCR:
+            retry_tasks = [
+                (
+                    ri,
+                    "core2_faithful_retry",
+                    [(name, image) for name, image in region_tasks[ri]
+                     if name in RETRYABLE_OCR_VIEWS],
+                    900,
+                )
+                for ri in stranded
+            ]
+        else:
+            retry_tasks = [(ri, f"{name}#r{k}", img, 900 + k)
+                           for ri in stranded for k, (name, img) in enumerate(region_tasks[ri])
+                           if name in RETRYABLE_OCR_VIEWS or name.startswith("chunk_")]
         print(f"[OCR] {len(stranded)} region(s) still empty -> final retry of {len(retry_tasks)} call(s) ...")
         time.sleep(5)
-        _ocr_batch(retry_tasks)
+        rescue_failures = _ocr_batch(retry_tasks)
+        if MULTI_IMAGE_OCR and rescue_failures:
+            still_stranded = [
+                ri for ri, _name, _evidence, _seed in rescue_failures
+                if not any(
+                    (result.get("ocr") or {}).get("full_transcription")
+                    or (result.get("ocr") or {}).get("classification")
+                    for result in region_results[ri]
+                )
+            ]
+            original_retries = [
+                (
+                    ri,
+                    "01_original_crop.png#final_rescue",
+                    dict(region_tasks[ri])["01_original_crop.png"],
+                    901,
+                )
+                for ri in sorted(set(still_stranded))
+            ]
+            if original_retries:
+                print(
+                    f"[OCR] final original-image rescue for "
+                    f"{len(set(still_stranded))} region(s) ..."
+                )
+                _ocr_batch(original_retries)
     if failures:
         print(f"[OCR] WARNING: {len(failures)} call(s) still failing after all retries", file=sys.stderr)
+
+    cu_context_markdown = ""
+    if NEARBY_CU_CONTEXT and cu_future is not None:
+        try:
+            cu_context_markdown = cu_future.result()
+        except Exception as exc:
+            print(f"[CU] context unavailable: {exc}", file=sys.stderr)
 
     # ---- final aggregation per region (deterministic vote -> visual -> text) - #
     print("[vote] aggregating self-consistency draws per region ..." if VOTE_ENABLED
           else "[reconcile] final visual adjudication per region ...")
 
     def _reconcile_region(ri: int) -> dict:
+        if segmented_finals[ri] is not None:
+            return segmented_finals[ri] or {}
         res = region_results[ri]
         usable = [
             result for result in res
             if (result.get("ocr") or {}).get("full_transcription", "").strip()
+            or (result.get("ocr") or {}).get("classification")
         ]
-        if not usable:
-            return {
-                "final_transcription": "",
-                "words": [],
-                "notes": ["no non-empty OCR candidates; skipped visual reconciliation"],
-                "needs_review": True,
-                "decision_status": "empty_candidate_set",
-            }
         if VOTE_ENABLED:
             readings = [(r.get("ocr") or {}).get("full_transcription", "") for r in usable]
             if readings:
                 vote = aggregate_votes(readings)
                 if "[?]" not in vote.get("final_transcription", ""):
-                    return vote  # deterministic agreement; no model call
+                    return finalize_region_semantics(vote, usable)  # no model call
         imgs = region_images[ri]
+        signature_flourish = is_signature_flourish(dict(imgs)["01_original_crop.png"])
+        local_cu_context = nearby_printed_context(
+            cu_context_markdown, regions[ri]["box"], page_img.height
+        )
+        region_context = "\n".join(
+            context for context in (printed_context, local_cu_context) if context.strip()
+        )
+
+        def _contextualize(final: dict) -> dict:
+            final = finalize_region_semantics(final, usable, signature_flourish)
+            if not should_contextual_recheck(final, usable):
+                return final
+            try:
+                pre_context_text = final.get("final_transcription", "")
+                recheck, context_images = contextual_region_recheck(
+                    page_img, regions[ri], final, region_context
+                )
+                context_images[0].save(region_dirs[ri] / "08_context_highlight.png")
+                context_images[1].save(region_dirs[ri] / "09_page_highlight.png")
+                _write_json_atomic(region_dirs[ri] / "contextual_recheck.json", recheck)
+                accepted = dict(accept_contextual_recheck(final, recheck))
+                accepted["pre_context_transcription"] = pre_context_text
+                accepted["contextual_evidence"] = recheck
+                pre_info = _information_text(pre_context_text)
+                recheck_info = _information_text(recheck.get("final_transcription", ""))
+                if (
+                    re.search(r"[\u0590-\u05ff]", pre_info)
+                    and re.search(r"[\u0590-\u05ff]", recheck_info)
+                    and pre_info != recheck_info
+                ):
+                    accepted["needs_review"] = True
+                    alternatives = accepted.setdefault("alternative_transcriptions", [])
+                    for text in (pre_context_text, recheck.get("final_transcription", "")):
+                        if text and text != accepted.get("final_transcription") and text not in alternatives:
+                            alternatives.append(text)
+                    accepted.setdefault("notes", []).append(
+                        "independent Hebrew context reread disagreed; human review required"
+                    )
+                return accepted
+            except Exception as recheck_exc:
+                final.setdefault("notes", []).append(
+                    f"contextual recheck failed: {recheck_exc}"
+                )
+                return final
+
         try:  # 1) visual adjudication with images (primary)
-            final = visual_reconcile_ocr_results(imgs, res, printed_context)
+            final = visual_reconcile_ocr_results(imgs, res, region_context)
             final.setdefault("notes", []).append("visual reconciliation")
-            return final
+            return _contextualize(final)
         except Exception as vexc:
             try:  # 2) text-only reconciliation (fallback)
-                final = reconcile_ocr_results(res, printed_context)
+                final = reconcile_ocr_results(res, region_context)
                 final.setdefault("notes", []).append(f"text reconciliation (visual failed: {vexc})")
-                return final
+                return _contextualize(final)
             except Exception as texc:  # 3) best non-empty per-image reading
                 usable = [r for r in res if (r.get("ocr") or {}).get("full_transcription")]
                 if usable:
                     best = max(usable, key=lambda r: len(r["ocr"].get("full_transcription", "")))
-                    return {"final_transcription": best["ocr"].get("full_transcription", ""),
-                            "words": best["ocr"].get("words", []),
-                            "notes": [f"per-image fallback (text failed: {texc})"]}
+                    return _contextualize({
+                        "final_transcription": best["ocr"].get("full_transcription", ""),
+                        "words": best["ocr"].get("words", []),
+                        "notes": [f"per-image fallback (text failed: {texc})"],
+                    })
                 return {"final_transcription": "", "words": [], "notes": ["all reconciliation failed"]}
 
     finals: list[dict] = [{} for _ in regions]
@@ -2171,16 +3462,27 @@ def run_pipeline(
                 finals[ri] = {"final_transcription": "", "words": [],
                               "notes": [f"reconcile failed: {exc}"]}
 
+    finals = reconcile_repeated_structured_fields(finals, regions)
+
     # ---- write per-region debug + combined -------------------------------- #
     all_results = []
     for i, region in enumerate(regions, 1):
         rdir = region_dirs[i - 1]
         res = region_results[i - 1]
         final = finals[i - 1] or {}
+        local_cu_context = nearby_printed_context(
+            cu_context_markdown, region["box"], page_img.height
+        )
+        region_context = "\n".join(
+            context for context in (printed_context, local_cu_context) if context.strip()
+        )
 
         per_image = [
             {"source": r["source"],
              "full_transcription": (r.get("ocr") or {}).get("full_transcription", ""),
+             "classification": (r.get("ocr") or {}).get("classification"),
+             "marks": (r.get("ocr") or {}).get("marks", []),
+             "digits": (r.get("ocr") or {}).get("digits", []),
              "words": (r.get("ocr") or {}).get("words", [])}
             for r in res
         ]
@@ -2189,7 +3491,7 @@ def run_pipeline(
 
         sel = _select_visual_images(region_images[i - 1], res)
         vinput = {
-            "printed_context_used": printed_context,
+            "printed_context_used": region_context,
             "selected_images": [n for n, _ in sel],
             "candidate_readings": [
                 {"source": r["source"], "text": (r.get("ocr") or {}).get("full_transcription", "")}
@@ -2202,15 +3504,22 @@ def run_pipeline(
         result_debug = {
             "label": region.get("label"),
             "box": region["box"],
-            "printed_context_used": printed_context,
+            "printed_context_used": region_context,
             "per_image": per_image,
+            "field_type": final.get("field_type"),
             "final_transcription": final.get("final_transcription", ""),
+            "numeric_cells": final.get("numeric_cells", []),
+            "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
+            "pre_context_transcription": final.get("pre_context_transcription"),
+            "contextual_evidence": final.get("contextual_evidence"),
             "alternative_transcriptions": final.get("alternative_transcriptions", []),
             "words": final.get("words", []),
             "notes": final.get("notes", []),
             "needs_review": final.get("needs_review", False),
+            "classification": final.get("classification", "handwritten_text"),
             "decision_status": final.get("decision_status", "visual_reconciliation"),
             "agreement_gate": final.get("agreement_gate"),
+            "cross_region_consensus": final.get("cross_region_consensus"),
             "vote": {
                 "candidate_count": len(per_image),
                 "selected_text": final.get("final_transcription", ""),
@@ -2224,17 +3533,25 @@ def run_pipeline(
         all_results.append({
             "region": i, "folder": rdir.name,
             "label": region.get("label"), "box": region["box"],
+            "field_type": final.get("field_type"),
             "final_transcription": final.get("final_transcription"),
+            "pre_context_transcription": final.get("pre_context_transcription"),
+            "contextual_evidence": final.get("contextual_evidence"),
+            "numeric_cells": final.get("numeric_cells", []),
+            "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
             "words": final.get("words"), "notes": final.get("notes"),
+            "classification": final.get("classification", "handwritten_text"),
             "needs_review": final.get("needs_review", False),
             "decision_status": final.get("decision_status", "visual_reconciliation"),
             "agreement_gate": final.get("agreement_gate"),
+            "cross_region_consensus": final.get("cross_region_consensus"),
         })
         print(f"  [{i}] {region.get('label')}: {final.get('final_transcription', '')!r}")
 
     combined = {
         "source": input_path, "page": page,
         "region_map": overlay_name, "regions": all_results,
+        "ocr_strategy": OCR_STRATEGY,
     }
     # handwriting_result.json is written AFTER the merge step below so the token
     # totals include the merge call and the elapsed time covers the whole run.
@@ -2294,6 +3611,13 @@ def run_pipeline(
     print(f"\nTotal time:    {combined['elapsed']} (mm:ss)")
     print(f"GPT tokens:    {usage['input_tokens']:,} in + {usage['output_tokens']:,} out "
           f"= {usage['total_tokens']:,} total  ({usage['calls']} GPT calls)")
+    if usage.get("targets"):
+        print(
+            "GPT targets:   "
+            + ", ".join(
+                f"{name}={calls}" for name, calls in sorted(usage["targets"].items())
+            )
+        )
     print(f"Region map:    {out / overlay_name}")
     print(f"Per-region:    {out}/region_*/  (images + result.json)")
     print(f"Combined JSON: {out / 'handwriting_result.json'}")

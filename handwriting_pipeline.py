@@ -39,6 +39,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from html import escape
 from pathlib import Path
@@ -107,6 +108,19 @@ CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
 GPT_TEMPERATURE = float(os.environ.get("GPT_TEMPERATURE", "0"))
 GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
 GPT_READ_TIMEOUT = int(os.environ.get("GPT_READ_TIMEOUT", "90"))  # per-call read timeout (s); stuck calls retry fast
+IVRIT_OCR_URL = os.environ.get("IVRIT_OCR_URL", "http://127.0.0.1:8000").rstrip("/")
+IVRIT_OCR_TIMEOUT = max(1, int(os.environ.get("IVRIT_OCR_TIMEOUT", "60")))
+IVRIT_OCR_ENABLED = os.environ.get("IVRIT_OCR_ENABLED", "1") not in (
+    "", "0", "false", "False",
+)
+IVRIT_OCR_WORKERS = max(1, int(os.environ.get("IVRIT_OCR_WORKERS", "1")))
+IVRIT_OCR_SOURCE = "ivrit_hash_v1"
+IVRIT_OCR_MIN_AGREEMENT = float(
+    os.environ.get("IVRIT_OCR_MIN_AGREEMENT", "0.40")
+)
+IVRIT_OCR_MIN_PREPROCESS_AGREEMENT = float(
+    os.environ.get("IVRIT_OCR_MIN_PREPROCESS_AGREEMENT", "0.55")
+)
 CONTEXTUAL_RECHECK_MIN_CONFIDENCE = float(
     os.environ.get("CONTEXTUAL_RECHECK_MIN_CONFIDENCE", "0.60")
 )
@@ -775,6 +789,315 @@ def _responses_call(content: list[dict], retries: int = 2,
     return _loads_lenient(_responses_text(content, retries, max_tokens=max_tokens,
                                           reasoning=reasoning, seed=seed,
                                           endpoint_limit=endpoint_limit))
+
+
+def ocr_image_with_ivrit(image: Image.Image) -> dict:
+    """Send one region crop to the optional HASH v1 OCR sidecar."""
+    image_bytes = io.BytesIO()
+    image.convert("RGB").save(image_bytes, format="PNG")
+    response = requests.post(
+        f"{IVRIT_OCR_URL}/v1/ocr",
+        files={"file": ("region.png", image_bytes.getvalue(), "image/png")},
+        timeout=(3, IVRIT_OCR_TIMEOUT),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    lines = []
+    for page in payload.get("pages") or []:
+        for line in page.get("lines") or []:
+            text = str(line.get("text") or "").strip()
+            if not text:
+                continue
+            lines.append({
+                "text": text,
+                "confidence": float(line.get("confidence") or 0.0),
+                "box": dict(line.get("box") or {}),
+            })
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        text = "\n".join(line["text"] for line in lines)
+    confidence = (
+        sum(line["confidence"] for line in lines) / len(lines)
+        if lines else 0.0
+    )
+    return {
+        "status": "complete",
+        "source": IVRIT_OCR_SOURCE,
+        "model": "HASH v1",
+        "text": text,
+        "confidence": confidence,
+        "lines": lines,
+        "raw_response": payload,
+    }
+
+
+def ivrit_ocr_service_status() -> tuple[bool, str]:
+    """Check the optional sidecar once so absent Docker never fails a page."""
+    if not IVRIT_OCR_ENABLED:
+        return False, "disabled by IVRIT_OCR_ENABLED"
+    try:
+        response = requests.get(f"{IVRIT_OCR_URL}/health", timeout=(1, 2))
+        response.raise_for_status()
+        status = str((response.json() or {}).get("status") or "")
+        if status != "ok":
+            return False, f"service reported {status or 'unknown status'}"
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        return False, str(exc)
+    return True, "HASH v1 ready"
+
+
+def prepare_ivrit_blue_only_image(image: Image.Image) -> Image.Image | None:
+    """Remove black form print while preserving the original blue pen pixels."""
+    rgb = np.array(image.convert("RGB"))
+    work = rgb.astype(np.int16)
+    red, green, blue = np.moveaxis(work, -1, 0)
+    pen = (
+        (blue - red >= 24)
+        & (blue - green >= 17)
+        & (blue <= 245)
+    )
+    rows, columns = np.where(pen)
+    if len(columns) < max(40, round(image.width * image.height * 0.002)):
+        return None
+    left = max(0, int(columns.min()) - 12)
+    right = min(image.width, int(columns.max()) + 13)
+    top = max(0, int(rows.min()) - 10)
+    bottom = min(image.height, int(rows.max()) + 11)
+    isolated = np.full_like(rgb, 255)
+    isolated[pen] = rgb[pen]
+    return Image.fromarray(isolated[top:bottom, left:right])
+
+
+def _ivrit_core_result(vision_results: list[dict]) -> dict | None:
+    readings = [
+        result for result in vision_results
+        if result.get("source") != IVRIT_OCR_SOURCE
+        and (result.get("ocr") or {}).get("full_transcription", "").strip()
+    ]
+    if not readings:
+        return None
+    return next(
+        (
+            result for result in readings
+            if result.get("source", "").split("#", 1)[0] == "core4_multi"
+        ),
+        max(
+            readings,
+            key=lambda result: len(
+                _information_text(
+                    (result.get("ocr") or {}).get("full_transcription", "")
+                )
+            ),
+        ),
+    )
+
+
+def _ivrit_lines_overlap(lines: list[dict]) -> bool:
+    for first_index, first in enumerate(lines):
+        first_box = first.get("box") or {}
+        first_top = int(first_box.get("y") or 0)
+        first_height = int(first_box.get("height") or 0)
+        for second in lines[first_index + 1:]:
+            second_box = second.get("box") or {}
+            second_top = int(second_box.get("y") or 0)
+            second_height = int(second_box.get("height") or 0)
+            overlap = max(
+                0,
+                min(first_top + first_height, second_top + second_height)
+                - max(first_top, second_top),
+            )
+            if overlap >= 0.50 * max(1, min(first_height, second_height)):
+                return True
+    return False
+
+
+def should_try_ivrit_blue_only(
+    evidence: dict, vision_results: list[dict], region: dict,
+) -> bool:
+    """Retry only when one Core4 line became overlapping HASH line fragments."""
+    if evidence.get("status") != "complete":
+        return False
+    lines = evidence.get("lines") or []
+    if len(lines) < 2 or not _ivrit_lines_overlap(lines):
+        return False
+    core_result = _ivrit_core_result(vision_results)
+    if core_result is None:
+        return False
+    core_text = str(
+        (core_result.get("ocr") or {}).get("full_transcription") or ""
+    ).strip()
+    if "\n" in core_text or re.search(r"\d", core_text):
+        return False
+    if len(_hebrew_letter_sequence(core_text)) < 3:
+        return False
+    return not re.search(
+        r"\b(?:date|phone|email|account|reference|identifier|signature|"
+        r"mark|checkbox|amount|total)\b",
+        str(region.get("label") or ""),
+        re.I,
+    )
+
+
+def select_ivrit_preprocessing_variant(
+    original: dict, blue_only: dict, vision_results: list[dict], region: dict,
+) -> dict:
+    """Use a clean single blue line when two HASH preprocessors still agree."""
+    variants = {
+        "original": {
+            key: original.get(key)
+            for key in ("status", "text", "confidence", "lines", "detail")
+            if original.get(key) is not None
+        },
+        "blue_only": {
+            key: blue_only.get(key)
+            for key in ("status", "text", "confidence", "lines", "detail")
+            if blue_only.get(key) is not None
+        },
+    }
+    selected = dict(original)
+    selected["selected_variant"] = "original"
+    selected["variants"] = variants
+    if blue_only.get("status") != "complete" or len(blue_only.get("lines") or []) != 1:
+        return selected
+
+    original_letters = _hebrew_letter_sequence(str(original.get("text") or ""))
+    blue_letters = _hebrew_letter_sequence(str(blue_only.get("text") or ""))
+    if len(original_letters) < 3 or len(blue_letters) < 3:
+        return selected
+    agreement = difflib.SequenceMatcher(
+        None, original_letters, blue_letters
+    ).ratio()
+    length_overlap = min(len(original_letters), len(blue_letters)) / max(
+        len(original_letters), len(blue_letters)
+    )
+    if (
+        agreement < IVRIT_OCR_MIN_PREPROCESS_AGREEMENT
+        or length_overlap < 0.80
+    ):
+        return selected
+    selected = dict(blue_only)
+    selected["selected_variant"] = "blue_only"
+    selected["variants"] = variants
+    selected["preprocessing_consensus"] = {
+        "eligible": True,
+        "character_agreement": round(agreement, 4),
+        "length_overlap": round(length_overlap, 4),
+        "reason": "overlapping_hash_lines_collapsed_by_blue_isolation",
+    }
+    return selected
+
+
+def _hebrew_letter_sequence(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    return "".join(
+        character for character in normalized
+        if "\u05d0" <= character <= "\u05ea"
+    )
+
+
+def ivrit_ocr_advisory_gate(
+    evidence: dict, vision_results: list[dict], region: dict,
+) -> dict:
+    """Offer HASH to GPT only as a nearby spelling hypothesis."""
+    hash_text = str(evidence.get("text") or "").strip()
+    if evidence.get("status") != "complete" or not hash_text:
+        return {"eligible": False, "reason": "no_complete_hash_reading"}
+
+    core_result = _ivrit_core_result(vision_results)
+    if core_result is None:
+        return {"eligible": False, "reason": "no_vision_reading_to_correlate"}
+    core_ocr = core_result.get("ocr") or {}
+    core_text = str(core_ocr.get("full_transcription") or "").strip()
+    if core_ocr.get("classification") in {
+        "mark_or_checkbox", "signature_non_text", "no_handwriting",
+    }:
+        return {"eligible": False, "reason": "non_text_region"}
+
+    label = str(region.get("label") or "")
+    structured_label = re.search(
+        r"\b(?:date|phone|email|account|reference|"
+        r"identifier|signature|mark|checkbox|amount|total)\b",
+        label,
+        re.I,
+    )
+    if structured_label or re.search(r"\d", core_text) or re.search(r"\d", hash_text):
+        return {"eligible": False, "reason": "structured_or_numeric_region"}
+    if "\n" in core_text or "\n" in hash_text or len(evidence.get("lines") or []) != 1:
+        return {"eligible": False, "reason": "multiline_reading"}
+
+    core_letters = _hebrew_letter_sequence(core_text)
+    hash_letters = _hebrew_letter_sequence(hash_text)
+    if len(core_letters) < 3 or len(hash_letters) < 3:
+        return {"eligible": False, "reason": "insufficient_hebrew_letters"}
+    if core_letters == hash_letters:
+        return {
+            "eligible": False,
+            "reason": "duplicate_of_vision_reading",
+            "vision_source": core_result.get("source"),
+            "character_agreement": 1.0,
+            "length_overlap": 1.0,
+        }
+    preprocessing_consensus = evidence.get("preprocessing_consensus") or {}
+    if preprocessing_consensus.get("eligible"):
+        return {
+            "eligible": True,
+            "reason": "preprocessing_consensus",
+            "vision_source": core_result.get("source"),
+            "character_agreement": round(
+                difflib.SequenceMatcher(None, core_letters, hash_letters).ratio(),
+                4,
+            ),
+            "length_overlap": round(
+                min(len(core_letters), len(hash_letters)) / max(
+                    len(core_letters), len(hash_letters)
+                ),
+                4,
+            ),
+            "preprocessing_consensus": preprocessing_consensus,
+        }
+    length_overlap = min(len(core_letters), len(hash_letters)) / max(
+        len(core_letters), len(hash_letters)
+    )
+    agreement = difflib.SequenceMatcher(
+        None, core_letters, hash_letters
+    ).ratio()
+    gate = {
+        "eligible": (
+            agreement >= IVRIT_OCR_MIN_AGREEMENT and length_overlap >= 0.60
+        ),
+        "reason": "related_compact_hebrew" if (
+            agreement >= IVRIT_OCR_MIN_AGREEMENT and length_overlap >= 0.60
+        ) else "unrelated_to_vision_reading",
+        "vision_source": core_result.get("source"),
+        "character_agreement": round(agreement, 4),
+        "length_overlap": round(length_overlap, 4),
+    }
+    return gate
+
+
+def ivrit_ocr_candidate(evidence: dict) -> dict | None:
+    """Convert raw HASH evidence into a weak candidate for GPT adjudication."""
+    text = str(evidence.get("text") or "").strip()
+    if evidence.get("status") != "complete" or not text:
+        return None
+    words = [
+        {
+            "text": line.get("text", ""),
+            "alternatives": [],
+            "reason": "HASH v1 CNN-CTC advisory reading; confidence is uncalibrated",
+        }
+        for line in evidence.get("lines") or []
+        if line.get("text")
+    ]
+    return {
+        "source": IVRIT_OCR_SOURCE,
+        "ocr": {
+            "full_transcription": text,
+            "words": words,
+            "advisory": True,
+            "advisory_gate": evidence.get("advisory_gate"),
+        },
+    }
 
 
 def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
@@ -1859,6 +2182,60 @@ def accept_contextual_recheck(current: dict, recheck: dict) -> dict:
     return accepted
 
 
+def protect_contextual_recheck_with_cross_engine_agreement(
+    current: dict,
+    recheck: dict,
+    accepted: dict,
+    vision_results: list[dict],
+    ivrit_evidence: dict,
+) -> dict:
+    """Do not let one context guess override exact visual/Core4/HASH agreement."""
+    current_text = str(current.get("final_transcription") or "")
+    recheck_text = str(recheck.get("final_transcription") or "")
+    accepted_text = str(accepted.get("final_transcription") or "")
+    current_info = _information_text(current_text)
+    if (
+        len(current_info) < 3
+        or _information_text(recheck_text) == current_info
+        or _information_text(accepted_text) == current_info
+        or ivrit_evidence.get("status") != "complete"
+        or _information_text(str(ivrit_evidence.get("text") or "")) != current_info
+    ):
+        return accepted
+    faithful_supporters = [
+        result.get("source", "")
+        for result in vision_results
+        if _is_faithful_source(result.get("source", ""))
+        and _information_text(
+            str((result.get("ocr") or {}).get("full_transcription") or "")
+        ) == current_info
+    ]
+    if not faithful_supporters:
+        return accepted
+
+    protected = dict(current)
+    if not protected.get("field_type") and accepted.get("field_type"):
+        protected["field_type"] = accepted.get("field_type")
+    alternatives = list(protected.get("alternative_transcriptions") or [])
+    for text in [recheck_text, *(recheck.get("alternative_transcriptions") or [])]:
+        if text and text != current_text and text not in alternatives:
+            alternatives.append(text)
+    protected["alternative_transcriptions"] = alternatives
+    protected.setdefault("notes", []).append(
+        "contextual override rejected: visual/Core4 and independent HASH exactly agree"
+    )
+    protected["needs_review"] = True
+    protected["decision_status"] = "cross_engine_agreement_protected"
+    protected["cross_engine_agreement"] = {
+        "selected_transcription": current_text,
+        "rejected_contextual_transcription": recheck_text,
+        "vision_supporting_sources": faithful_supporters,
+        "ivrit_source": ivrit_evidence.get("source", IVRIT_OCR_SOURCE),
+        "ivrit_selected_variant": ivrit_evidence.get("selected_variant", "original"),
+    }
+    return protected
+
+
 def is_signature_flourish(image: Image.Image) -> bool:
     """High-specificity blue-ink signature gate based on one dominant crossing stroke."""
     rgb = np.asarray(image.convert("RGB"))
@@ -2089,11 +2466,19 @@ def visual_reconcile_ocr_results(
     readings = [
         (r.get("ocr") or {}).get("full_transcription", "")
         for r in usable
+        if r.get("source") != IVRIT_OCR_SOURCE
         if (r.get("ocr") or {}).get("full_transcription", "").strip()
     ]
     agreement = aggregate_votes(readings) if readings else {}
     agreement_text = agreement.get("final_transcription", "") or "(none)"
     context_block = build_context_block(printed_context)
+    ivrit_rule = ""
+    if any(result.get("source") == IVRIT_OCR_SOURCE for result in usable):
+        ivrit_rule = """- The candidate source ivrit_hash_v1 is an independent HASH v1
+  CNN-CTC OCR reading. Its confidence is uncalibrated and its measured natural-form
+  word error rate is high. Use it only as spelling evidence when the visible strokes
+  support it. Never select it solely because it supplies a complete or familiar Hebrew word.
+"""
     instruction = f"""You are doing final visual adjudication of Hebrew handwriting OCR.
 
 You will receive:
@@ -2104,7 +2489,7 @@ You will receive:
 Rules:
 - The images are the source of truth.
 - Candidate readings are hints only.
-- Original crop, contrast, denoised, and original-image chunks are faithful evidence.
+{ivrit_rule}- Original crop, contrast, denoised, and original-image chunks are faithful evidence.
 - Thresholded, thickened, line-removed, and isolated-stroke images are supporting evidence only.
 - Never choose a reading supported only by one supporting transform when the faithful images
     disagree with it. Return uncertain letters/words instead of completing a plausible name.
@@ -2458,6 +2843,380 @@ def tighten_regions_to_colored_ink(
                 ],
             })
     return tightened
+
+
+def tighten_regions_to_black_ink_rows(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Snap oversized black-ink form crops to the strongest ruled row."""
+    page_width, page_height = page_img.size
+    gray_page = np.array(page_img.convert("L"))
+    tightened = []
+    selected_rows: list[tuple[int, int, float]] = []
+    minimum_region_height = max(120, round(page_height * 0.055))
+
+    for region in regions:
+        candidate = dict(region, box=list(region["box"]))
+        x, y, width, height = candidate["box"]
+        label = str(candidate.get("label") or "").lower()
+        if "paragraph block" in label or height < minimum_region_height:
+            tightened.append(candidate)
+            continue
+
+        margin = max(
+            40,
+            min(round(height * 0.35), round(page_height * 0.04)),
+        )
+        search_top = max(0, y - margin)
+        search_bottom = min(page_height, y + height + margin)
+        gray = gray_page[search_top:search_bottom, x:x + width]
+        if gray.size == 0:
+            tightened.append(candidate)
+            continue
+
+        _, ink = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+        )
+        joined = cv2.morphologyEx(
+            ink,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (9, 1)),
+        )
+        row_coverage = (joined > 0).sum(axis=1)
+        longest_runs = np.zeros(joined.shape[0], dtype=np.int32)
+        for row_index, row in enumerate(joined > 0):
+            padded = np.r_[False, row, False]
+            edges = np.flatnonzero(padded[1:] != padded[:-1])
+            if len(edges):
+                longest_runs[row_index] = int(
+                    (edges[1::2] - edges[::2]).max()
+                )
+
+        separator_rows = (
+            (longest_runs >= max(60, round(width * 0.08)))
+            & (row_coverage >= max(80, round(width * 0.10)))
+        )
+        separator_rows = cv2.dilate(
+            separator_rows.astype(np.uint8).reshape(-1, 1),
+            np.ones((3, 1), np.uint8),
+        ).ravel().astype(bool)
+        starts = np.flatnonzero(
+            separator_rows & ~np.r_[False, separator_rows[:-1]]
+        )
+        ends = np.flatnonzero(
+            separator_rows & ~np.r_[separator_rows[1:], False]
+        ) + 1
+        separators = [int((start + end) // 2) for start, end in zip(starts, ends)]
+        if len(separators) < 2:
+            tightened.append(candidate)
+            continue
+
+        horizontal = cv2.morphologyEx(
+            ink,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT, (max(40, width // 12), 1),
+            ),
+        )
+        vertical = cv2.morphologyEx(
+            ink,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(
+                cv2.MORPH_RECT,
+                (1, max(30, (search_bottom - search_top) // 3)),
+            ),
+        )
+        cleaned = cv2.subtract(cv2.subtract(ink, horizontal), vertical)
+        cleaned = cv2.morphologyEx(
+            cleaned, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8),
+        )
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            cleaned, 8,
+        )
+        minimum_area = max(8, round(page_height * 0.004))
+        components = []
+        for component_index in range(1, count):
+            left = int(stats[component_index, cv2.CC_STAT_LEFT])
+            top = int(stats[component_index, cv2.CC_STAT_TOP])
+            component_width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+            area = int(stats[component_index, cv2.CC_STAT_AREA])
+            if (
+                area >= minimum_area
+                and component_width >= 3
+                and component_height >= 4
+                and component_width < width * 0.32
+            ):
+                components.append(
+                    (left, top, component_width, component_height, area)
+                )
+        if not components:
+            tightened.append(candidate)
+            continue
+
+        component_heights = np.array(
+            [component[3] for component in components], dtype=np.int32,
+        )
+        minimum_tall = max(18, round(page_height * 0.0065))
+        maximum_tall_cutoff = max(minimum_tall + 8, round(page_height * 0.013))
+        tall_cutoff = max(
+            minimum_tall,
+            min(
+                maximum_tall_cutoff,
+                int(np.percentile(component_heights, 75) * 1.6),
+            ),
+        )
+        tall_components = [
+            component for component in components
+            if component[3] >= tall_cutoff
+        ]
+        if not tall_components:
+            tightened.append(candidate)
+            continue
+
+        region_center = y + height / 2
+        minimum_row_height = max(24, round(page_height * 0.01))
+        maximum_row_height = max(
+            140,
+            min(round(height * 0.75), round(page_height * 0.07)),
+        )
+        row_candidates = []
+        for row_start, row_end in zip(separators, separators[1:]):
+            row_height = row_end - row_start
+            if not minimum_row_height <= row_height <= maximum_row_height:
+                continue
+            members = [
+                component for component in tall_components
+                if row_start <= component[1] + component[3] / 2 <= row_end
+            ]
+            if len(members) < 2:
+                continue
+            evidence = sum(
+                component[4] * (component[3] / tall_cutoff) ** 1.5
+                for component in members
+            )
+            absolute_top = search_top + row_start
+            absolute_bottom = search_top + row_end
+            if absolute_top <= region_center <= absolute_bottom:
+                distance = 0.0
+            else:
+                distance = min(
+                    abs(region_center - absolute_top),
+                    abs(region_center - absolute_bottom),
+                )
+            score = evidence / (1 + distance / max(1, height * 0.30))
+            row_candidates.append(
+                (score, absolute_top, absolute_bottom, members)
+            )
+        if not row_candidates:
+            tightened.append(candidate)
+            continue
+
+        row_candidates.sort(key=lambda item: item[0], reverse=True)
+        best_score = row_candidates[0][0]
+        selected = row_candidates[0]
+        for row_candidate in row_candidates:
+            score, candidate_top, candidate_bottom, _members = row_candidate
+            if score < best_score * 0.20:
+                break
+            collision = False
+            for used_top, used_bottom, used_center_x in selected_rows:
+                overlap = max(
+                    0,
+                    min(candidate_bottom, used_bottom)
+                    - max(candidate_top, used_top),
+                )
+                overlap_fraction = overlap / max(
+                    1,
+                    min(candidate_bottom - candidate_top, used_bottom - used_top),
+                )
+                if (
+                    overlap_fraction >= 0.70
+                    and abs((x + width / 2) - used_center_x) <= width * 0.65
+                ):
+                    collision = True
+                    break
+            if not collision:
+                selected = row_candidate
+                break
+        _score, row_top, row_bottom, members = selected
+        vertical_padding = max(6, round(page_height * 0.0017))
+        crop_top = max(0, row_top - vertical_padding)
+        crop_bottom = min(page_height, row_bottom + vertical_padding)
+        if crop_bottom - crop_top >= height * 0.85:
+            tightened.append(candidate)
+            continue
+            selected_rows.append((row_top, row_bottom, x + width / 2))
+
+        member_left = min(component[0] for component in members)
+        member_right = max(component[0] + component[2] for component in members)
+        horizontal_span = member_right - member_left
+        if horizontal_span >= width * 0.18:
+            horizontal_padding = max(12, round((row_bottom - row_top) * 0.18))
+            crop_left = max(0, x + member_left - horizontal_padding)
+            crop_right = min(
+                page_width, x + member_right + horizontal_padding,
+            )
+        else:
+            crop_left, crop_right = x, x + width
+        candidate["box"] = [
+            int(crop_left),
+            int(crop_top),
+            int(crop_right - crop_left),
+            int(crop_bottom - crop_top),
+        ]
+        tightened.append(candidate)
+    return tightened
+
+
+def detect_black_ink_form_rows(page_img: Image.Image) -> list[dict]:
+    """Find strong handwritten rows bounded by long rules on monochrome forms."""
+    page_width, page_height = page_img.size
+    gray = np.array(page_img.convert("L"))
+    _, ink = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+
+    joined = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (13, 1)),
+    )
+    row_coverage = (joined > 0).sum(axis=1)
+    longest_runs = np.zeros(page_height, dtype=np.int32)
+    for row_index, row in enumerate(joined > 0):
+        padded = np.r_[False, row, False]
+        edges = np.flatnonzero(padded[1:] != padded[:-1])
+        if len(edges):
+            longest_runs[row_index] = int(
+                (edges[1::2] - edges[::2]).max()
+            )
+    separator_rows = (
+        (longest_runs >= round(page_width * 0.20))
+        & (row_coverage >= round(page_width * 0.22))
+    )
+    separator_rows = cv2.dilate(
+        separator_rows.astype(np.uint8).reshape(-1, 1),
+        np.ones((3, 1), np.uint8),
+    ).ravel().astype(bool)
+    starts = np.flatnonzero(
+        separator_rows & ~np.r_[False, separator_rows[:-1]]
+    )
+    ends = np.flatnonzero(
+        separator_rows & ~np.r_[separator_rows[1:], False]
+    ) + 1
+    separators = [int((start + end) // 2) for start, end in zip(starts, ends)]
+    if len(separators) < 4:
+        return []
+
+    horizontal = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(80, page_width // 12), 1),
+        ),
+    )
+    vertical = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(60, page_height // 14)),
+        ),
+    )
+    cleaned = cv2.subtract(cv2.subtract(ink, horizontal), vertical)
+    cleaned = cv2.morphologyEx(
+        cleaned, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8),
+    )
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        cleaned, 8,
+    )
+    components = []
+    for component_index in range(1, count):
+        x = int(stats[component_index, cv2.CC_STAT_LEFT])
+        y = int(stats[component_index, cv2.CC_STAT_TOP])
+        width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[component_index, cv2.CC_STAT_AREA])
+        if (
+            area >= max(8, round(page_height * 0.004))
+            and width >= 3
+            and height >= 4
+            and width < page_width * 0.25
+        ):
+            components.append((x, y, width, height, area))
+    if not components:
+        return []
+
+    component_heights = np.array(
+        [component[3] for component in components], dtype=np.int32,
+    )
+    tall_cutoff = max(
+        18,
+        min(
+            max(30, round(page_height * 0.013)),
+            int(np.percentile(component_heights, 85) * 1.35),
+        ),
+    )
+    tall_components = [
+        component for component in components
+        if component[3] >= tall_cutoff
+    ]
+    minimum_row_height = max(24, round(page_height * 0.01))
+    maximum_row_height = max(140, round(page_height * 0.04))
+    minimum_tall_area = max(300, round(page_height * 0.90))
+    minimum_horizontal_span = max(160, round(page_width * 0.18))
+    rows = []
+    for row_top, row_bottom in zip(separators, separators[1:]):
+        row_height = row_bottom - row_top
+        if not minimum_row_height <= row_height <= maximum_row_height:
+            continue
+        members = [
+            component for component in tall_components
+            if row_top <= component[1] + component[3] / 2 <= row_bottom
+        ]
+        if len(members) < 6:
+            continue
+        total_area = sum(component[4] for component in members)
+        core_width = max(12, round(page_width * 0.0145))
+        core_area = max(80, round(page_height * 0.085))
+        core_members = [
+            component for component in members
+            if component[2] >= core_width and component[4] >= core_area
+        ]
+        if len(core_members) < 2:
+            continue
+        core_left = min(component[0] for component in core_members)
+        core_right = max(
+            component[0] + component[2] for component in core_members
+        )
+        support_gap = max(30, round(row_height * 2.20))
+        support_width = max(8, round(core_width * 0.50))
+        supported_members = [
+            component for component in members
+            if component[2] >= support_width
+            and component[0] + component[2] >= core_left - support_gap
+            and component[0] <= core_right + support_gap
+        ]
+        left = min(component[0] for component in supported_members)
+        right = max(
+            component[0] + component[2] for component in supported_members
+        )
+        if total_area < minimum_tall_area or right - left < minimum_horizontal_span:
+            continue
+        horizontal_padding = max(12, round(row_height * 0.18))
+        vertical_padding = max(6, round(page_height * 0.0017))
+        crop_left = max(0, left - horizontal_padding)
+        crop_right = min(page_width, right + horizontal_padding)
+        crop_top = max(0, row_top - vertical_padding)
+        crop_bottom = min(page_height, row_bottom + vertical_padding)
+        rows.append({
+            "label": f"black handwritten form row {len(rows) + 1}",
+            "box": [
+                int(crop_left), int(crop_top),
+                int(crop_right - crop_left), int(crop_bottom - crop_top),
+            ],
+        })
+    return rows if len(rows) >= 3 else []
 
 
 def merge_colored_line_fragments(regions: list[dict]) -> list[dict]:
@@ -2842,6 +3601,10 @@ Each box must tightly cover one handwritten field or line with a small margin.""
     if colored_regions:
         regions = colored_regions
     else:
+        black_form_rows = detect_black_ink_form_rows(page_img)
+        regions = black_form_rows or tighten_regions_to_black_ink_rows(
+            page_img, regions,
+        )
         regions = merge_colored_line_fragments(
             tighten_regions_to_colored_ink(page_img, regions)
         )
@@ -3225,6 +3988,44 @@ def run_pipeline(
     region_tasks = [ocr for ocr, _all in region_prep]         # images sent to per-image OCR (#4)
     region_images = [allimg for _ocr, allimg in region_prep]  # full image set for visual reconcile
 
+    # HASH v1 is optional advisory evidence. Start it before GPT so CPU inference
+    # overlaps network calls; one health failure disables it for the whole page.
+    ivrit_available, ivrit_detail = ivrit_ocr_service_status()
+    ivrit_status = "pending" if ivrit_available else (
+        "disabled" if not IVRIT_OCR_ENABLED else "unavailable"
+    )
+    ivrit_results: list[dict] = [
+        {
+            "status": ivrit_status,
+            "source": IVRIT_OCR_SOURCE,
+            "model": "HASH v1",
+            "text": "",
+            "confidence": 0.0,
+            "lines": [],
+            "detail": ivrit_detail,
+        }
+        for _region in regions
+    ]
+    ivrit_executor = None
+    ivrit_futures = {}
+    if ivrit_available:
+        print(
+            f"[ivrit] HASH v1 ready; scheduling {len(regions)} region crop(s) "
+            f"with {min(IVRIT_OCR_WORKERS, len(regions))} worker(s) ..."
+        )
+        ivrit_executor = ThreadPoolExecutor(
+            max_workers=min(IVRIT_OCR_WORKERS, len(regions)),
+        )
+        ivrit_futures = {
+            ivrit_executor.submit(
+                ocr_image_with_ivrit,
+                dict(region_images[region_index])["01_original_crop.png"],
+            ): region_index
+            for region_index in range(len(regions))
+        }
+    else:
+        print(f"[ivrit] HASH v1 advisory OCR unavailable: {ivrit_detail}")
+
     # ---- run ALL vision calls in parallel across ALL regions -------------- #
     # Self-consistency: draw each image version VOTE_SEEDS times (distinct seeds)
     # so the deterministic aggregation has multiple genuine samples to vote over.
@@ -3284,6 +4085,7 @@ def run_pipeline(
                     "label": regions[index].get("label"),
                     "box": regions[index]["box"],
                     "completed_draws": len(results),
+                    "ivrit_ocr": ivrit_results[index],
                     "candidates": [
                         {
                             "source": result["source"],
@@ -3428,6 +4230,101 @@ def run_pipeline(
     if failures:
         print(f"[OCR] WARNING: {len(failures)} call(s) still failing after all retries", file=sys.stderr)
 
+    if ivrit_futures:
+        for future in as_completed(ivrit_futures):
+            region_index = ivrit_futures[future]
+            try:
+                ivrit_results[region_index] = future.result()
+                print(
+                    f"[ivrit] region {region_index + 1}: "
+                    f"{ivrit_results[region_index].get('text', '')!r}"
+                )
+            except Exception as exc:
+                ivrit_results[region_index] = {
+                    "status": "failed",
+                    "source": IVRIT_OCR_SOURCE,
+                    "model": "HASH v1",
+                    "text": "",
+                    "confidence": 0.0,
+                    "lines": [],
+                    "detail": str(exc),
+                }
+                print(
+                    f"[ivrit] region {region_index + 1} failed: {exc}",
+                    file=sys.stderr,
+                )
+            _write_json_atomic(
+                region_dirs[region_index] / "ivrit_ocr.json",
+                ivrit_results[region_index],
+            )
+            _publish_ocr_progress()
+        ivrit_executor.shutdown(wait=True)
+    else:
+        for region_index, evidence in enumerate(ivrit_results):
+            _write_json_atomic(region_dirs[region_index] / "ivrit_ocr.json", evidence)
+
+    blue_only_inputs = {}
+    for region_index, evidence in enumerate(ivrit_results):
+        if not should_try_ivrit_blue_only(
+            evidence, region_results[region_index], regions[region_index]
+        ):
+            continue
+        blue_image = prepare_ivrit_blue_only_image(
+            dict(region_images[region_index])["01_original_crop.png"]
+        )
+        if blue_image is not None:
+            blue_only_inputs[region_index] = blue_image
+    if blue_only_inputs:
+        print(
+            f"[ivrit] retrying {len(blue_only_inputs)} compact region(s) "
+            "with blue-only isolation ..."
+        )
+        with ThreadPoolExecutor(
+            max_workers=min(IVRIT_OCR_WORKERS, len(blue_only_inputs))
+        ) as executor:
+            futures = {
+                executor.submit(ocr_image_with_ivrit, image): region_index
+                for region_index, image in blue_only_inputs.items()
+            }
+            for future in as_completed(futures):
+                region_index = futures[future]
+                try:
+                    blue_evidence = future.result()
+                except Exception as exc:
+                    blue_evidence = {
+                        "status": "failed",
+                        "source": IVRIT_OCR_SOURCE,
+                        "model": "HASH v1",
+                        "text": "",
+                        "confidence": 0.0,
+                        "lines": [],
+                        "detail": str(exc),
+                    }
+                ivrit_results[region_index] = select_ivrit_preprocessing_variant(
+                    ivrit_results[region_index],
+                    blue_evidence,
+                    region_results[region_index],
+                    regions[region_index],
+                )
+                print(
+                    f"[ivrit] region {region_index + 1}: selected "
+                    f"{ivrit_results[region_index].get('selected_variant')} "
+                    f"{ivrit_results[region_index].get('text', '')!r}"
+                )
+
+    for region_index, evidence in enumerate(ivrit_results):
+        evidence["advisory_gate"] = ivrit_ocr_advisory_gate(
+            evidence, region_results[region_index], regions[region_index]
+        )
+        _write_json_atomic(region_dirs[region_index] / "ivrit_ocr.json", evidence)
+        if evidence["advisory_gate"]["eligible"]:
+            print(
+                f"[ivrit] region {region_index + 1}: advisory candidate eligible "
+                f"({evidence['advisory_gate']['character_agreement']:.0%} "
+                "character agreement)"
+            )
+    _publish_ocr_progress()
+
     cu_context_markdown = ""
     if NEARBY_CU_CONTEXT and cu_future is not None:
         try:
@@ -3439,21 +4336,40 @@ def run_pipeline(
     print("[vote] aggregating self-consistency draws per region ..." if VOTE_ENABLED
           else "[reconcile] final visual adjudication per region ...")
 
+    def _results_with_ivrit(region_index: int) -> list[dict]:
+        results = list(region_results[region_index])
+        evidence = ivrit_results[region_index]
+        candidate = (
+            ivrit_ocr_candidate(evidence)
+            if (evidence.get("advisory_gate") or {}).get("eligible")
+            else None
+        )
+        if candidate is not None:
+            results.append(candidate)
+        return results
+
     def _reconcile_region(ri: int) -> dict:
         if segmented_finals[ri] is not None:
             return segmented_finals[ri] or {}
-        res = region_results[ri]
+        res = _results_with_ivrit(ri)
         usable = [
             result for result in res
             if (result.get("ocr") or {}).get("full_transcription", "").strip()
             or (result.get("ocr") or {}).get("classification")
         ]
+        semantic_usable = [
+            result for result in usable
+            if result.get("source") != IVRIT_OCR_SOURCE
+        ]
         if VOTE_ENABLED:
-            readings = [(r.get("ocr") or {}).get("full_transcription", "") for r in usable]
+            readings = [
+                (r.get("ocr") or {}).get("full_transcription", "")
+                for r in semantic_usable
+            ]
             if readings:
                 vote = aggregate_votes(readings)
                 if "[?]" not in vote.get("final_transcription", ""):
-                    return finalize_region_semantics(vote, usable)  # no model call
+                    return finalize_region_semantics(vote, semantic_usable)  # no model call
         imgs = region_images[ri]
         signature_flourish = is_signature_flourish(dict(imgs)["01_original_crop.png"])
         local_cu_context = nearby_printed_context(
@@ -3464,7 +4380,9 @@ def run_pipeline(
         )
 
         def _contextualize(final: dict) -> dict:
-            final = finalize_region_semantics(final, usable, signature_flourish)
+            final = finalize_region_semantics(
+                final, semantic_usable, signature_flourish,
+            )
             if not should_contextual_recheck(final, usable):
                 return final
             try:
@@ -3476,6 +4394,13 @@ def run_pipeline(
                 context_images[1].save(region_dirs[ri] / "09_page_highlight.png")
                 _write_json_atomic(region_dirs[ri] / "contextual_recheck.json", recheck)
                 accepted = dict(accept_contextual_recheck(final, recheck))
+                accepted = protect_contextual_recheck_with_cross_engine_agreement(
+                    final,
+                    recheck,
+                    accepted,
+                    semantic_usable,
+                    ivrit_results[ri],
+                )
                 accepted["pre_context_transcription"] = pre_context_text
                 accepted["contextual_evidence"] = recheck
                 pre_info = _information_text(pre_context_text)
@@ -3510,9 +4435,15 @@ def run_pipeline(
                 final.setdefault("notes", []).append(f"text reconciliation (visual failed: {vexc})")
                 return _contextualize(final)
             except Exception as texc:  # 3) best non-empty per-image reading
-                usable = [r for r in res if (r.get("ocr") or {}).get("full_transcription")]
-                if usable:
-                    best = max(usable, key=lambda r: len(r["ocr"].get("full_transcription", "")))
+                vision_usable = [
+                    result for result in semantic_usable
+                    if (result.get("ocr") or {}).get("full_transcription")
+                ]
+                if vision_usable:
+                    best = max(
+                        vision_usable,
+                        key=lambda r: len(r["ocr"].get("full_transcription", "")),
+                    )
                     return _contextualize({
                         "final_transcription": best["ocr"].get("full_transcription", ""),
                         "words": best["ocr"].get("words", []),
@@ -3538,6 +4469,7 @@ def run_pipeline(
     for i, region in enumerate(regions, 1):
         rdir = region_dirs[i - 1]
         res = region_results[i - 1]
+        reconciliation_results = _results_with_ivrit(i - 1)
         final = finals[i - 1] or {}
         local_cu_context = nearby_printed_context(
             cu_context_markdown, region["box"], page_img.height
@@ -3564,7 +4496,7 @@ def run_pipeline(
             "selected_images": [n for n, _ in sel],
             "candidate_readings": [
                 {"source": r["source"], "text": (r.get("ocr") or {}).get("full_transcription", "")}
-                for r in res
+                for r in reconciliation_results
             ],
         }
         (rdir / "visual_reconcile_input.json").write_text(
@@ -3575,6 +4507,7 @@ def run_pipeline(
             "box": region["box"],
             "printed_context_used": region_context,
             "per_image": per_image,
+            "ivrit_ocr": ivrit_results[i - 1],
             "field_type": final.get("field_type"),
             "final_transcription": final.get("final_transcription", ""),
             "numeric_cells": final.get("numeric_cells", []),
@@ -3588,6 +4521,7 @@ def run_pipeline(
             "classification": final.get("classification", "handwritten_text"),
             "decision_status": final.get("decision_status", "visual_reconciliation"),
             "agreement_gate": final.get("agreement_gate"),
+            "cross_engine_agreement": final.get("cross_engine_agreement"),
             "cross_region_consensus": final.get("cross_region_consensus"),
             "vote": {
                 "candidate_count": len(per_image),
@@ -3606,6 +4540,7 @@ def run_pipeline(
             "final_transcription": final.get("final_transcription"),
             "pre_context_transcription": final.get("pre_context_transcription"),
             "contextual_evidence": final.get("contextual_evidence"),
+            "ivrit_ocr": ivrit_results[i - 1],
             "numeric_cells": final.get("numeric_cells", []),
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
             "words": final.get("words"), "notes": final.get("notes"),
@@ -3613,6 +4548,7 @@ def run_pipeline(
             "needs_review": final.get("needs_review", False),
             "decision_status": final.get("decision_status", "visual_reconciliation"),
             "agreement_gate": final.get("agreement_gate"),
+            "cross_engine_agreement": final.get("cross_engine_agreement"),
             "cross_region_consensus": final.get("cross_region_consensus"),
         })
         print(f"  [{i}] {region.get('label')}: {final.get('final_transcription', '')!r}")

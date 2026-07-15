@@ -14,7 +14,7 @@
   </script>
   <link rel="stylesheet" href="/styles.css?v=20260713-1" />
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
-  <script src="/app.js?v=20260714-2" defer></script>
+  <script src="/app.js?v=20260715-2" defer></script>
 </head>
 <body>
   <div class="app-shell">
@@ -48,11 +48,11 @@
           <label class="model-picker">
             <span>Vision model</span>
             <select id="modelSelect" name="model_profile">
-              <option value="gpt-5.4">GPT-5.4</option>
+              <option value="gpt-5.4" selected>GPT-5.4</option>
               <option value="gpt-5.4-pro">GPT-5.4 Pro · medium reasoning (experimental, slower)</option>
               <option value="gpt-5.6-luna">GPT-5.6 Luna (experimental)</option>
               <option value="gpt-5.6-sol-none">GPT-5.6 Sol · Fast (no reasoning)</option>
-              <option value="gpt-5.6-sol" selected>GPT-5.6 Sol · low reasoning (recommended)</option>
+              <option value="gpt-5.6-sol">GPT-5.6 Sol · low reasoning (experimental)</option>
               <option value="gpt-5.6-sol-medium">GPT-5.6 Sol · medium reasoning (experimental, slower)</option>
             </select>
           </label>
@@ -224,6 +224,9 @@
                 </button>
                 <button class="stage-tab" type="button" data-view="candidates" role="tab" aria-selected="false">
                   <i data-lucide="list-tree"></i><span>Candidates</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="ivrit" role="tab" aria-selected="false">
+                  <i data-lucide="languages"></i><span>Ivrit OCR</span>
                 </button>
                 <button class="stage-tab" type="button" data-view="decision" role="tab" aria-selected="false">
                   <i data-lucide="git-compare-arrows"></i><span>Decision</span>

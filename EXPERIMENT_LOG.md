@@ -557,6 +557,171 @@ or reliability.
   useful, but neither repeat supports it as a quality default and the two runs are not stable enough
   to infer small accuracy improvements.
 
+### EXP-20260714-17: Black-ink ruled-form crop tightening
+
+- **Status**: ADOPTED
+- **Question/Hypothesis**: The oversized crops on `דוח_אלעד.pdf` persist because the black-ink
+  refiner can only expand a model box. Long form rules plus unusually tall connected components
+  should identify the actual handwritten row without another model call.
+- **Input and reference**: Saved pages and detections from
+  `analysis_results/דוח_אלעד.pdf__2026-07-14_19-31-00/` and the cancelled repeat
+  `analysis_results/דוח_אלעד.pdf__2026-07-14_20-05-05/`.
+- **Inference isolation**: Offline OpenCV replay only. No model, OCR candidates, merged output, or
+  golden text was used to choose geometry.
+- **Baseline**: Six overlapping crops were 365-497 pixels tall. Region 5 included two income rows,
+  and region 1 contained mostly printed prose while clipping the intended handwriting at its lower
+  edge. The existing `refine_box_to_ink` preserved the complete original box and added vertical
+  padding, so it could not correct either failure.
+- **Failed first fix**: Local ruled-row tightening worked offline when GPT returned one approximate
+  box per handwriting row. On the next run GPT returned only four boxes, including two prose/table
+  containers and omitting two handwritten rows. A local postprocessor cannot reject a false box
+  with only one nearby rule or create rows that the model never returned.
+- **Adopted change**: For monochrome pages with at least three strongly supported ruled rows, scan
+  the full page for long horizontal boundaries and select intervals with at least six tall stroke
+  components, sufficient ink area, and a dense horizontal handwriting core. This replaces the
+  model geometry and uses generic row labels. The prior local tightener remains the fallback for
+  pages without enough global evidence. Colored-ink and paragraph-block behavior is unchanged.
+- **Exact repeat replay**: The failed repeat's four boxes included prose at `(871,1510,1735,332)`
+  and a work-to-table container at `(801,2484,1845,418)`. Global replay returns six boxes:
+  `(921,1958,1753,134)`, `(637,2195,2067,155)`, `(780,2504,869,158)`,
+  `(1077,2997,1305,132)`, `(989,3181,1303,88)`, and `(944,3391,1419,94)`.
+  No prose box remains, both omitted rows are restored, and sparse printed checkbox/table outliers
+  are excluded from the horizontal bounds.
+- **Verification**: Three synthetic regressions cover local snapping, distinct assignment for
+  overlapping detections, and global recovery when model detection misses rows. A hard replay
+  assertion on the exact failed page verifies six expected y-bands and tight work/table widths.
+  The complete suite passes 134 tests; VS Code reports no errors in the edited files.
+- **Decision**: **ADOPTED / GEOMETRY**. Use global ruled-row discovery when its conservative
+  evidence gate succeeds; otherwise preserve the local fallback.
+
+### EXP-20260714-18: HASH v1 advisory OCR sidecar
+
+- **Status**: AVAILABLE / LIVE VALIDATED
+- **Question/Hypothesis**: A separately trained CNN-BiLSTM-CTC Hebrew model may expose useful
+  letter or spelling evidence when Core4 and GPT visual adjudication disagree, even though its
+  standalone natural-handwriting accuracy is insufficient.
+- **Source**: `roie9876/heb-handfree` commit `b63051c`, cloned to `~/heb-handfree`. The bundled
+  HASH v1 checkpoint is served by FastAPI through `POST /v1/ocr`; `GET /health` reports readiness.
+- **Measured upstream limitation**: The model card reports 45.95% CER and 100% WER on its confirmed
+  natural ruled-form evaluation. Confidence is mean greedy CTC path probability and uncalibrated.
+- **Integration**: Check sidecar health once per page, submit each original region crop while Core4
+  runs, persist raw text/line/confidence/box evidence in `region_*/ivrit_ocr.json`, and include one
+  `ivrit_hash_v1` candidate in final GPT visual adjudication. HASH is explicitly excluded from
+  deterministic agreement, faithful-source guards, semantic fallback, and standalone acceptance.
+  Absence, disablement, HTTP errors, and timeouts are nonfatal.
+- **UI**: Added an **Ivrit OCR** diagnostics tab with per-region status, advisory text,
+  uncalibrated confidence, and crop-relative line boxes. Completed evidence is also retained in
+  `result.json`, `handwriting_result.json`, and `ocr_progress.json`.
+- **Validation**: Mocked API contract, prompt-safety, and full one-region orchestration tests pass.
+  The complete 136-test suite also exercises a real localhost connection-refused path and confirms
+  the page continues normally. JavaScript syntax, rendered tab declaration, editor diagnostics,
+  and `git diff --check` pass. Homebrew `uv 0.11.28` provisioned the upstream frozen Python 3.12
+  environment. The FastAPI service loaded HASH v1 with Apple MPS, returned `{"status":"ok"}` from
+  `/health`, and completed a real production-adapter request against a saved InkSight crop. That
+  crop produced two low-quality lines at 0.8523 uncalibrated mean confidence, reinforcing that HASH
+  must remain advisory despite high model confidence.
+- **Decision**: Keep enabled as an optional localhost advisory source. Do not treat HASH confidence
+  as acceptance confidence or promote its text without visible-stroke support from GPT.
+
+### EXP-20260715-19: HASH contribution ablation and selective gate
+
+- **Status**: ADOPTED / SELECTIVE ADVISORY ONLY
+- **Question**: Does adding HASH v1 to GPT-5.4 Core4 improve final transcription, and can weak
+  evidence be filtered without golden data at runtime?
+- **Inputs**: Two complete 21-region runs of the human-golden `חיוב חשבון1.pdf`, plus paired visual
+  reconciliations using immutable images and Core4 responses from
+  `חיוב חשבון1.pdf__2026-07-14_21-39-20`. Golden text was loaded only after ablation inference.
+- **Observed full-run scores**: Always-on HASH runs scored 5/20 exact at 0.759 similarity and 6/20
+  exact at 0.739. The nearest same-profile no-HASH run scored 8/20 at 0.753. Run-level differences
+  are not causal because Core4 and visual adjudication vary between calls.
+- **HASH reliability**: HASH was byte-identical on 21/21 regions across both runs, but standalone
+  accuracy was only 2/20 exact with 0.2645 mean similarity. Every text field had confidence above
+  0.90; even the subset above 0.95 remained only 2/11 exact per run. HASH confidence is therefore
+  repeatable but unusable as correctness evidence.
+- **Ungated paired test**: Five representative regions x two repetitions produced 0/10 exact and
+  0.6481 similarity without HASH versus 2/10 and 0.6679 with HASH. However, both exact gains were
+  on `ביוב` while HASH itself incorrectly read `כסף`, showing prompt perturbation rather than valid
+  OCR support. The three-line recipient field worsened in both HASH pairs. Numeric/date pairs were
+  unchanged. Artifact: `analysis_results/ivrit_hash_ablation_sequential__2026-07-15/`.
+- **Selective gate**: Admit HASH only for single-line nonnumeric/non-structured Hebrew, at least
+  three letters per source, at least 60% length overlap, and at least 40% normalized Hebrew
+  character agreement with Core4. This admitted only regions 8/9 in one run and 8/9/19 in the
+  other, versus all 21 previously. It excludes HASH confidence from the GPT payload and omits all
+  HASH-specific prompt text when the gate fails. A follow-up live run exposed a noisy detector
+  label (`handwritten number`) on exact Hebrew `בארותיים`; generic number labels no longer veto
+  nonnumeric readings, while exact Core4-HASH duplicates are omitted as redundant.
+- **Gated paired test**: Three eligible regions x two repetitions produced 0/6 exact and 0.6056
+  similarity without HASH versus 1/6 exact and 0.7056 with gated HASH. No pair regressed. HASH
+  rescued exact `בארותיים` in one of two repetitions; the other eligible fields were unchanged.
+  The benefit is real but stochastic, so HASH remains a hint rather than an authority. Artifact:
+  `analysis_results/ivrit_hash_gated_ablation__2026-07-15/`.
+- **Invalid attempt**: The first 20-call concurrent ablation is excluded because all calls failed
+  at TCP connect during a transient Foundry endpoint outage. Sequential retry completed without
+  failures after DNS/TLS and Entra checks passed.
+- **Validation**: 139 Python tests, JavaScript syntax, editor diagnostics, and `git diff --check`
+  pass. Live InkSight reports HTTP 200, HASH `/health` reports `ok`, and the adapter exposes the
+  configured 0.40 gate threshold. The UI identifies both admitted and excluded HASH evidence.
+  A subsequent live 21-region run admitted only two HASH readings and scored 7/20 exact, 0.7902
+  similarity, and 1/1 classification. This exceeds both always-on HASH runs in similarity, but
+  remains observational because Core4/visual outputs vary between runs. The live artifact also
+  exposed a noisy `handwritten number` label on Hebrew `בארותיים`; the final gate ignores generic
+  number labels when readings are nonnumeric and suppresses exact Core4-HASH duplicates.
+- **Decision**: **ADOPTED** with the deterministic selective gate. Keep all raw HASH evidence in
+  artifacts/UI, never expose its confidence to GPT, and never use HASH as a standalone fallback.
+
+### EXP-20260715-20: Cross-Mac HASH discrepancy and crop normalization
+
+- **Status**: ADOPTED / TARGETED PREPROCESSING
+- **Reported discrepancy**: The source Mac returned exact `מרטין פאלרמו` from a manually prepared
+  tight sample. InkSight region 5 returned `משת פאלר מן\nן` from the same document content.
+- **Device check**: The exact InkSight PNG (`704x170`, SHA-256
+  `141119b67b556ec795a0908187ea130dea3c25551e2c758839701ab67bc1b44a`) produced identical text,
+  boxes, and effectively identical confidence on CPU and Apple MPS. The checkpoint/device is not
+  the cause. The source sample file is ignored/unavailable in the cloned repository, so its byte
+  hash could not be compared; the screenshot visibly shows a tighter one-line crop.
+- **Root cause**: InkSight's original crop includes a black rule and printed field label. HASH
+  segmented one handwritten row into two vertically overlapping lines, including a duplicate final
+  `ן`. Removing black print and retaining only tight blue pen pixels produced exact
+  `מרטין פאלרמו` through the live MPS service.
+- **Global preprocessing benchmark**: Across 20 text regions, original HASH scored 2/20 exact and
+  0.2645 similarity; blue-only scored 2/20 and 0.2665; rule-clipped scored 1/17 and 0.2589. A global
+  switch is rejected. Blue-only exactly fixed region 5 and improved regions 19/20, but degraded
+  region 9 and the multiline region 2. Artifact:
+  `analysis_results/hash_input_preprocessing__2026-07-15/`.
+- **Adopted change**: Retry blue-only only when Core4 is one nonnumeric Hebrew line and original
+  HASH has multiple lines with at least 50% vertical overlap. Select blue-only only if it becomes
+  one line and agrees with original HASH by at least 55% characters and 80% length. This
+  preprocessing consensus may admit spelling evidence even when Core4 is the outlier. Both variant
+  summaries and `selected_variant` are persisted and displayed in the Ivrit OCR tab.
+- **Verification**: The production helper plus live MPS service returns exact `מרטין פאלרמו` for
+  the saved region 5 crop. Focused helper and full orchestration regressions verify two HASH calls,
+  blue-only selection, persisted preprocessing consensus, and delivery to visual reconciliation.
+- **Decision**: **ADOPTED** as a narrow duplicate-line recovery path. Keep original HASH input for
+  all normal, multiline, structured, and non-overlapping cases.
+
+### EXP-20260715-21: Contextual override versus cross-engine agreement
+
+- **Status**: ADOPTED / SEMANTIC-ANCHORING GUARD
+- **Failure**: On region 8, Core4 read `בארותיים`, visual reconciliation kept `בארותיים`, and HASH
+  independently read `בארותיים`. The later highlighted contextual reread noticed the printed field
+  label `עיר` (city), guessed `אורנים` at confidence 0.69, and replaced the agreed result because
+  the generic contextual acceptance floor was 0.60. The app marked disagreement for review but
+  still chose the context guess.
+- **Root cause**: `accept_contextual_recheck` used information length, script, structured-token
+  preservation, and self-reported confidence, but had no protection for exact independent source
+  agreement. Printed semantic context could therefore anchor a plausible replacement.
+- **Change**: If the pre-context visual result, at least one faithful/Core4 candidate, and raw HASH
+  text agree exactly after normalization, a differing contextual reread cannot replace them. The
+  contextual text remains an alternative, the region is marked `needs_review`, and
+  `cross_engine_agreement` records the supporting sources and rejected context text. Normal
+  contextual correction remains unchanged when HASH or faithful visual evidence does not agree.
+- **Exact replay**: Saved region 8 now selects `בארותיים`, retains `אורנים` and `אורנית[?]` as
+  alternatives, and records `cross_engine_agreement_protected` instead of `contextual_recheck`.
+- **Validation**: Exact-artifact replay and focused positive/control regressions pass. The complete
+  suite passes 142 tests; JavaScript syntax, editor diagnostics, and `git diff --check` pass.
+- **Decision**: **ADOPTED**. Nearby printed context remains useful, but one context reread cannot
+  overrule exact agreement from visual/Core4 plus independent HASH.
+
 # Experiment Template
 
 Copy this section for every new experiment.

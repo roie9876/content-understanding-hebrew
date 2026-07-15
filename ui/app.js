@@ -340,6 +340,97 @@ function renderCandidates(diagnostics) {
   adminOutput.append(list);
 }
 
+function renderIvritOcr(diagnostics) {
+  const progressRegions = diagnostics.progress?.regions || [];
+  const finalRegions = diagnostics.final_regions || [];
+  const regions = progressRegions.length ? progressRegions : finalRegions.map((region, index) => ({
+    ...region,
+    region: index + 1,
+  }));
+  const evidenceByRegion = regions.map((region, index) =>
+    region.ivrit_ocr || finalRegions[index]?.ivrit_ocr || {
+      status: "pending",
+      text: "",
+      confidence: 0,
+      lines: [],
+    }
+  );
+  const complete = evidenceByRegion.filter((evidence) => evidence.status === "complete").length;
+  const offered = evidenceByRegion.filter((evidence) => evidence.advisory_gate?.eligible).length;
+  const failed = evidenceByRegion.filter((evidence) => evidence.status === "failed").length;
+  const unavailable = evidenceByRegion.filter((evidence) =>
+    ["disabled", "unavailable"].includes(evidence.status)
+  ).length;
+  const summary = createElement("div", "admin-summary");
+  addAdminStat(summary, "HASH responses", `${complete} / ${regions.length}`);
+  addAdminStat(summary, "Sent to GPT", offered);
+  addAdminStat(summary, "Unavailable", unavailable);
+  addAdminStat(summary, "Failed", failed);
+  adminOutput.append(summary);
+  adminOutput.append(createElement(
+    "div",
+    "admin-empty",
+    "HASH v1 is independent advisory OCR. Its confidence is uncalibrated and its text is never accepted without GPT visual support.",
+  ));
+  const list = createElement("div", "diagnostic-list");
+  regions.forEach((region, index) => {
+    const evidence = evidenceByRegion[index];
+    const lines = evidence.lines || [];
+    const details = regionDetails(region, lines.length, "HASH lines");
+    if (index === 0) details.open = true;
+    const body = createElement("div", "diagnostic-body");
+    body.append(createElement(
+      "div",
+      "candidate-source",
+      `${evidence.model || "HASH v1"} · ${evidence.status || "pending"}`,
+    ));
+    if (evidence.status === "complete") {
+      const gate = evidence.advisory_gate || {};
+      const agreement = gate.character_agreement === undefined
+        ? ""
+        : ` · ${Math.round(Number(gate.character_agreement) * 100)}% character agreement`;
+      body.append(
+        createElement("div", "decision-selected", evidence.text || "(empty reading)"),
+        createElement(
+          "div",
+          "decision-method",
+          `Input: ${evidence.selected_variant || "original"} · Uncalibrated mean confidence: ${Math.round((Number(evidence.confidence) || 0) * 100)}%`,
+        ),
+        createElement(
+          "div",
+          "decision-method",
+          `${gate.eligible ? "Sent to GPT as spelling evidence" : "Excluded from GPT evidence"} · ${gate.reason || "gate pending"}${agreement}`,
+        ),
+      );
+      lines.forEach((line, lineIndex) => {
+        const box = line.box || {};
+        const row = createElement("div", "candidate");
+        row.append(
+          createElement(
+            "div",
+            "candidate-source",
+            `Line ${lineIndex + 1} · ${Math.round((Number(line.confidence) || 0) * 100)}% · [${box.x || 0}, ${box.y || 0}, ${box.width || 0}, ${box.height || 0}]`,
+          ),
+          createElement("div", "candidate-text", line.text || "(empty line)"),
+        );
+        body.append(row);
+      });
+    } else {
+      body.append(createElement(
+        "div",
+        "admin-empty",
+        evidence.detail || "Waiting for the Ivrit OCR sidecar",
+      ));
+    }
+    details.append(body);
+    list.append(details);
+  });
+  if (!regions.length) {
+    list.append(createElement("div", "admin-empty", "Ivrit OCR starts after handwriting detection"));
+  }
+  adminOutput.append(list);
+}
+
 function renderDecision(diagnostics) {
   const regions = diagnostics.final_regions || [];
   const summary = createElement("div", "admin-summary");
@@ -406,6 +497,7 @@ async function showAdminView(page) {
     adminOutput.replaceChildren();
     if (activeView === "detection") renderDetection(diagnostics, page);
     if (activeView === "candidates") renderCandidates(diagnostics);
+    if (activeView === "ivrit") renderIvritOcr(diagnostics);
     if (activeView === "decision") renderDecision(diagnostics);
     if (activeView === "logs") renderLogs(diagnostics);
   } catch (error) {
@@ -609,7 +701,7 @@ async function showResultView(page) {
     if (mergedDocumentFrame.src !== mergedUrl) mergedDocumentFrame.src = page.merged_document_url;
   } else if (activeView === "golden" && page.golden_comparison_url && page.stage === "complete") {
     showGoldenComparison(page);
-  } else if (["detection", "candidates", "decision", "logs"].includes(activeView)) {
+  } else if (["detection", "candidates", "ivrit", "decision", "logs"].includes(activeView)) {
     showAdminView(page);
   } else {
     if (activeView === "merged") mergedDocumentFrame.src = "about:blank";

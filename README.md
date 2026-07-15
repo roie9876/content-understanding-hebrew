@@ -7,6 +7,7 @@ Azure AI engines together:
 | --- | --- |
 | **Azure AI Content Understanding** | OCR of printed Hebrew + layout + structured field extraction, with confidence scores |
 | **Azure OpenAI GPT vision** (`gpt-5.4`, `gpt-5.6-luna`, or `gpt-5.6-sol`) | Reads Hebrew **handwriting** (which classic OCR does not support) and separates printed vs handwritten text |
+| **Ivrit OCR HASH v1** (optional local sidecar) | Independent CNN-BiLSTM-CTC Hebrew reading used as advisory spelling evidence during GPT visual adjudication |
 
 The two outputs are merged side-by-side so you can compare how each engine read the document.
 
@@ -22,8 +23,9 @@ flowchart LR
     A[Scanned PDF] --> B[Render page to PNG<br/>PyMuPDF]
     A --> C[Content Understanding<br/>custom analyzer]
     B --> D[GPT-5.x vision<br/>Responses API]
+    B --> H[Ivrit OCR HASH v1<br/>local sidecar]
     C --> E[Printed text + fields<br/>+ confidence]
-    D --> F[Handwritten text + fields]
+    D & H --> F[Handwritten text + fields]
     E & F --> G[out/result.json]
 ```
 
@@ -31,6 +33,7 @@ flowchart LR
 
 - Python 3.9+
 - Azure CLI, logged in: `az login`
+- Optional: Docker Desktop or another Docker-compatible runtime for the local HASH v1 sidecar
 - Access (Entra ID RBAC) to:
   - a **Content Understanding** resource (`Cognitive Services User`)
   - an **Azure OpenAI** resource with a vision model deployment (`Cognitive Services OpenAI User`)
@@ -54,6 +57,79 @@ Open [http://127.0.0.1:5173](http://127.0.0.1:5173). Temporary uploads are kept 
 and local start time, for example `document.pdf__2026-07-12_10-30-45/`. Each run contains
 all page artifacts plus a `run.json` manifest and is excluded from Git because results may
 contain PII.
+
+### Optional Ivrit OCR evidence
+
+The pipeline can query the HASH v1 service from
+[roie9876/heb-handfree](https://github.com/roie9876/heb-handfree). Keep it as a sibling clone so
+its Python 3.11+/PyTorch environment stays isolated from this Python 3.9 application:
+
+```bash
+git clone https://github.com/roie9876/heb-handfree.git ../heb-handfree
+cd ../heb-handfree
+brew install uv
+make install
+IVRIT_OCR_DEVICE=mps .venv/bin/python -m uvicorn \
+  ivrit_ocr.api:app --host 127.0.0.1 --port 8000 --workers 1 --limit-concurrency 16
+```
+
+Keep that command running in a separate terminal. On a machine with Docker, the containerized CPU
+service is an alternative:
+
+```bash
+cd ../heb-handfree
+docker compose up --build -d
+curl --fail http://127.0.0.1:8000/health
+```
+
+The local clone used for this integration was inspected at commit `b63051c`. Each page checks
+`GET /health` once. When ready, original region crops are sent to `POST /v1/ocr` while Core4 runs.
+The raw response is saved as `region_*/ivrit_ocr.json`, including line text, uncalibrated
+confidence, crop-relative boxes, and the advisory-gate decision. HASH text is shown to GPT as
+`ivrit_hash_v1` spelling evidence only when all of these deterministic checks pass:
+
+- Core4 and HASH are both single-line, nonnumeric Hebrew readings.
+- The field is not an explicit date, account, reference, amount, mark, or signature; a noisy generic
+  `number` detector label does not veto two visibly nonnumeric Hebrew readings.
+- Both readings contain at least three Hebrew letters and have at least 60% length overlap.
+- Their punctuation- and diacritic-free Hebrew character agreement is at least 40%.
+- An exact Core4-HASH duplicate is omitted because it adds no spelling information.
+
+All other HASH responses remain visible in the **Ivrit OCR** tab but are excluded from the GPT
+prompt. HASH is also excluded from deterministic agreement, faithful-source guards, and standalone
+fallbacks. Its uncalibrated model confidence is never sent to GPT. If the service is disabled,
+absent, or times out, the normal GPT pipeline continues unchanged.
+
+Contextual rereads may use nearby printed labels to understand a field, but they cannot replace an
+exact transcription independently supported by the visual decision, a faithful Core4 candidate,
+and HASH. A conflicting contextual reading is retained as an alternative, the selected visual text
+is preserved, and the region is marked for review. This prevents semantic labels such as `עיר`
+(`city`) from turning agreed visible strokes into a more familiar place name.
+
+For compact blue handwriting, InkSight also detects a specific segmentation failure: HASH returns
+multiple vertically overlapping lines while Core4 sees one nonnumeric Hebrew line. Only in that
+case, InkSight retries HASH on a tight blue-only image that removes black form print. The blue-only
+result replaces the original HASH result only when it collapses to one line and retains at least
+55% Hebrew character agreement and 80% length overlap with the original HASH reading. This recovers
+line samples that were trained/evaluated as tight crops without globally applying a transform that
+regresses other fields. The Ivrit OCR tab records `original` or `blue_only` as the selected input.
+
+Configure the sidecar in `.env`:
+
+```dotenv
+IVRIT_OCR_ENABLED=1
+IVRIT_OCR_URL=http://127.0.0.1:8000
+IVRIT_OCR_TIMEOUT=60
+IVRIT_OCR_WORKERS=1
+IVRIT_OCR_MIN_AGREEMENT=0.40
+IVRIT_OCR_MIN_PREPROCESS_AGREEMENT=0.55
+```
+
+HASH v1 is an assisted-transcription model, not an authority. Its model card reports 45.95% CER
+and 100% WER on the confirmed natural ruled-form evaluation, and its confidence is not calibrated.
+The **Ivrit OCR** tab therefore exposes its evidence independently; final text still requires GPT
+to verify the visible strokes. Preserve the upstream `NOTICE.md` when redistributing its checkpoint
+or container. Stop the native Uvicorn process with Ctrl+C, or use `docker compose down` for Docker.
 
 The upload screen lists completed local analyses. Selecting one reopens the full source,
 detection, candidates, decision, final overlay, and logs without calling Azure again. Saved
@@ -96,6 +172,8 @@ The page workspace exposes the complete analysis trail for administrators:
 - **Content Understanding** appears as soon as its background call completes.
 - **Detection** lists every handwriting region with its page coordinates and numbered overlay.
 - **Candidates** updates after each vision draw and groups alternate readings by region.
+- **Ivrit OCR** shows HASH v1 availability, text, line confidence, crop-relative boxes, and whether
+  the deterministic gate sent or excluded that reading from GPT evidence.
 - **Decision** records the selected transcription, voting method, alternatives, word confidence,
   and visual reasons.
 - **Final** shows the red handwriting overlay; **Logs** shows page-scoped pipeline events.

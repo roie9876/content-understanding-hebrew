@@ -86,8 +86,20 @@ class UploadFormatTests(unittest.TestCase):
 
 
 class ConcurrentJobTests(unittest.TestCase):
-    def test_customer_default_model_is_sol_low(self):
-        self.assertEqual("gpt-5.6-sol", web_app.DEFAULT_MODEL_PROFILE)
+    def test_default_profile_is_gpt54_standard_core4(self):
+        self.assertEqual("gpt-5.4", web_app.DEFAULT_MODEL_PROFILE)
+        self.assertEqual("standard", web_app.DEFAULT_OCR_STRATEGY)
+
+        response = web_app.app.test_client().get("/")
+        html = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn('<option value="gpt-5.4" selected>', html)
+        self.assertIn('<option value="standard" selected>', html)
+        self.assertNotIn('<option value="gpt-5.6-sol" selected>', html)
+        self.assertIn('data-view="ivrit"', html)
+        self.assertIn('<span>Ivrit OCR</span>', html)
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1022,6 +1034,86 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertLess(tightened[0]["box"][1] + tightened[0]["box"][3], 400)
         self.assertGreater(tightened[1]["box"][1], 400)
 
+    def test_black_form_geometry_snaps_oversized_crop_to_handwritten_row(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        for text_y in (245, 265, 285):
+            draw.text((140, text_y), "printed form text " * 8, fill="black")
+        for rule_y in (320, 440, 560, 680):
+            draw.line((100, rule_y, 900, rule_y), fill="black", width=2)
+        for stroke_x, stroke_height in ((220, 66), (340, 78), (510, 62), (690, 72)):
+            draw.line(
+                (stroke_x, 535, stroke_x + 22, 535 - stroke_height),
+                fill="black",
+                width=7,
+            )
+        for stroke_x in (260, 470, 650):
+            draw.line(
+                (stroke_x, 655, stroke_x + 18, 600),
+                fill="black",
+                width=7,
+            )
+        regions = [{"label": "handwritten amount row", "box": [80, 250, 840, 390]}]
+
+        tightened = pipeline.tighten_regions_to_black_ink_rows(page, regions)
+
+        self.assertEqual(1, len(tightened))
+        left, top, width, height = tightened[0]["box"]
+        self.assertGreaterEqual(top, 430)
+        self.assertLessEqual(top + height, 570)
+        self.assertGreater(left, 150)
+        self.assertLess(left + width, 800)
+
+    def test_black_form_geometry_assigns_overlapping_regions_to_distinct_rows(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        for rule_y in (300, 420, 540):
+            draw.line((100, rule_y, 900, rule_y), fill="black", width=2)
+        for row_y in (395, 515):
+            for stroke_x in (220, 360, 520, 700):
+                draw.line(
+                    (stroke_x, row_y, stroke_x + 22, row_y - 62),
+                    fill="black",
+                    width=7,
+                )
+        regions = [
+            {"label": "handwritten row 1", "box": [80, 280, 840, 230]},
+            {"label": "handwritten row 2", "box": [80, 310, 840, 230]},
+        ]
+
+        tightened = pipeline.tighten_regions_to_black_ink_rows(page, regions)
+
+        self.assertEqual(2, len(tightened))
+        first_top = tightened[0]["box"][1]
+        second_top = tightened[1]["box"][1]
+        self.assertLess(first_top, second_top)
+        self.assertGreaterEqual(second_top - first_top, 90)
+
+    def test_black_form_detector_recovers_rows_missing_from_model_detection(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        for rule_y in (180, 300, 420, 540, 660, 780, 900):
+            draw.line((80, rule_y, 920, rule_y), fill="black", width=2)
+        for row_y in (275, 515, 875):
+            for stroke_x in (180, 290, 410, 540, 680, 790):
+                draw.line(
+                    (stroke_x, row_y, stroke_x + 24, row_y - 64),
+                    fill="black",
+                    width=7,
+                )
+        draw.text((150, 335), "printed header", fill="black")
+        draw.text((150, 695), "printed header", fill="black")
+
+        detected = pipeline.detect_black_ink_form_rows(page)
+
+        self.assertEqual(3, len(detected))
+        self.assertEqual([175, 415, 775], [region["box"][1] for region in detected])
+        for region in detected:
+            left, _top, width, height = region["box"]
+            self.assertGreater(left, 100)
+            self.assertLess(left + width, 900)
+            self.assertLessEqual(height, 140)
+
     def test_colored_line_fragments_merge_without_merging_rows(self):
         regions = [
             {"label": "left fragment", "box": [100, 300, 200, 80]},
@@ -1137,6 +1229,186 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(0, responses_call.call_args.kwargs["retries"])
         self.assertEqual(1, responses_call.call_args.kwargs["endpoint_limit"])
 
+    @patch.object(pipeline.requests, "post")
+    def test_ivrit_ocr_sidecar_normalizes_hash_response(self, post):
+        response = Mock()
+        response.json.return_value = {
+            "text": "שלום עולם",
+            "pages": [{
+                "number": 1,
+                "width": 200,
+                "height": 80,
+                "lines": [
+                    {
+                        "text": "שלום",
+                        "confidence": 0.8,
+                        "box": {"x": 100, "y": 5, "width": 80, "height": 30},
+                    },
+                    {
+                        "text": "עולם",
+                        "confidence": 0.6,
+                        "box": {"x": 10, "y": 42, "width": 90, "height": 30},
+                    },
+                ],
+            }],
+        }
+        post.return_value = response
+
+        result = pipeline.ocr_image_with_ivrit(Image.new("RGB", (200, 80), "white"))
+
+        self.assertEqual("complete", result["status"])
+        self.assertEqual("ivrit_hash_v1", result["source"])
+        self.assertEqual("שלום עולם", result["text"])
+        self.assertAlmostEqual(0.7, result["confidence"])
+        self.assertEqual(2, len(result["lines"]))
+        response.raise_for_status.assert_called_once_with()
+        self.assertEqual(
+            (3, pipeline.IVRIT_OCR_TIMEOUT), post.call_args.kwargs["timeout"]
+        )
+        file_name, image_bytes, content_type = post.call_args.kwargs["files"]["file"]
+        self.assertEqual("region.png", file_name)
+        self.assertTrue(image_bytes.startswith(b"\x89PNG"))
+        self.assertEqual("image/png", content_type)
+
+    def test_ivrit_advisory_gate_keeps_only_related_compact_hebrew(self):
+        def evidence(text, lines=1):
+            return {
+                "status": "complete",
+                "text": text,
+                "lines": [
+                    {"text": text, "confidence": 0.99, "box": {}}
+                    for _index in range(lines)
+                ],
+            }
+
+        def vision(text, classification=None):
+            return [{
+                "source": "core4_multi",
+                "ocr": {
+                    "full_transcription": text,
+                    "classification": classification,
+                },
+            }]
+
+        related = pipeline.ivrit_ocr_advisory_gate(
+            evidence("בארותיים"), vision("ירושל״ם"), {"label": "address word"},
+        )
+        mislabeled_related = pipeline.ivrit_ocr_advisory_gate(
+            evidence("בארותיים"),
+            vision("ירושל״ם"),
+            {"label": "handwritten number on second line"},
+        )
+        duplicate = pipeline.ivrit_ocr_advisory_gate(
+            evidence("בארותיים"),
+            vision("בארותיים"),
+            {"label": "handwritten number on second line"},
+        )
+        numeric = pipeline.ivrit_ocr_advisory_gate(
+            evidence("סרעדעפת"), vision("12/7/26"), {"label": "date"},
+        )
+        multiline = pipeline.ivrit_ocr_advisory_gate(
+            evidence("שורה אחת\nשורה שתיים", lines=2),
+            vision("שורה אחת\nשורה אחרת"),
+            {"label": "handwritten paragraph"},
+        )
+        unrelated = pipeline.ivrit_ocr_advisory_gate(
+            evidence("כסף"), vision("ביב[?]"), {"label": "address word"},
+        )
+
+        self.assertTrue(related["eligible"])
+        self.assertTrue(mislabeled_related["eligible"])
+        self.assertGreaterEqual(
+            related["character_agreement"], pipeline.IVRIT_OCR_MIN_AGREEMENT
+        )
+        self.assertEqual("duplicate_of_vision_reading", duplicate["reason"])
+        self.assertFalse(duplicate["eligible"])
+        self.assertEqual("structured_or_numeric_region", numeric["reason"])
+        self.assertEqual("multiline_reading", multiline["reason"])
+        self.assertEqual("unrelated_to_vision_reading", unrelated["reason"])
+        self.assertFalse(numeric["eligible"])
+        self.assertFalse(multiline["eligible"])
+        self.assertFalse(unrelated["eligible"])
+
+    def test_ivrit_candidate_does_not_expose_uncalibrated_confidence(self):
+        candidate = pipeline.ivrit_ocr_candidate({
+            "status": "complete",
+            "text": "בארותיים",
+            "confidence": 0.99,
+            "lines": [{"text": "בארותיים", "confidence": 0.99, "box": {}}],
+            "advisory_gate": {"eligible": True},
+        })
+
+        self.assertIsNotNone(candidate)
+        self.assertNotIn("hash_confidence", candidate["ocr"])
+        self.assertNotIn("confidence", candidate["ocr"]["words"][0])
+
+    def test_ivrit_blue_only_recovers_overlapping_single_line_segmentation(self):
+        image = Image.new("RGB", (220, 110), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((15, 70, 205, 70), fill="black", width=3)
+        draw.text((30, 78), "printed field", fill="black")
+        for left in (35, 70, 105, 140, 175):
+            draw.line((left, 25, left + 15, 72), fill=(35, 75, 190), width=6)
+        isolated = pipeline.prepare_ivrit_blue_only_image(image)
+
+        self.assertIsNotNone(isolated)
+        pixels = list(isolated.getdata())
+        self.assertTrue(any(blue > red + 20 for red, green, blue in pixels))
+        self.assertFalse(any(max(pixel) < 80 for pixel in pixels))
+
+        original = {
+            "status": "complete",
+            "text": "משת פאלר מן\nן",
+            "confidence": 0.92,
+            "lines": [
+                {
+                    "text": "משת פאלר מן",
+                    "confidence": 0.94,
+                    "box": {"x": 0, "y": 10, "width": 200, "height": 70},
+                },
+                {
+                    "text": "ן",
+                    "confidence": 0.88,
+                    "box": {"x": 120, "y": 35, "width": 20, "height": 70},
+                },
+            ],
+        }
+        blue_only = {
+            "status": "complete",
+            "text": "מרטין פאלרמו",
+            "confidence": 0.95,
+            "lines": [{
+                "text": "מרטין פאלרמו",
+                "confidence": 0.95,
+                "box": {"x": 0, "y": 0, "width": 200, "height": 70},
+            }],
+        }
+        vision = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "מוטי פא[?]ר[?]"},
+        }]
+        region = {"label": "handwritten note on line"}
+
+        self.assertTrue(pipeline.should_try_ivrit_blue_only(original, vision, region))
+        selected = pipeline.select_ivrit_preprocessing_variant(
+            original, blue_only, vision, region,
+        )
+        gate = pipeline.ivrit_ocr_advisory_gate(selected, vision, region)
+
+        self.assertEqual("blue_only", selected["selected_variant"])
+        self.assertEqual("מרטין פאלרמו", selected["text"])
+        self.assertEqual("preprocessing_consensus", gate["reason"])
+        self.assertTrue(gate["eligible"])
+        multiline_vision = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "שורה אחת\nשורה שתיים"},
+        }]
+        self.assertFalse(
+            pipeline.should_try_ivrit_blue_only(
+                original, multiline_vision, region,
+            )
+        )
+
     @patch("handwriting_pipeline._responses_call")
     def test_reconciliation_uses_fallbacks_instead_of_hidden_retries(self, responses_call):
         responses_call.return_value = {"final_transcription": "טקסט", "words": []}
@@ -1156,6 +1428,10 @@ class ConcurrentJobTests(unittest.TestCase):
             {"source": "a", "ocr": {"full_transcription": "8 עמינדב"}},
             {"source": "b", "ocr": {"full_transcription": "8 עמינדב"}},
             {"source": "c", "ocr": {"full_transcription": "8 עמיאל"}},
+            {
+                "source": pipeline.IVRIT_OCR_SOURCE,
+                "ocr": {"full_transcription": "מילה שגויה", "advisory": True},
+            },
         ]
 
         pipeline.visual_reconcile_ocr_results([("01_original_crop.png", image)], results)
@@ -1163,6 +1439,24 @@ class ConcurrentJobTests(unittest.TestCase):
         prompt = responses_call.call_args.args[0][0]["text"]
         self.assertIn("Deterministic agreement summary", prompt)
         self.assertIn("8 עמינדב", prompt)
+        self.assertIn("ivrit_hash_v1", prompt)
+        self.assertIn("word error rate is high", prompt)
+        agreement_section = prompt.split(
+            "Deterministic agreement summary across candidates", 1
+        )[1].split("Return ONLY", 1)[0]
+        self.assertNotIn("מילה שגויה", agreement_section)
+
+    @patch.object(pipeline, "_responses_call")
+    def test_visual_adjudication_omits_hash_warning_without_candidate(self, responses_call):
+        responses_call.return_value = {"final_transcription": "שלום", "words": []}
+        pipeline.visual_reconcile_ocr_results(
+            [("01_original_crop.png", Image.new("RGB", (20, 20), "white"))],
+            [{"source": "core4_multi", "ocr": {"full_transcription": "שלום"}}],
+        )
+
+        prompt = responses_call.call_args.args[0][0]["text"]
+        self.assertNotIn("ivrit_hash_v1", prompt)
+        self.assertNotIn("word error rate is high", prompt)
 
     def test_agreement_gate_rejects_single_thickened_name_candidate(self):
         readings = [
@@ -1333,6 +1627,54 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertIs(current, below_floor)
         self.assertEqual("בארותיים", at_floor["final_transcription"])
         self.assertEqual("contextual_recheck", at_floor["decision_status"])
+
+    def test_contextual_recheck_cannot_override_exact_cross_engine_agreement(self):
+        current = {
+            "classification": "handwritten_text",
+            "final_transcription": "בארותיים",
+            "words": [],
+            "notes": ["visual reconciliation"],
+        }
+        recheck = {
+            "classification": "handwritten_text",
+            "field_type": "address",
+            "final_transcription": "אורנים",
+            "confidence": 0.69,
+            "alternative_transcriptions": ["אורנית[?]"],
+        }
+        accepted = pipeline.accept_contextual_recheck(current, recheck)
+        vision = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "בארותיים"},
+        }]
+        ivrit = {
+            "status": "complete",
+            "source": pipeline.IVRIT_OCR_SOURCE,
+            "text": "בארותיים",
+            "selected_variant": "original",
+        }
+
+        protected = pipeline.protect_contextual_recheck_with_cross_engine_agreement(
+            current, recheck, accepted, vision, ivrit,
+        )
+
+        self.assertEqual("בארותיים", protected["final_transcription"])
+        self.assertEqual(
+            "cross_engine_agreement_protected", protected["decision_status"]
+        )
+        self.assertIn("אורנים", protected["alternative_transcriptions"])
+        self.assertTrue(protected["needs_review"])
+        self.assertEqual(
+            ["core4_multi"],
+            protected["cross_engine_agreement"]["vision_supporting_sources"],
+        )
+
+        unrelated_ivrit = {**ivrit, "text": "כסף"}
+        unprotected = pipeline.protect_contextual_recheck_with_cross_engine_agreement(
+            current, recheck, accepted, vision, unrelated_ivrit,
+        )
+        self.assertEqual("אורנים", unprotected["final_transcription"])
+        self.assertEqual("contextual_recheck", unprotected["decision_status"])
 
     def test_repeated_structured_field_uses_stronger_one_digit_match(self):
         regions = [
@@ -1638,6 +1980,164 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("isolated_multiview_consensus", region["decision_status"])
         self.assertTrue((output_dir / region["folder"] / "result.json").exists())
         visual_reconcile.assert_not_called()
+
+    def test_standard_pipeline_persists_ivrit_advisory_evidence(self):
+        input_path = self.output_dir / "region.png"
+        Image.new("RGB", (120, 80), "white").save(input_path)
+        output_dir = self.output_dir / "ivrit-output"
+        gpt_read = {
+            "classification": "handwritten_text",
+            "full_transcription": "שלם",
+            "words": [],
+        }
+        ivrit_read = {
+            "status": "complete",
+            "source": pipeline.IVRIT_OCR_SOURCE,
+            "model": "HASH v1",
+            "text": "שלום",
+            "confidence": 0.42,
+            "lines": [{
+                "text": "שלום",
+                "confidence": 0.42,
+                "box": {"x": 10, "y": 12, "width": 80, "height": 30},
+            }],
+            "raw_response": {"text": "שלום", "pages": []},
+        }
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "שלום",
+            "words": [],
+            "notes": [],
+        }
+
+        with patch.object(pipeline, "OCR_STRATEGY", "standard"), \
+             patch.object(pipeline, "detect_handwriting_regions", return_value=[{
+                 "label": "handwritten word", "box": [0, 0, 120, 80],
+             }]), \
+             patch.object(pipeline, "ivrit_ocr_service_status", return_value=(True, "ready")), \
+             patch.object(pipeline, "ocr_image_with_ivrit", return_value=ivrit_read), \
+             patch.object(pipeline, "ocr_image_set", return_value=gpt_read), \
+             patch.object(pipeline, "should_contextual_recheck", return_value=False), \
+             patch.object(
+                 pipeline, "visual_reconcile_ocr_results", return_value=final,
+             ) as visual_reconcile:
+            return_code = pipeline.run_pipeline(
+                str(input_path),
+                page=1,
+                dpi=400,
+                crops=None,
+                output_dir=str(output_dir),
+                chunk_width=900,
+                overlap=150,
+                ocr_mode="full",
+                auto_detect=True,
+                merge_md=False,
+            )
+
+        self.assertEqual(0, return_code)
+        reconciliation_results = visual_reconcile.call_args.args[1]
+        self.assertEqual(
+            ["core4_multi", pipeline.IVRIT_OCR_SOURCE],
+            [result["source"] for result in reconciliation_results],
+        )
+        region_dir = next(output_dir.glob("region_*"))
+        saved_ivrit = json.loads((region_dir / "ivrit_ocr.json").read_text())
+        saved_result = json.loads((region_dir / "result.json").read_text())
+        saved_progress = json.loads((output_dir / "ocr_progress.json").read_text())
+        self.assertEqual("שלום", saved_ivrit["text"])
+        self.assertTrue(saved_ivrit["advisory_gate"]["eligible"])
+        self.assertEqual("שלום", saved_result["ivrit_ocr"]["text"])
+        self.assertEqual("שלום", saved_progress["regions"][0]["ivrit_ocr"]["text"])
+        self.assertEqual(1, len(saved_result["per_image"]))
+
+    def test_standard_pipeline_retries_overlapping_hash_lines_with_blue_only(self):
+        input_path = self.output_dir / "blue-form.png"
+        image = Image.new("RGB", (220, 110), "white")
+        draw = ImageDraw.Draw(image)
+        draw.line((10, 72, 210, 72), fill="black", width=3)
+        draw.text((25, 80), "printed field", fill="black")
+        for left in (30, 65, 100, 135, 170):
+            draw.line((left, 22, left + 15, 75), fill=(35, 75, 190), width=6)
+        image.save(input_path)
+        output_dir = self.output_dir / "ivrit-blue-output"
+        original = {
+            "status": "complete",
+            "source": pipeline.IVRIT_OCR_SOURCE,
+            "model": "HASH v1",
+            "text": "משת פאלר מן\nן",
+            "confidence": 0.92,
+            "lines": [
+                {
+                    "text": "משת פאלר מן",
+                    "confidence": 0.94,
+                    "box": {"x": 0, "y": 10, "width": 200, "height": 70},
+                },
+                {
+                    "text": "ן",
+                    "confidence": 0.88,
+                    "box": {"x": 120, "y": 35, "width": 20, "height": 70},
+                },
+            ],
+        }
+        blue_only = {
+            "status": "complete",
+            "source": pipeline.IVRIT_OCR_SOURCE,
+            "model": "HASH v1",
+            "text": "מרטין פאלרמו",
+            "confidence": 0.95,
+            "lines": [{
+                "text": "מרטין פאלרמו",
+                "confidence": 0.95,
+                "box": {"x": 0, "y": 0, "width": 200, "height": 70},
+            }],
+        }
+        core = {
+            "classification": "handwritten_text",
+            "full_transcription": "מוטי פא[?]ר[?]",
+            "words": [],
+        }
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "מרטין פאלרמו",
+            "words": [],
+            "notes": [],
+        }
+
+        with patch.object(pipeline, "OCR_STRATEGY", "standard"), \
+             patch.object(pipeline, "detect_handwriting_regions", return_value=[{
+                 "label": "handwritten note on line", "box": [0, 0, 220, 110],
+             }]), \
+             patch.object(pipeline, "ivrit_ocr_service_status", return_value=(True, "ready")), \
+             patch.object(
+                 pipeline, "ocr_image_with_ivrit", side_effect=[original, blue_only],
+             ) as ivrit_ocr, \
+             patch.object(pipeline, "ocr_image_set", return_value=core), \
+             patch.object(pipeline, "should_contextual_recheck", return_value=False), \
+             patch.object(
+                 pipeline, "visual_reconcile_ocr_results", return_value=final,
+             ) as visual_reconcile:
+            return_code = pipeline.run_pipeline(
+                str(input_path),
+                page=1,
+                dpi=400,
+                crops=None,
+                output_dir=str(output_dir),
+                chunk_width=900,
+                overlap=150,
+                ocr_mode="full",
+                auto_detect=True,
+                merge_md=False,
+            )
+
+        self.assertEqual(0, return_code)
+        self.assertEqual(2, ivrit_ocr.call_count)
+        region_dir = next(output_dir.glob("region_*"))
+        saved = json.loads((region_dir / "ivrit_ocr.json").read_text())
+        self.assertEqual("blue_only", saved["selected_variant"])
+        self.assertEqual("מרטין פאלרמו", saved["text"])
+        self.assertEqual("preprocessing_consensus", saved["advisory_gate"]["reason"])
+        reconciliation_results = visual_reconcile.call_args.args[1]
+        self.assertEqual("מרטין פאלרמו", reconciliation_results[-1]["ocr"]["full_transcription"])
 
     def test_responses_url_accepts_base_or_full_url(self):
         self.assertEqual(

@@ -116,7 +116,7 @@ MODEL_PROFILES = {
         },
     },
 }
-DEFAULT_MODEL_PROFILE = "gpt-5.6-sol"
+DEFAULT_MODEL_PROFILE = "gpt-5.4"
 DEFAULT_OCR_STRATEGY = "standard"
 OCR_STRATEGIES = {
     "standard": {"label": "Standard core4 + visual reconciliation"},

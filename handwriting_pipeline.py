@@ -2498,16 +2498,135 @@ Return JSON only:
         {"type": "input_text", "text": "Full page with the same target rectangle:"},
         {"type": "input_image", "image_url": _to_data_uri(highlighted_page)},
     ])
-    result = _responses_call(
-        content, retries=0, max_tokens=8000, reasoning="high"
-    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                _responses_call,
+                content,
+                retries=0,
+                max_tokens=8000,
+                reasoning="high",
+                seed=1701 + index,
+                endpoint_limit=1,
+            )
+            for index in range(2)
+        ]
+        audits = []
+        for future in futures:
+            try:
+                audits.append(future.result())
+            except Exception as exc:
+                audits.append({
+                    "script": "error",
+                    "_error": str(exc),
+                })
+    result = combine_script_conflict_audits(audits)
     return result, images
+
+
+def combine_script_conflict_audits(audits: list[dict]) -> dict:
+    """Emit text only when two candidate-blind Hebrew audits exactly agree."""
+    all_audits = [audit for audit in audits if isinstance(audit, dict)]
+    usable = [audit for audit in all_audits if not audit.get("_error")]
+    if not usable:
+        return {
+            "script": "unknown",
+            "script_consensus": "unavailable",
+            "classification": "handwritten_text",
+            "field_type": "unknown",
+            "final_transcription": "[?]",
+            "confidence": 0.0,
+            "alternative_transcriptions": [],
+            "words": [],
+            "notes": [
+                "both candidate-blind script audits failed after an independent Hebrew conflict"
+            ],
+            "script_audits": all_audits,
+        }
+    hebrew = [
+        audit for audit in usable
+        if str(audit.get("script") or "").lower() == "hebrew"
+        and audit.get("classification") == "handwritten_text"
+    ]
+    if not hebrew:
+        combined = dict(usable[0])
+        combined["script_consensus"] = "non_hebrew"
+        combined["script_audits"] = all_audits
+        return combined
+    if len(hebrew) != len(usable):
+        alternatives = [
+            str(audit.get("final_transcription") or "").strip()
+            for audit in usable
+            if str(audit.get("final_transcription") or "").strip()
+        ]
+        return {
+            "script": "mixed",
+            "script_consensus": "disagreed",
+            "classification": "handwritten_text",
+            "field_type": "unknown",
+            "final_transcription": "[?]",
+            "confidence": 0.0,
+            "alternative_transcriptions": list(dict.fromkeys(alternatives)),
+            "words": [],
+            "notes": ["candidate-blind audits disagreed on script"],
+            "script_audits": all_audits,
+        }
+
+    texts = [" ".join(str(audit.get("final_transcription") or "").split()) for audit in hebrew]
+    confidences = [float(audit.get("confidence", 0.0) or 0.0) for audit in hebrew]
+    exact_agreement = (
+        len(usable) == 2
+        and
+        texts[0]
+        and all(text == texts[0] for text in texts)
+        and "[?]" not in texts[0]
+        and min(confidences) >= 0.55
+    )
+    if exact_agreement:
+        combined = dict(hebrew[0])
+        combined["final_transcription"] = texts[0]
+        combined["confidence"] = min(confidences)
+        combined["script_consensus"] = "exact"
+        combined["script_audits"] = all_audits
+        combined.setdefault("notes", []).append(
+            "two independent candidate-blind audits exactly agreed"
+        )
+        return combined
+
+    alternatives = []
+    for audit in hebrew:
+        for text in [
+            audit.get("final_transcription"),
+            *(audit.get("alternative_transcriptions") or []),
+        ]:
+            text = str(text or "").strip()
+            if text and text not in alternatives:
+                alternatives.append(text)
+    field_types = {
+        str(audit.get("field_type") or "").lower() for audit in hebrew
+    }
+    return {
+        "script": "hebrew",
+        "script_consensus": "script_only",
+        "classification": "handwritten_text",
+        "field_type": field_types.pop() if len(field_types) == 1 else "unknown",
+        "final_transcription": "[?]",
+        "confidence": 0.0,
+        "alternative_transcriptions": alternatives,
+        "words": [],
+        "notes": [
+            "candidate-blind audits agree on Hebrew script but disagree on exact letters"
+        ],
+        "script_audits": all_audits,
+    }
 
 
 def accept_hebrew_numeric_script_recheck(current: dict, recheck: dict) -> dict:
     """Replace numeric text only with a confident candidate-blind Hebrew field read."""
     text = str(recheck.get("final_transcription") or "").strip()
     if (
+        recheck.get("script_consensus") != "exact"
+        or
         str(recheck.get("script") or "").lower() != "hebrew"
         or recheck.get("classification") != "handwritten_text"
         or str(recheck.get("field_type") or "").lower()
@@ -2538,12 +2657,21 @@ def preserve_uncertain_hebrew_script_conflict(
 ) -> dict:
     """Do not retain numeric text after a credible audit identifies Hebrew script."""
     text = str(recheck.get("final_transcription") or "").strip()
+    unresolved_consensus = recheck.get("script_consensus") in {
+        "script_only", "disagreed", "unavailable",
+    }
     if (
-        str(recheck.get("script") or "").lower() != "hebrew"
+        str(recheck.get("script") or "").lower()
+        not in {"hebrew", "mixed", "unknown"}
         or recheck.get("classification") != "handwritten_text"
-        or len(_hebrew_letter_sequence(text)) < 3
-        or re.search(r"\d", text)
-        or float(recheck.get("confidence", 0.0) or 0.0) < 0.35
+        or (
+            not unresolved_consensus
+            and (
+                len(_hebrew_letter_sequence(text)) < 3
+                or re.search(r"\d", text)
+                or float(recheck.get("confidence", 0.0) or 0.0) < 0.35
+            )
+        )
     ):
         return current
     unresolved = dict(recheck)

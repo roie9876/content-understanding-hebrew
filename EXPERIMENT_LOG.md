@@ -897,17 +897,21 @@ or reliability.
   only independent evidence that the region may be Hebrew while leaving the original Core4
   numeric mistake unchanged.
 - **Change**: Before ordinary context, numeric-only Core4 output plus substantial Hebrew HASH
-  evidence can trigger a high-reasoning candidate-blind audit. It receives original, blue-only,
-  local-context, and full-page images but no OCR strings. A Hebrew `name/address/free_text` result
-  at confidence >=0.55 may replace the digits. A credible Hebrew result at confidence >=0.35 is
-  retained with uncertainty and `needs_review`; false digits remain only as an alternative.
+  evidence can trigger two high-reasoning candidate-blind audits. Each uses one separate endpoint
+  and receives original, blue-only, local-context, and full-page images but no OCR strings. A
+  Hebrew `name/address/free_text` value is emitted only when both audits exactly agree and both
+  confidences are >=0.55. Hebrew-text disagreement, Hebrew-vs-numeric disagreement, one Hebrew
+  result plus a timeout, or two endpoint timeouts produce `[?]`, `needs_review`, and preserved raw
+  audit diagnostics; false digits remain only as an alternative. Numeric-only audit evidence may
+  retain the numeric result.
 - **Safety gate**: Trigger only for strong name-slot labels, or generic colored handwriting with
   at least three HASH line fragments; exclude dates, phone/email/account/reference/ID, signatures,
   marks, amounts, totals, numbers, and codes. Eight-document saved-run replay triggered exactly
   one of 77 emitted regions: this failing field.
-- **Candidate-blind probe**: Without golden text or prior OCR candidates, the audit classified the
-  strokes as Hebrew `name` and returned `ב[?]לין` at 0.39. Exact letters remain unresolved, but the
-  false numeric output is no longer represented as confident text.
+- **Candidate-blind probes**: Without golden text or prior OCR candidates, separate audits
+  classified the strokes as Hebrew `name` but disagreed on the actual name (`ב[?]לין` versus
+  `יובל אלון`). A later endpoint-isolated probe encountered two timeouts. Both conditions now
+  resolve to `[?]` plus review rather than either false digits or a plausible unsupported name.
 - **Decision**: Keep HASH enabled as the conflict signal. Prefer honest uncertain Hebrew plus
   review over a confidently wrong numeric transcription.
 

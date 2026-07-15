@@ -535,10 +535,12 @@ high-reasoning reread is even narrower: it runs only when non-signature text rem
 blind vision reads are also empty; their diagnostics remain in `rejected_regions`.
 
 When Core4 returns only digits but independent HASH output contains substantial Hebrew in a
-name/text slot, the pipeline performs a candidate-blind script audit before the normal contextual
-reread. It sends the tight crop, blue-only support, larger context, and highlighted page without
-either OCR candidate. A confident Hebrew name replaces the digits; a lower-confidence but credible
-Hebrew result is emitted with `[?]` and `needs_review` instead of preserving false numeric text.
+name/text slot, the pipeline performs two independent candidate-blind script audits before the
+normal contextual reread. Each audit uses one model endpoint and receives the tight crop, blue-only
+support, larger context, and highlighted page without either OCR candidate. A Hebrew name is emitted
+only when both audits exactly agree at sufficient confidence. Hebrew disagreement, mixed-script
+disagreement, a partial timeout with one Hebrew result, or two endpoint timeouts emit `[?]` with
+`needs_review` instead of preserving false numeric text or inventing a plausible name.
 The audit is intentionally narrow: strong name-slot labels, or a generic colored-handwriting label
 with at least three overlapping HASH fragments. Dates, accounts, amounts, IDs, and normal numeric
 fields are excluded.

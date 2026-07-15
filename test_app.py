@@ -1796,12 +1796,16 @@ class ConcurrentJobTests(unittest.TestCase):
             for item in responses_call.call_args.args[0]
             if item.get("type") == "input_text"
         )
-        self.assertEqual(response, result)
+        self.assertEqual("exact", result["script_consensus"])
+        self.assertEqual("דנית ראובן", result["final_transcription"])
+        self.assertEqual(2, responses_call.call_count)
         self.assertIn("NO prior OCR strings", prompt_text)
         self.assertNotIn("1242 13", prompt_text)
         self.assertIn("context", images)
         self.assertIn("page", images)
-        self.assertEqual("high", responses_call.call_args.kwargs["reasoning"])
+        for call in responses_call.call_args_list:
+            self.assertEqual("high", call.kwargs["reasoning"])
+            self.assertEqual(1, call.kwargs["endpoint_limit"])
 
     def test_script_conflict_acceptance_requires_confident_hebrew_name(self):
         current = {
@@ -1811,6 +1815,7 @@ class ConcurrentJobTests(unittest.TestCase):
         }
         accepted = pipeline.accept_hebrew_numeric_script_recheck(current, {
             "script": "hebrew",
+            "script_consensus": "exact",
             "classification": "handwritten_text",
             "field_type": "name",
             "final_transcription": "דנית ראובן",
@@ -1827,6 +1832,7 @@ class ConcurrentJobTests(unittest.TestCase):
         for rejected in (
             {
                 "script": "numeric",
+                "script_consensus": "disagreed",
                 "classification": "handwritten_text",
                 "field_type": "numeric",
                 "final_transcription": "1242 13",
@@ -1834,6 +1840,7 @@ class ConcurrentJobTests(unittest.TestCase):
             },
             {
                 "script": "hebrew",
+                "script_consensus": "exact",
                 "classification": "handwritten_text",
                 "field_type": "name",
                 "final_transcription": "בן כהן",
@@ -1841,6 +1848,7 @@ class ConcurrentJobTests(unittest.TestCase):
             },
             {
                 "script": "hebrew",
+                "script_consensus": "exact",
                 "classification": "handwritten_text",
                 "field_type": "name",
                 "final_transcription": "דנית 13",
@@ -1860,6 +1868,7 @@ class ConcurrentJobTests(unittest.TestCase):
         }
         recheck = {
             "script": "hebrew",
+            "script_consensus": "script_only",
             "classification": "handwritten_text",
             "field_type": "name",
             "final_transcription": "ב[?]לין",
@@ -1878,9 +1887,81 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertIs(
             current,
             pipeline.preserve_uncertain_hebrew_script_conflict(
-                current, {**recheck, "confidence": 0.34}
+                current,
+                {
+                    **recheck,
+                    "script_consensus": None,
+                    "confidence": 0.34,
+                },
             ),
         )
+
+    def test_script_conflict_audits_emit_text_only_on_exact_agreement(self):
+        first = {
+            "script": "hebrew",
+            "classification": "handwritten_text",
+            "field_type": "name",
+            "final_transcription": "ב[?]לין",
+            "confidence": 0.39,
+            "alternative_transcriptions": [],
+        }
+        second = {
+            "script": "hebrew",
+            "classification": "handwritten_text",
+            "field_type": "name",
+            "final_transcription": "יובל אלון",
+            "confidence": 0.68,
+            "alternative_transcriptions": [],
+        }
+
+        disagreed = pipeline.combine_script_conflict_audits([first, second])
+        agreed = pipeline.combine_script_conflict_audits([
+            {**second, "confidence": 0.72},
+            {**second, "confidence": 0.61},
+        ])
+        partial = pipeline.combine_script_conflict_audits([
+            second,
+            {"script": "error", "_error": "read timeout"},
+        ])
+        numeric = {
+            "script": "numeric",
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "final_transcription": "1242 13",
+            "confidence": 0.81,
+        }
+        mixed = pipeline.combine_script_conflict_audits([second, numeric])
+        numeric_partial = pipeline.combine_script_conflict_audits([
+            numeric,
+            {"script": "error", "_error": "read timeout"},
+        ])
+        unavailable = pipeline.combine_script_conflict_audits([
+            {"script": "error", "_error": "primary timeout"},
+            {"script": "error", "_error": "secondary timeout"},
+        ])
+
+        self.assertEqual("script_only", disagreed["script_consensus"])
+        self.assertEqual("[?]", disagreed["final_transcription"])
+        self.assertIn("ב[?]לין", disagreed["alternative_transcriptions"])
+        self.assertIn("יובל אלון", disagreed["alternative_transcriptions"])
+        self.assertEqual("exact", agreed["script_consensus"])
+        self.assertEqual("יובל אלון", agreed["final_transcription"])
+        self.assertEqual(0.61, agreed["confidence"])
+        self.assertEqual("script_only", partial["script_consensus"])
+        self.assertEqual("[?]", partial["final_transcription"])
+        self.assertEqual("read timeout", partial["script_audits"][1]["_error"])
+        self.assertEqual("disagreed", mixed["script_consensus"])
+        self.assertEqual("[?]", mixed["final_transcription"])
+        self.assertEqual("non_hebrew", numeric_partial["script_consensus"])
+        self.assertEqual("1242 13", numeric_partial["final_transcription"])
+        self.assertEqual("unavailable", unavailable["script_consensus"])
+        self.assertEqual("[?]", unavailable["final_transcription"])
+        suppressed = pipeline.preserve_uncertain_hebrew_script_conflict(
+            numeric,
+            unavailable,
+        )
+        self.assertEqual("[?]", suppressed["final_transcription"])
+        self.assertEqual("script_conflict_unresolved", suppressed["decision_status"])
 
     def test_eligible_ivrit_candidate_breaks_visual_tie(self):
         final = {

@@ -101,10 +101,11 @@ fallbacks. Its uncalibrated model confidence is never sent to GPT. If the servic
 absent, or times out, the normal GPT pipeline continues unchanged.
 
 Contextual rereads may use nearby printed labels to understand a field, but they cannot replace an
-exact transcription independently supported by the visual decision, a faithful Core4 candidate,
-and HASH. A conflicting contextual reading is retained as an alternative, the selected visual text
-is preserved, and the region is marked for review. This prevents semantic labels such as `עיר`
-(`city`) from turning agreed visible strokes into a more familiar place name.
+exact transcription independently supported by the visual decision and an eligible HASH reading.
+Core4 must either agree exactly or have supplied the measured character correlation that admitted
+HASH through the advisory gate. A conflicting contextual reading is retained as an alternative,
+the selected visual text is preserved, and the region is marked for review. This prevents semantic
+labels such as `עיר` (`city`) from turning agreed visible strokes into a more familiar place name.
 
 For compact blue handwriting, InkSight also detects a specific segmentation failure: HASH returns
 multiple vertically overlapping lines while Core4 sees one nonnumeric Hebrew line. Only in that
@@ -418,7 +419,9 @@ Two later quality experiments are retained but disabled by default:
 
 GPT-5.4 can use a two-endpoint pool configured locally in `.env`.
 
-The UI also offers high-cost experimental `Claude Opus 4.8 · GitHub Copilot SDK`. It uses the
+The UI also offers high-cost experimental
+`Claude Opus 4.8 · GitHub Copilot SDK · Core4`. It uses the standard four-view Core4 OCR call and
+visual reconciliation through the
 official `@github/copilot-sdk` Node package and image blob attachments, not an Azure/model API
 endpoint. Set `COPILOT_GITHUB_USER` to a login whose `gh` authentication has Opus 4.8 enabled,
 then run `npm install`. The app obtains that account's token with `gh auth token --user`, passes it
@@ -500,12 +503,50 @@ structural verdict:
 
 ```bash
 python3 compare_golden.py         # regression check: current output vs golden
-python3 compare_golden.py --run   # re-run the 3 samples, then compare
+python3 compare_golden.py --run   # re-run all registered samples, then compare
 ```
 
 The comparator fails only on **structural** regressions (missing/empty regions, count change)
 or a **stable** field (dates, numbers, IDs, emails) changing; volatile cursive/`[?]` fields
 are reported but never failed, since the model rewords them run-to-run.
+
+For deterministic quality-rule development, `quality_replay.py` reapplies current detector
+deduplication, HASH selection, numeric/date consensus, signature geometry, and output filtering to
+saved OCR evidence. It makes no model calls and loads golden answers only after all transformations:
+
+```bash
+python3 quality_replay.py \
+  --run 'חיוב חשבון1=analysis_results/חיוב חשבון1.pdf__2026-07-15_09-58-19' \
+  --run 'דוח_יוסי=analysis_results/דוח_יוסי.pdf__2026-07-15_11-27-12'
+```
+
+Repeat `--run 'GOLDEN_STEM=SAVED_RUN_DIR'` for any set of documents; add `--json` for
+machine-readable output. The final eight-document replay improved strict exact text from
+20/70 to 31/70, mean similarity from 0.646 to 0.704, and non-text classification from 5/7 to
+7/7. On the two newly evaluated documents, current deterministic rules produce 3/3 exact fields
+for `חוזר מכר` and retain the one unresolved `פרוטוקול` date without inventing a correction.
+
+CU text used by deterministic numeric reconciliation is kept separate from model-facing nearby
+context. A unique one-edit CU token may repair a typed numeric field after visual adjudication;
+CU is not inserted into the model prompt unless `OCR_NEARBY_CU_CONTEXT=1`. A second
+high-reasoning reread is even narrower: it runs only when non-signature text remains explicitly
+`[?]` with no resolved characters, and accepts only Hebrew `handwritten_text` at confidence
+`>=0.70`. Empty `no_handwriting` detections are omitted from exported/merged regions only when all
+blind vision reads are also empty; their diagnostics remain in `rejected_regions`.
+
+For crop/detection changes, run the detector without OCR or reconciliation. It matches current
+boxes against human text-region geometry, supports tight crops inside older broad/overlapping
+golden boxes, and fails on missed regions, excessive extras, or large center drift:
+
+```bash
+python3 detection_regression.py
+python3 detection_regression.py --stem "דוח_כחלון" --stem "דוח_אלעד"
+```
+
+The command writes an ignored report plus detector overlays under `analysis_results/`. A local
+`golden/<document>/detection_regions.json` may define detection-only targets without storing or
+inventing OCR text. Golden geometry remains evaluation-only and is never read by the runtime
+pipeline.
 
 ### Full-agent model benchmark
 

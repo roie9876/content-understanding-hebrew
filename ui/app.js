@@ -41,6 +41,7 @@ let loadedContentUrl = null;
 let diagnosticRequest = 0;
 let goldenRequest = 0;
 let processZoom = Number(localStorage.getItem("inkSightProcessZoom")) || 100;
+const JOB_POLL_INTERVAL_MS = 15000;
 
 function setProcessZoom(percent, persist = true) {
   processZoom = Math.max(50, Math.min(200, Math.round(percent / 25) * 25));
@@ -487,8 +488,20 @@ function renderLogs(diagnostics) {
 
 async function showAdminView(page) {
   const requestId = ++diagnosticRequest;
+  const scrollTop = resultCanvas.scrollTop;
+  const scrollLeft = resultCanvas.scrollLeft;
+  const hadRegionDetails = Boolean(
+    adminOutput.querySelector(".region-diagnostic"),
+  );
+  const openRegions = new Set(
+    [...adminOutput.querySelectorAll(".region-diagnostic[open]")]
+      .map((details) => details.querySelector(".region-index")?.textContent)
+      .filter(Boolean),
+  );
   adminOutput.hidden = false;
-  adminOutput.replaceChildren(createElement("div", "admin-empty", "Loading page diagnostics…"));
+  if (!adminOutput.children.length) {
+    adminOutput.replaceChildren(createElement("div", "admin-empty", "Loading page diagnostics…"));
+  }
   try {
     const response = await fetch(`${page.diagnostics_url}?t=${Date.now()}`);
     if (!response.ok) throw new Error("Diagnostics unavailable");
@@ -500,6 +513,14 @@ async function showAdminView(page) {
     if (activeView === "ivrit") renderIvritOcr(diagnostics);
     if (activeView === "decision") renderDecision(diagnostics);
     if (activeView === "logs") renderLogs(diagnostics);
+    if (hadRegionDetails) {
+      adminOutput.querySelectorAll(".region-diagnostic").forEach((details) => {
+        const region = details.querySelector(".region-index")?.textContent;
+        details.open = Boolean(region && openRegions.has(region));
+      });
+    }
+    resultCanvas.scrollTop = scrollTop;
+    resultCanvas.scrollLeft = scrollLeft;
   } catch (error) {
     if (requestId === diagnosticRequest) {
       adminOutput.replaceChildren(createElement("div", "admin-empty", error.message));
@@ -619,7 +640,7 @@ async function analyzeSelectedPages() {
 function schedulePoll() {
   clearTimeout(pollTimer);
   if (!activeJob || ["complete", "failed", "cancelled"].includes(activeJob.status)) return;
-  pollTimer = setTimeout(pollJob, 1000);
+  pollTimer = setTimeout(pollJob, JOB_POLL_INTERVAL_MS);
 }
 
 async function pollJob() {

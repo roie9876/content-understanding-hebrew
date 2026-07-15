@@ -94,11 +94,12 @@ MODEL_PROFILES = {
         },
     },
     "copilot-claude-opus-4.8": {
-        "label": "Claude Opus 4.8 · GitHub Copilot SDK (high cost, experimental)",
+        "label": "Claude Opus 4.8 · GitHub Copilot SDK · Core4 (high cost, experimental)",
         "endpoint": "copilot-sdk://local",
         "deployment": "claude-opus-4.8",
         "environment": {
             "MODEL_BACKEND": "github-copilot-sdk",
+            "OCR_MULTI_IMAGE": "1",
             "GPT_REASONING": "high",
             "OCR_REASONING": "high",
             "GPT_READ_TIMEOUT": "180",

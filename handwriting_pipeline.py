@@ -1836,6 +1836,99 @@ def _information_text(text: str) -> str:
     return re.sub(r"[^\w\u0590-\u05ff]", "", (text or "").replace("[?]", ""))
 
 
+def prefer_eligible_ivrit_candidate(final: dict, evidence: dict) -> dict:
+    """Use HASH only after the existing vision-correlation gate admitted it."""
+    gate = evidence.get("advisory_gate") or {}
+    ivrit_text = str(evidence.get("text") or "").strip()
+    current_text = str(final.get("final_transcription") or "").strip()
+    if (
+        evidence.get("status") != "complete"
+        or not gate.get("eligible")
+        or not ivrit_text
+        or _information_text(ivrit_text) == _information_text(current_text)
+    ):
+        return final
+    if final.get("classification") not in (None, "handwritten_text"):
+        return final
+
+    selected = dict(final)
+    selected["final_transcription"] = ivrit_text
+    selected["classification"] = "handwritten_text"
+    alternatives = selected.setdefault("alternative_transcriptions", [])
+    if current_text and current_text != ivrit_text and current_text not in alternatives:
+        alternatives.insert(0, current_text)
+    selected.setdefault("notes", []).append(
+        "eligible HASH tie-break: selected independently gated compact Hebrew evidence"
+    )
+    selected["needs_review"] = bool(final.get("needs_review"))
+    selected["decision_status"] = "ivrit_eligible_tiebreak"
+    selected["ivrit_tiebreak"] = {
+        "rejected_transcription": current_text,
+        "reason": gate.get("reason"),
+        "vision_source": gate.get("vision_source"),
+        "character_agreement": gate.get("character_agreement"),
+        "selected_variant": evidence.get("selected_variant", "original"),
+    }
+    return selected
+
+
+def separate_numeric_field_marks(final: dict) -> dict:
+    """Keep standalone X marks out of otherwise numeric transcription."""
+    if str(final.get("field_type") or "").lower() != "numeric":
+        return final
+    text = str(final.get("final_transcription") or "")
+    if not re.search(r"(?<!\w)[xX×](?!\w)", text):
+        return final
+    numeric_text = " ".join(
+        re.sub(r"(?<!\w)[xX×](?!\w)", " ", text).split()
+    )
+    if not _numeric_sequence(numeric_text):
+        return final
+
+    separated = dict(final)
+    separated["final_transcription"] = numeric_text
+    marks = separated.setdefault("marks", [])
+    if "x" not in marks:
+        marks.append("x")
+    alternatives = separated.setdefault("alternative_transcriptions", [])
+    if text not in alternatives:
+        alternatives.insert(0, text)
+    separated.setdefault("notes", []).append(
+        "structured mark separation: moved standalone X out of numeric text"
+    )
+    separated["decision_status"] = "structured_mark_separation"
+    return separated
+
+
+def normalize_numeric_s_homoglyph(final: dict) -> dict:
+    """Interpret S as 5 only when the entire OCR result is numeric-like."""
+    text = str(final.get("final_transcription") or "")
+    cleaned = text.replace("[?]", "")
+    letters = re.findall(r"[A-Za-z]", cleaned)
+    if (
+        not letters
+        or any(letter not in {"S", "s"} for letter in letters)
+        or len(re.findall(r"\d", cleaned)) < 4
+        or re.search(r"[\u0590-\u05ff]", cleaned)
+    ):
+        return final
+    remainder = re.sub(r"[Ss\d\s,./:_-]", "", cleaned)
+    if remainder:
+        return final
+
+    normalized_text = re.sub(r"[Ss]", "5", text)
+    normalized = dict(final)
+    normalized["final_transcription"] = normalized_text
+    alternatives = normalized.setdefault("alternative_transcriptions", [])
+    if text not in alternatives:
+        alternatives.insert(0, text)
+    normalized.setdefault("notes", []).append(
+        "numeric homoglyph normalization: interpreted S-shaped glyphs as 5"
+    )
+    normalized["decision_status"] = "numeric_homoglyph_normalization"
+    return normalized
+
+
 def _structured_result_confidence(final: dict) -> float:
     if final.get("confidence") is not None:
         return float(final.get("confidence") or 0.0)
@@ -1849,7 +1942,8 @@ def _structured_result_confidence(final: dict) -> float:
 def reconcile_repeated_structured_fields(finals: list[dict], regions: list[dict]) -> list[dict]:
     """Use a stronger duplicate identifier to repair one-digit OCR drift."""
     position_words = re.compile(
-        r"\b(?:top|bottom|upper|lower|middle|left|right|form|handwritten|entry)\b",
+        r"\b(?:top|bottom|upper|lower|middle|left|right|form|handwritten|entry|"
+        r"next|below|above|line|table|on|in)\b",
         re.I,
     )
     identifier_words = re.compile(r"\b(?:account|customer|reference|identifier|number|id)\b", re.I)
@@ -1902,6 +1996,230 @@ def reconcile_repeated_structured_fields(finals: list[dict], regions: list[dict]
                     "loser_confidence": loser_confidence,
                 }
                 reconciled[loser_index] = loser
+    return reconciled
+
+
+def _date_values(value: object) -> list[str]:
+    pattern = re.compile(
+        r"(?<!\d)(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})(?!\d)"
+    )
+    found: list[str] = []
+
+    def collect(item: object) -> None:
+        if isinstance(item, str):
+            found.extend("/".join(match) for match in pattern.findall(item))
+        elif isinstance(item, dict):
+            for nested in item.values():
+                collect(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                collect(nested)
+
+    collect(value)
+    return found
+
+
+def reconcile_repeated_dates(finals: list[dict], regions: list[dict]) -> list[dict]:
+    """Repair one-digit date drift when context and another region agree."""
+    reconciled = [dict(final) for final in finals]
+    final_dates = [
+        _date_values(final.get("final_transcription", ""))
+        for final in reconciled
+    ]
+    for index, final in enumerate(reconciled):
+        current_dates = final_dates[index]
+        current_text = str(final.get("final_transcription") or "").strip()
+        if (
+            len(current_dates) != 1
+            or _information_text(current_text)
+            != _information_text(current_dates[0])
+        ):
+            continue
+        contextual_dates = _date_values(final.get("contextual_evidence") or {})
+        other_dates = [
+            date
+            for other_index, dates in enumerate(final_dates)
+            if other_index != index
+            for date in dates
+        ]
+        current_digits = current_dates[0].replace("/", "")
+        candidates = []
+        for candidate in contextual_dates:
+            candidate_digits = candidate.replace("/", "")
+            if (
+                candidate == current_dates[0]
+                or candidate not in other_dates
+                or len(candidate_digits) != len(current_digits)
+                or sum(
+                    left != right
+                    for left, right in zip(candidate_digits, current_digits)
+                ) != 1
+            ):
+                continue
+            candidates.append(candidate)
+        if not candidates:
+            continue
+        selected_date = max(
+            set(candidates),
+            key=lambda candidate: (
+                other_dates.count(candidate),
+                contextual_dates.count(candidate),
+            ),
+        )
+        matched_region = next(
+            other_index + 1
+            for other_index, dates in enumerate(final_dates)
+            if other_index != index and selected_date in dates
+        )
+        selected = dict(final)
+        selected["final_transcription"] = selected_date
+        alternatives = selected.setdefault("alternative_transcriptions", [])
+        if current_text not in alternatives:
+            alternatives.insert(0, current_text)
+        selected.setdefault("notes", []).append(
+            "cross-region date consensus: contextual alternative matched another field"
+        )
+        selected["decision_status"] = "cross_region_date_consensus"
+        selected["cross_region_date_consensus"] = {
+            "matched_region": matched_region,
+            "rejected_transcription": current_text,
+            "contextual_support": contextual_dates.count(selected_date),
+            "page_support": other_dates.count(selected_date),
+        }
+        reconciled[index] = selected
+    return reconciled
+
+
+def _text_edit_distance(left: str, right: str) -> int:
+    previous = list(range(len(right) + 1))
+    for left_index, left_character in enumerate(left, 1):
+        current = [left_index]
+        for right_index, right_character in enumerate(right, 1):
+            current.append(min(
+                current[-1] + 1,
+                previous[right_index] + 1,
+                previous[right_index - 1]
+                + (left_character != right_character),
+            ))
+        previous = current
+    return previous[-1]
+
+
+def reconcile_with_cu_numeric_tokens(
+    finals: list[dict], regions: list[dict], cu_markdown: str,
+) -> list[dict]:
+    """Use CU only for a unique one-edit correction of a typed numeric field."""
+    cu_tokens = []
+    for token in re.findall(
+        r"(?<!\w)\d[\d,./-]*\d(?!\w)|(?<!\w)\d(?!\w)",
+        cu_markdown or "",
+    ):
+        digits = "".join(re.findall(r"\d", token))
+        if len(digits) >= 4:
+            cu_tokens.append((digits, token))
+    all_cu_digits = [digits for digits, _token in cu_tokens]
+    reconciled = [dict(final) for final in finals]
+    for index, final in enumerate(reconciled):
+        if str(final.get("field_type") or "").lower() != "numeric":
+            continue
+        if "date" in str(regions[index].get("label") or "").lower():
+            continue
+        current_text = str(final.get("final_transcription") or "").strip()
+        current_digits = "".join(re.findall(r"\d", current_text))
+        if (
+            len(current_digits) < 4
+            or _information_text(current_text) != current_digits
+            or current_digits in all_cu_digits
+        ):
+            continue
+        nearby = {
+            digits: token
+            for digits, token in cu_tokens
+            if _text_edit_distance(current_digits, digits) == 1
+        }
+        if len(nearby) != 1:
+            continue
+        selected_digits, selected_token = next(iter(nearby.items()))
+        selected = dict(final)
+        selected["final_transcription"] = selected_token
+        alternatives = selected.setdefault("alternative_transcriptions", [])
+        if current_text not in alternatives:
+            alternatives.insert(0, current_text)
+        selected.setdefault("notes", []).append(
+            "CU numeric consensus: unique one-edit token matched typed numeric field"
+        )
+        selected["decision_status"] = "cu_numeric_consensus"
+        selected["cu_numeric_consensus"] = {
+            "rejected_transcription": current_text,
+            "selected_digits": selected_digits,
+            "edit_distance": 1,
+        }
+        reconciled[index] = selected
+    return reconciled
+
+
+def reconcile_uncertain_repeated_numbers(
+    finals: list[dict], regions: list[dict], cu_markdown: str,
+) -> list[dict]:
+    """Repair uncertain numeric text when another region and CU exactly agree."""
+    cu_lines = [
+        "".join(re.findall(r"\d", line))
+        for line in (cu_markdown or "").splitlines()
+        if len(re.findall(r"\d", line)) >= 4
+    ]
+    reconciled = [dict(final) for final in finals]
+    sequences = []
+    for final in reconciled:
+        text = str(final.get("final_transcription") or "")
+        info = _information_text(text)
+        digits = "".join(re.findall(r"\d", text))
+        sequences.append(
+            (digits, text)
+            if digits and not re.search(r"[A-Za-z\u0590-\u05ff]", info)
+            else ("", "")
+        )
+    for index, final in enumerate(reconciled):
+        if str(final.get("field_type") or "").lower() != "numeric":
+            continue
+        current_text = str(final.get("final_transcription") or "")
+        current_digits = "".join(re.findall(r"\d", current_text))
+        info = _information_text(current_text)
+        if (
+            "[?]" not in current_text
+            or len(current_digits) < 4
+            or "/" in current_text
+            or re.search(r"[A-Za-z\u0590-\u05ff]", info)
+            or any(current_digits in line for line in cu_lines)
+        ):
+            continue
+        candidates = {
+            digits: text
+            for other_index, (digits, text) in enumerate(sequences)
+            if other_index != index
+            and len(digits) >= 6
+            and _text_edit_distance(current_digits, digits) <= 3
+            and any(digits in line for line in cu_lines)
+        }
+        if len(candidates) != 1:
+            continue
+        selected_digits, selected_text = next(iter(candidates.items()))
+        selected = dict(final)
+        selected["final_transcription"] = selected_text
+        alternatives = selected.setdefault("alternative_transcriptions", [])
+        if current_text not in alternatives:
+            alternatives.insert(0, current_text)
+        selected.setdefault("notes", []).append(
+            "repeated numeric consensus: another region and CU agree"
+        )
+        selected["decision_status"] = "repeated_numeric_cu_consensus"
+        selected["repeated_numeric_cu_consensus"] = {
+            "rejected_transcription": current_text,
+            "selected_digits": selected_digits,
+            "edit_distance": _text_edit_distance(
+                current_digits, selected_digits,
+            ),
+        }
+        reconciled[index] = selected
     return reconciled
 
 
@@ -2026,6 +2344,7 @@ def build_contextual_region_images(
 
 def contextual_region_recheck(
     page_img: Image.Image, region: dict, candidate: dict, printed_context: str = "",
+    reasoning: str | None = None,
 ) -> tuple[dict, tuple[Image.Image, Image.Image]]:
     """Re-read a difficult field with local form labels and page-level position."""
     context_image, highlighted_page = build_contextual_region_images(page_img, region["box"])
@@ -2080,8 +2399,45 @@ Return JSON only:
         {"type": "input_image", "image_url": _to_data_uri(context_image)},
         {"type": "input_text", "text": "Full page with the same target rectangle:"},
         {"type": "input_image", "image_url": _to_data_uri(highlighted_page)},
-    ], retries=0, max_tokens=10000)
+    ], retries=0, max_tokens=10000, reasoning=reasoning)
     return result, (context_image, highlighted_page)
+
+
+def should_high_uncertainty_rescue(
+    final: dict, signature_flourish: bool,
+) -> bool:
+    """Retry only an explicit [?]-only text field after signature rejection."""
+    text = str(final.get("final_transcription") or "").strip()
+    return (
+        not signature_flourish
+        and final.get("classification") == "handwritten_text"
+        and "[?]" in text
+        and not _information_text(text)
+    )
+
+
+def accept_high_uncertainty_rescue(current: dict, recheck: dict) -> dict:
+    """Accept a high-reasoning rescue only as confident Hebrew handwriting."""
+    text = _information_text(recheck.get("final_transcription", ""))
+    if (
+        recheck.get("classification") != "handwritten_text"
+        or not re.search(r"[\u0590-\u05ff]", text)
+        or float(recheck.get("confidence", 0.0) or 0.0) < 0.70
+    ):
+        return current
+    return accept_contextual_recheck(current, recheck)
+
+
+def should_emit_region(final: dict, per_image: list[dict]) -> bool:
+    """Hide a detector false positive only when all vision evidence is empty."""
+    return not (
+        final.get("classification") == "no_handwriting"
+        and not _information_text(final.get("final_transcription", ""))
+        and not any(
+            _information_text(result.get("full_transcription", ""))
+            for result in per_image
+        )
+    )
 
 
 def assemble_spatial_numeric_cells(recheck: dict) -> dict:
@@ -2210,7 +2566,9 @@ def protect_contextual_recheck_with_cross_engine_agreement(
             str((result.get("ocr") or {}).get("full_transcription") or "")
         ) == current_info
     ]
-    if not faithful_supporters:
+    advisory_gate = ivrit_evidence.get("advisory_gate") or {}
+    eligible_hash_support = bool(advisory_gate.get("eligible"))
+    if not faithful_supporters and not eligible_hash_support:
         return accepted
 
     protected = dict(current)
@@ -2222,7 +2580,7 @@ def protect_contextual_recheck_with_cross_engine_agreement(
             alternatives.append(text)
     protected["alternative_transcriptions"] = alternatives
     protected.setdefault("notes", []).append(
-        "contextual override rejected: visual/Core4 and independent HASH exactly agree"
+        "contextual override rejected: visual and independently gated HASH agree"
     )
     protected["needs_review"] = True
     protected["decision_status"] = "cross_engine_agreement_protected"
@@ -2230,6 +2588,8 @@ def protect_contextual_recheck_with_cross_engine_agreement(
         "selected_transcription": current_text,
         "rejected_contextual_transcription": recheck_text,
         "vision_supporting_sources": faithful_supporters,
+        "vision_correlated_source": advisory_gate.get("vision_source"),
+        "ivrit_advisory_gate": advisory_gate,
         "ivrit_source": ivrit_evidence.get("source", IVRIT_OCR_SOURCE),
         "ivrit_selected_variant": ivrit_evidence.get("selected_variant", "original"),
     }
@@ -2259,6 +2619,54 @@ def is_signature_flourish(image: Image.Image) -> bool:
     return dominance >= 0.78 and width_fraction >= 0.78
 
 
+def is_black_signature_flourish(image: Image.Image) -> bool:
+    """High-specificity black-ink signature gate for monochrome forms."""
+    gray = np.array(image.convert("L"))
+    _, ink = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    horizontal = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(20, gray.shape[1] // 8), 1),
+        ),
+    )
+    vertical = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(20, gray.shape[0] // 3)),
+        ),
+    )
+    cleaned = cv2.subtract(cv2.subtract(ink, horizontal), vertical)
+    ink_area = int((cleaned > 0).sum())
+    if ink_area < 100:
+        return False
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        cleaned, 8,
+    )
+    components = [
+        stats[index]
+        for index in range(1, count)
+        if stats[index, cv2.CC_STAT_AREA] >= 40
+        and stats[index, cv2.CC_STAT_HEIGHT] >= 12
+    ]
+    if not components:
+        return False
+    largest = max(components, key=lambda stat: int(stat[cv2.CC_STAT_AREA]))
+    dominance = int(largest[cv2.CC_STAT_AREA]) / ink_area
+    width_fraction = int(largest[cv2.CC_STAT_WIDTH]) / max(1, image.width)
+    height_fraction = int(largest[cv2.CC_STAT_HEIGHT]) / max(1, image.height)
+    dominant_flourish = dominance >= 0.78 and width_fraction >= 0.65
+    complex_flourish = (
+        len(components) >= 15
+        and width_fraction >= 0.40
+        and height_fraction <= 0.60
+    )
+    return dominant_flourish or complex_flourish
+
+
 def finalize_region_semantics(
     final: dict, usable: list[dict], signature_flourish: bool = False,
 ) -> dict:
@@ -2286,6 +2694,18 @@ def finalize_region_semantics(
             classification = "mark_or_checkbox"
         else:
             classification = "handwritten_text"
+    notes = " ".join(str(note) for note in resolved.get("notes", [])).lower()
+    if (
+        signature_flourish
+        and classification == "handwritten_text"
+        and not _norm_read(resolved.get("final_transcription", ""))
+        and re.search(r"signature|scribble|חתימה|שרבוט", notes, re.I)
+    ):
+        classification = "signature_non_text"
+        resolved["classification"] = classification
+        resolved.setdefault("notes", []).append(
+            "signature geometry: empty text and explicit signature evidence agree"
+        )
     resolved["classification"] = classification
     if (
         not signature_flourish
@@ -2561,6 +2981,12 @@ def refine_box_to_ink(
     W, H = page_img.size
     x, y, w, h = box
     hint = color_hint.lower()
+    compact_terms = (
+        "date", "name", "number", "phone", "email", "account",
+        "reference", "identifier", "identification", "id field",
+    )
+    if any(term in hint for term in compact_terms):
+        vpad_frac = min(vpad_frac, 0.12)
     has_color_hint = any(term in hint for term in ("blue", "green", "phone", "email"))
     vpad = max(int(h * vpad_frac), 90 if has_color_hint else 0)
     y0, y1 = max(0, y - vpad), min(H, y + h + vpad)
@@ -3421,6 +3847,24 @@ def deduplicate_detection_regions(
                 ((fx + fw / 2) - (sx + sw / 2)) ** 2
                 + ((fy + fh / 2) - (sy + sh / 2)) ** 2
             ) ** 0.5
+            same_descriptive_label = (
+                bool(first.get("label", "").strip())
+                and first.get("label", "").strip().lower()
+                == second.get("label", "").strip().lower()
+                and first.get("label", "").strip().lower()
+                not in {"handwriting", "colored handwriting", "blue handwriting"}
+            )
+            compact_fragment = (
+                same_descriptive_label
+                and containment >= 0.45
+                and area_ratio >= 1.50
+                and center_distance <= 0.65 * max(fw, fh, sw, sh)
+                and max(first_area, second_area)
+                <= 0.05 * page_width * page_height
+            )
+            if compact_fragment:
+                remove.add(smaller_index)
+                continue
             duplicate = (
                 iou >= 0.70
                 or (
@@ -3454,6 +3898,447 @@ def needs_lower_detection_pass(regions: list[dict], page_height: int) -> bool:
     return lowest_center < page_height * 0.30
 
 
+def is_compact_handwriting_label(label: str) -> bool:
+    """Return whether detector geometry should stay local to one form field."""
+    compact_terms = (
+        "date", "name", "number", "phone", "email", "account",
+        "reference", "identifier", "identification", "id field", "details",
+    )
+    lowered = label.lower()
+    return any(term in lowered for term in compact_terms)
+
+
+def compact_handwriting_kind(label: str) -> str | None:
+    """Normalize compact labels so overlapping tile detections can be matched."""
+    lowered = label.lower()
+    if "date" in lowered:
+        return "date"
+    if "name" in lowered:
+        return "name"
+    if any(term in lowered for term in ("id number", "identification", "identifier")):
+        return "id"
+    for kind in ("phone", "email", "account", "reference", "number", "details"):
+        if kind in lowered:
+            return kind
+    return None
+
+
+def clean_compact_black_pen_regions(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Drop empty compact boxes, remove clipped duplicates, and shift weak boxes."""
+    if not regions:
+        return []
+    raw_ink = np.array(page_img.convert("L")) < 180
+    thick_ink = np.array(enhance_pen_stroke_isolation(page_img).convert("L")) < 180
+    page_height, page_width = raw_ink.shape
+
+    def metrics(box: list[int]) -> tuple[float, float, float, int]:
+        x, y, width, height = box
+        raw = raw_ink[y:y + height, x:x + width]
+        thick = thick_ink[y:y + height, x:x + width]
+        if raw.size == 0:
+            return 0.0, 0.0, 1.0, 0
+        thick_total = int(thick.sum())
+        raw_total = int(raw.sum())
+        edge = max(3, round(min(width, height) * 0.08))
+        edge_total = int(
+            thick[:edge].sum() + thick[-edge:].sum()
+            + thick[:, :edge].sum() + thick[:, -edge:].sum()
+        )
+        return (
+            thick_total / raw.size,
+            thick_total / max(1, raw_total),
+            edge_total / max(1, thick_total),
+            thick_total,
+        )
+
+    supported = []
+    for region in regions:
+        candidate = dict(region, box=list(region["box"]))
+        if is_compact_handwriting_label(str(candidate.get("label") or "")):
+            density, _retention, _edge_fraction, _total = metrics(candidate["box"])
+            if density < 0.006:
+                continue
+        supported.append(candidate)
+
+    remove: set[int] = set()
+    for first_index, first in enumerate(supported):
+        if first_index in remove:
+            continue
+        first_kind = compact_handwriting_kind(str(first.get("label") or ""))
+        if first_kind not in {
+            "date", "name", "id", "phone", "email", "account", "reference",
+        }:
+            continue
+        fx, fy, fw, fh = first["box"]
+        for second_index in range(first_index + 1, len(supported)):
+            if second_index in remove:
+                continue
+            second = supported[second_index]
+            if compact_handwriting_kind(str(second.get("label") or "")) != first_kind:
+                continue
+            sx, sy, sw, sh = second["box"]
+            horizontal_overlap = max(0, min(fx + fw, sx + sw) - max(fx, sx))
+            if horizontal_overlap < 0.70 * min(fw, sw):
+                continue
+            center_distance = abs((fy + fh / 2) - (sy + sh / 2))
+            if center_distance > 0.75 * max(fh, sh):
+                continue
+            first_edge = metrics(first["box"])[2]
+            second_edge = metrics(second["box"])[2]
+            if abs(first_edge - second_edge) >= 0.015:
+                remove.add(first_index if first_edge > second_edge else second_index)
+            else:
+                first_area, second_area = fw * fh, sw * sh
+                remove.add(first_index if first_area > second_area else second_index)
+            if first_index in remove:
+                break
+    supported = [
+        region for index, region in enumerate(supported) if index not in remove
+    ]
+
+    relocated = []
+    for region in supported:
+        candidate = dict(region, box=list(region["box"]))
+        if compact_handwriting_kind(str(candidate.get("label") or "")) is None:
+            relocated.append(candidate)
+            continue
+        density, retention, _edge_fraction, _total = metrics(candidate["box"])
+        if density < 0.006 or retention >= 0.23:
+            relocated.append(candidate)
+            continue
+
+        x, y, width, height = candidate["box"]
+        center_y = y + height / 2
+        search_left = max(0, x - round(width * 0.35))
+        search_right = min(page_width, x + width + round(width * 0.35))
+        search_top = max(0, y - 3 * height)
+        search_bottom = min(page_height, y + 4 * height)
+        local_thick = thick_ink[
+            search_top:search_bottom, search_left:search_right
+        ]
+        local_raw = raw_ink[
+            search_top:search_bottom, search_left:search_right
+        ]
+        row_counts = local_thick.sum(axis=1)
+        active = row_counts >= max(4, round(local_thick.shape[1] * 0.006))
+        dilation_height = max(9, min(25, round(height * 0.13)))
+        active = cv2.dilate(
+            active.astype(np.uint8).reshape(-1, 1),
+            np.ones((dilation_height, 1), np.uint8),
+        ).ravel().astype(bool)
+        starts = np.flatnonzero(active & ~np.r_[False, active[:-1]])
+        ends = np.flatnonzero(active & ~np.r_[active[1:], False]) + 1
+        bands = []
+        for start, end in zip(starts, ends):
+            band_mask = local_thick[start:end]
+            thick_total = int(band_mask.sum())
+            raw_total = int(local_raw[start:end].sum())
+            band_retention = thick_total / max(1, raw_total)
+            absolute_center = search_top + (start + end) / 2
+            component_count, _labels, stats, _centroids = (
+                cv2.connectedComponentsWithStats(
+                    band_mask.astype(np.uint8), 8,
+                )
+            )
+            glyph_components = [
+                component_index
+                for component_index in range(1, component_count)
+                if stats[component_index, cv2.CC_STAT_AREA] >= 8
+                and stats[component_index, cv2.CC_STAT_HEIGHT] >= 12
+                and stats[component_index, cv2.CC_STAT_WIDTH] >= 3
+                and stats[component_index, cv2.CC_STAT_WIDTH]
+                < local_thick.shape[1] * 0.45
+            ]
+            if (
+                thick_total >= 80
+                and len(glyph_components) >= 2
+                and band_retention >= max(0.30, retention + 0.10)
+                and abs(absolute_center - center_y) <= 3 * height
+            ):
+                bands.append((abs(absolute_center - center_y), start, end))
+        if not bands:
+            relocated.append(candidate)
+            continue
+        _distance, start, end = min(bands)
+        rows, columns = np.where(local_thick[start:end])
+        if not len(columns):
+            relocated.append(candidate)
+            continue
+        horizontal_padding = max(8, round(width * 0.06))
+        vertical_padding = max(8, round(height * 0.08))
+        left = max(0, search_left + int(columns.min()) - horizontal_padding)
+        right = min(
+            page_width,
+            search_left + int(columns.max()) + horizontal_padding + 1,
+        )
+        top = max(
+            0, search_top + int(start) + int(rows.min()) - vertical_padding,
+        )
+        bottom = min(
+            page_height,
+            search_top + int(start) + int(rows.max()) + vertical_padding + 1,
+        )
+        candidate["box"] = [left, top, right - left, bottom - top]
+        relocated.append(candidate)
+    return relocated
+
+
+def _large_black_handwriting_components(
+    page_img: Image.Image,
+) -> list[tuple[int, int, int, int]]:
+    """Return large thick-stroke components on a monochrome form."""
+    rgb = np.array(page_img.convert("RGB")).astype(np.int16)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    colored_pen = (
+        (blue - red >= 24)
+        & (blue - green >= 17)
+        & (blue <= 245)
+    )
+    if int(colored_pen.sum()) >= page_img.width * page_img.height * 0.0002:
+        return []
+
+    page_width, page_height = page_img.size
+    gray = np.array(page_img.convert("L"))
+    _, ink = cv2.threshold(
+        gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+    )
+    horizontal = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (max(80, page_width // 15), 1),
+        ),
+    )
+    vertical = cv2.morphologyEx(
+        ink,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT, (1, max(60, page_height // 35)),
+        ),
+    )
+    cleaned = cv2.subtract(cv2.subtract(ink, horizontal), vertical)
+    distance = cv2.distanceTransform(cleaned, cv2.DIST_L2, 5)
+    count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        cleaned, 8,
+    )
+    minimum_height = max(38, round(page_height * 0.008))
+    components = []
+    for component_index in range(1, count):
+        x = int(stats[component_index, cv2.CC_STAT_LEFT])
+        y = int(stats[component_index, cv2.CC_STAT_TOP])
+        width = int(stats[component_index, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[component_index, cv2.CC_STAT_AREA])
+        if (
+            height >= minimum_height
+            and area >= 120
+            and width >= 6
+            and width < page_width * 0.18
+            and float(distance[labels == component_index].max()) >= 2.4
+        ):
+            components.append((x, y, x + width, y + height))
+    return components
+
+
+def supplement_black_handwriting_peer_regions(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Recover omitted name/ID peers on the same monochrome declaration row."""
+    if not regions:
+        return []
+    components = _large_black_handwriting_components(page_img)
+    if not components:
+        return [dict(region, box=list(region["box"])) for region in regions]
+
+    page_width, page_height = page_img.size
+
+    peer_terms = ("name", "id number", "hebrew name", "declarant", "entry")
+    maximum_anchor_height = max(120, round(page_height * 0.05))
+    anchors = [
+        index for index, region in enumerate(regions)
+        if region["box"][3] <= maximum_anchor_height
+        and any(
+            term in str(region.get("label") or "").lower()
+            for term in peer_terms
+        )
+    ]
+    removed: set[int] = set()
+    additions: list[dict] = []
+    processed: set[int] = set()
+    component_gap = max(80, round(page_height * 0.025))
+    minimum_group_span = max(100, round(page_height * 0.025))
+    for anchor_index in sorted(
+        anchors,
+        key=lambda index: (
+            regions[index]["box"][1] + regions[index]["box"][3] / 2,
+            regions[index]["box"][0],
+        ),
+    ):
+        if anchor_index in processed:
+            continue
+        _x, y, _width, height = regions[anchor_index]["box"]
+        center_y = y + height / 2
+        row_tolerance = max(height * 0.75, page_height * 0.018)
+        row_anchors = [
+            index for index in anchors
+            if abs(
+                regions[index]["box"][1]
+                + regions[index]["box"][3] / 2
+                - center_y
+            ) <= row_tolerance
+        ]
+        row_components = sorted(
+            component for component in components
+            if abs((component[1] + component[3]) / 2 - center_y)
+            <= row_tolerance
+        )
+        groups: list[list[tuple[int, int, int, int]]] = []
+        for component in row_components:
+            if (
+                not groups
+                or component[0] - groups[-1][-1][2] > component_gap
+            ):
+                groups.append([component])
+            else:
+                groups[-1].append(component)
+        peer_groups = []
+        for group in groups:
+            if len(group) < 3:
+                continue
+            left = min(component[0] for component in group)
+            top = min(component[1] for component in group)
+            right = max(component[2] for component in group)
+            bottom = max(component[3] for component in group)
+            if right - left < minimum_group_span:
+                continue
+            peer_groups.append((left, top, right, bottom))
+        if len(peer_groups) < 2:
+            processed.update(row_anchors)
+            continue
+        horizontal_padding = max(12, round(page_height * 0.004))
+        vertical_padding = max(8, round(page_height * 0.002))
+        for left, top, right, bottom in peer_groups:
+            crop_left = max(0, left - horizontal_padding)
+            crop_top = max(0, top - vertical_padding)
+            crop_right = min(page_width, right + horizontal_padding)
+            crop_bottom = min(page_height, bottom + vertical_padding)
+            additions.append({
+                "label": "handwritten declaration peer",
+                "box": [
+                    crop_left,
+                    crop_top,
+                    crop_right - crop_left,
+                    crop_bottom - crop_top,
+                ],
+            })
+        removed.update(row_anchors)
+        processed.update(row_anchors)
+
+    supplemented = [
+        dict(region, box=list(region["box"]))
+        for index, region in enumerate(regions)
+        if index not in removed
+    ]
+    supplemented.extend(additions)
+    return supplemented
+
+
+def supplement_uncovered_black_handwriting_groups(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Add large uncovered text groups after declaration peers establish context."""
+    supplemented = [
+        dict(region, box=list(region["box"])) for region in regions
+    ]
+    if sum(
+        str(region.get("label") or "") == "handwritten declaration peer"
+        for region in regions
+    ) < 2:
+        return supplemented
+    components = _large_black_handwriting_components(page_img)
+    if not components:
+        return supplemented
+
+    page_width, page_height = page_img.size
+    row_tolerance = max(55, round(page_height * 0.015))
+    component_gap = max(80, round(page_height * 0.025))
+    minimum_group_span = max(100, round(page_height * 0.025))
+    rows: list[dict] = []
+    for component in sorted(
+        components,
+        key=lambda item: ((item[1] + item[3]) / 2, item[0]),
+    ):
+        center_y = (component[1] + component[3]) / 2
+        matching_row = next(
+            (
+                row for row in rows
+                if abs(center_y - row["center_y"]) <= row_tolerance
+            ),
+            None,
+        )
+        if matching_row is None:
+            rows.append({"center_y": center_y, "components": [component]})
+        else:
+            matching_row["components"].append(component)
+            matching_row["center_y"] = sum(
+                (item[1] + item[3]) / 2
+                for item in matching_row["components"]
+            ) / len(matching_row["components"])
+
+    horizontal_padding = max(12, round(page_height * 0.004))
+    vertical_padding = max(8, round(page_height * 0.002))
+    for row in rows:
+        if row["center_y"] < page_height * 0.12:
+            continue
+        groups: list[list[tuple[int, int, int, int]]] = []
+        for component in sorted(row["components"]):
+            if (
+                not groups
+                or component[0] - groups[-1][-1][2] > component_gap
+            ):
+                groups.append([component])
+            else:
+                groups[-1].append(component)
+        for group in groups:
+            if len(group) < 3:
+                continue
+            left = min(component[0] for component in group)
+            top = min(component[1] for component in group)
+            right = max(component[2] for component in group)
+            bottom = max(component[3] for component in group)
+            if right - left < minimum_group_span:
+                continue
+            crop_left = max(0, left - horizontal_padding)
+            crop_top = max(0, top - vertical_padding)
+            crop_right = min(page_width, right + horizontal_padding)
+            crop_bottom = min(page_height, bottom + vertical_padding)
+            candidate = [
+                crop_left,
+                crop_top,
+                crop_right - crop_left,
+                crop_bottom - crop_top,
+            ]
+            candidate_area = candidate[2] * candidate[3]
+            covered = False
+            for region in supplemented:
+                rx, ry, rw, rh = region["box"]
+                intersection = (
+                    max(0, min(crop_right, rx + rw) - max(crop_left, rx))
+                    * max(0, min(crop_bottom, ry + rh) - max(crop_top, ry))
+                )
+                if intersection / max(1, candidate_area) >= 0.35:
+                    covered = True
+                    break
+            if not covered:
+                supplemented.append({
+                    "label": "handwritten stroke group",
+                    "box": candidate,
+                })
+    return supplemented
+
+
 def detect_handwriting_regions(page_img: Image.Image, det_max_side: int = 3000) -> list[dict]:
     """Ask the Vision LLM to locate every handwritten region on the page.
 
@@ -3483,6 +4368,11 @@ DO NOT select machine-printed text, even when it is styled to look cursive:
   stamps, signatures, and black redaction boxes.
 If unsure whether a block is handwriting or an italic printed paragraph, treat it
 as printed and DO NOT include it.
+
+You receive two aligned views with identical dimensions. The first is the
+authoritative original. The second suppresses thin print and rules while retaining
+the thick cores of pen strokes. Use the second only as supporting evidence: a box
+must contain irregular pen evidence there and visible handwriting in the original.
 
 Return ONLY a single JSON object with PIXEL coordinates in THIS image size:
 {{"regions": [{{"label": "short english description", "box": [x, y, width, height]}}]}}
@@ -3514,6 +4404,8 @@ Each box should tightly cover the handwriting with a small margin."""
             label = str(region.get("label") or "handwriting")
             if "paragraph block" in label.lower():
                 contextual = [bx, by, bw, bh]
+            elif is_compact_handwriting_label(label):
+                contextual = [bx, by, bw, bh]
             else:
                 refined = refine_box_to_ink(page_img, [bx, by, bw, bh], color_hint=label)
                 contextual = (
@@ -3528,7 +4420,13 @@ Each box should tightly cover the handwriting with a small margin."""
 
     content = [
         {"type": "input_text", "text": prompt},
+        {"type": "input_text", "text": "View 1: original document"},
         {"type": "input_image", "image_url": _to_data_uri(det_img)},
+        {"type": "input_text", "text": "View 2: pen-stroke-isolated support"},
+        {
+            "type": "input_image",
+            "image_url": _to_data_uri(enhance_pen_stroke_isolation(det_img)),
+        },
     ]
     def detection_call(evidence: list[dict]) -> dict:
         return _responses_call(
@@ -3539,7 +4437,15 @@ Each box should tightly cover the handwriting with a small margin."""
             endpoint_limit=1,
         )
 
-    regions = parse_response(detection_call(content))
+    try:
+        initial_response = detection_call(content)
+    except RuntimeError as exc:
+        print(
+            f"[detect] full-page detection unavailable; trying tiled coverage: {exc}"
+        )
+        regions = []
+    else:
+        regions = parse_response(initial_response)
     penalty, issues = detection_geometry_penalty(regions, W, H)
     if issues:
         correction = (
@@ -3562,41 +4468,80 @@ Each box should tightly cover the handwriting with a small margin."""
             if repaired_penalty < penalty:
                 print(f"[detect] geometry repair improved penalty {penalty:.1f} -> {repaired_penalty:.1f}")
                 regions = repaired
-    if needs_lower_detection_pass(regions, H):
-        lower_top = round(H * 0.20)
-        lower_page = page_img.crop((0, lower_top, W, H))
-        lower_scale = min(1.0, det_max_side / max(lower_page.size))
-        lower_width = int(lower_page.width * lower_scale)
-        lower_height = int(lower_page.height * lower_scale)
-        lower_image = lower_page.resize(
-            (lower_width, lower_height), Image.LANCZOS
-        ) if lower_scale < 1.0 else lower_page
-        lower_prompt = f"""This is a detailed view of the LOWER 80% of a scanned Hebrew document,
-{lower_width}x{lower_height} pixels. Find every true handwritten pen entry in this
-view that a whole-page scan may have missed. Include long handwriting crossing
-printed form lines. Exclude all machine-printed text, italic printed text, logos,
-stamps, signatures, and black redaction boxes.
+    missing_lower_coverage = needs_lower_detection_pass(regions, H)
+    if missing_lower_coverage:
+        coverage_bands = (
+            (0.0, 0.30), (0.24, 0.48), (0.42, 0.66),
+            (0.60, 0.82), (0.76, 1.0),
+        )
+        coverage_regions: list[dict] = []
+        successful_segments = 0
+        for band_index, (start_fraction, end_fraction) in enumerate(
+            coverage_bands, 1,
+        ):
+            lower_top = round(H * start_fraction)
+            lower_bottom = round(H * end_fraction)
+            lower_page = page_img.crop((0, lower_top, W, lower_bottom))
+            lower_scale = min(1.0, det_max_side / max(lower_page.size))
+            lower_width = int(lower_page.width * lower_scale)
+            lower_height = int(lower_page.height * lower_scale)
+            lower_image = lower_page.resize(
+                (lower_width, lower_height), Image.LANCZOS
+            ) if lower_scale < 1.0 else lower_page
+            lower_prompt = f"""This is vertical segment {band_index} of 2 from a scanned Hebrew document,
+covering {start_fraction:.0%}-{end_fraction:.0%} of the full page and measuring
+{lower_width}x{lower_height} pixels. Scan this entire segment from top to bottom.
+Find every true handwritten pen entry that a whole-page scan may have missed.
+Include long handwriting crossing printed form lines. Exclude all machine-printed
+text, italic printed text, logos, stamps, signatures, and black redaction boxes.
+Do not infer handwriting from a printed field label; include a box only when
+irregular handwritten pen strokes are visibly present inside it. You receive the
+aligned original followed by a pen-stroke-isolated support view; require evidence
+in both and use the original for coordinates.
 
 Return ONLY one JSON object with coordinates in THIS image:
 {{"regions": [{{"label": "short english description", "box": [x, y, width, height]}}]}}
 Each box must tightly cover one handwritten field or line with a small margin."""
-        lower_content = [
-            {"type": "input_text", "text": lower_prompt},
-            {"type": "input_image", "image_url": _to_data_uri(lower_image)},
-        ]
-        try:
-            lower_response = detection_call(lower_content)
-        except RuntimeError as exc:
-            print(f"[detect] lower-page coverage unavailable; keeping initial regions: {exc}")
-        else:
+            lower_content = [
+                {"type": "input_text", "text": lower_prompt},
+                {"type": "input_text", "text": "View 1: original document segment"},
+                {"type": "input_image", "image_url": _to_data_uri(lower_image)},
+                {"type": "input_text", "text": "View 2: pen-stroke-isolated support"},
+                {
+                    "type": "input_image",
+                    "image_url": _to_data_uri(
+                        enhance_pen_stroke_isolation(lower_image)
+                    ),
+                },
+            ]
+            try:
+                lower_response = detection_call(lower_content)
+            except RuntimeError as exc:
+                print(
+                    f"[detect] coverage segment {band_index} unavailable; "
+                    f"keeping other regions: {exc}"
+                )
+                continue
+            successful_segments += 1
             lower_regions = parse_response(
                 lower_response,
                 coordinate_inv=1.0 / lower_scale,
                 offset_y=lower_top,
             )
             if lower_regions:
-                print(f"[detect] lower-page coverage pass added {len(lower_regions)} candidate region(s)")
-                regions.extend(lower_regions)
+                print(
+                    f"[detect] coverage segment {band_index} added "
+                    f"{len(lower_regions)} candidate region(s)"
+                )
+                coverage_regions.extend(lower_regions)
+        if successful_segments == len(coverage_bands):
+            print(
+                "[detect] complete tiled coverage replaced the incomplete "
+                "full-page scan"
+            )
+            regions = coverage_regions
+        else:
+            regions.extend(coverage_regions)
     colored_regions = detect_colored_pen_regions(page_img, regions)
     if colored_regions:
         regions = colored_regions
@@ -3607,6 +4552,12 @@ Each box must tightly cover one handwritten field or line with a small margin.""
         )
         regions = merge_colored_line_fragments(
             tighten_regions_to_colored_ink(page_img, regions)
+        )
+        regions = supplement_black_handwriting_peer_regions(page_img, regions)
+        regions = clean_compact_black_pen_regions(page_img, regions)
+        regions = deduplicate_detection_regions(regions, W, H)
+        regions = supplement_uncovered_black_handwriting_groups(
+            page_img, regions,
         )
     return deduplicate_detection_regions(regions, W, H)
 
@@ -4371,7 +5322,11 @@ def run_pipeline(
                 if "[?]" not in vote.get("final_transcription", ""):
                     return finalize_region_semantics(vote, semantic_usable)  # no model call
         imgs = region_images[ri]
-        signature_flourish = is_signature_flourish(dict(imgs)["01_original_crop.png"])
+        original_crop = dict(imgs)["01_original_crop.png"]
+        signature_flourish = (
+            is_signature_flourish(original_crop)
+            or is_black_signature_flourish(original_crop)
+        )
         local_cu_context = nearby_printed_context(
             cu_context_markdown, regions[ri]["box"], page_img.height
         )
@@ -4418,6 +5373,36 @@ def run_pipeline(
                     accepted.setdefault("notes", []).append(
                         "independent Hebrew context reread disagreed; human review required"
                     )
+                if should_high_uncertainty_rescue(
+                    accepted, signature_flourish,
+                ):
+                    high_recheck, _high_images = contextual_region_recheck(
+                        page_img,
+                        regions[ri],
+                        accepted,
+                        region_context,
+                        reasoning="high",
+                    )
+                    _write_json_atomic(
+                        region_dirs[ri] / "high_uncertainty_recheck.json",
+                        high_recheck,
+                    )
+                    accepted["high_uncertainty_evidence"] = high_recheck
+                    rescued = dict(accept_high_uncertainty_rescue(
+                        accepted, high_recheck,
+                    ))
+                    if rescued.get("final_transcription") != accepted.get(
+                        "final_transcription"
+                    ):
+                        rescued["pre_high_rescue_transcription"] = accepted.get(
+                            "final_transcription", ""
+                        )
+                        rescued["high_uncertainty_evidence"] = high_recheck
+                        rescued["decision_status"] = "high_uncertainty_rescue"
+                        rescued.setdefault("notes", []).append(
+                            "high-reasoning rescue resolved explicit uncertainty-only text"
+                        )
+                        return rescued
                 return accepted
             except Exception as recheck_exc:
                 final.setdefault("notes", []).append(
@@ -4462,10 +5447,31 @@ def run_pipeline(
                 finals[ri] = {"final_transcription": "", "words": [],
                               "notes": [f"reconcile failed: {exc}"]}
 
+    cu_evidence_markdown = cu_context_markdown
+    if not cu_evidence_markdown and cu_future is not None:
+        try:
+            cu_evidence_markdown = cu_future.result()
+        except Exception as exc:
+            print(f"[CU] numeric evidence unavailable: {exc}", file=sys.stderr)
+
+    finals = [separate_numeric_field_marks(final) for final in finals]
+    finals = [normalize_numeric_s_homoglyph(final) for final in finals]
+    finals = [
+        prefer_eligible_ivrit_candidate(final, ivrit_results[index])
+        for index, final in enumerate(finals)
+    ]
+    finals = reconcile_repeated_dates(finals, regions)
+    finals = reconcile_with_cu_numeric_tokens(
+        finals, regions, cu_evidence_markdown,
+    )
     finals = reconcile_repeated_structured_fields(finals, regions)
+    finals = reconcile_uncertain_repeated_numbers(
+        finals, regions, cu_evidence_markdown,
+    )
 
     # ---- write per-region debug + combined -------------------------------- #
     all_results = []
+    rejected_results = []
     for i, region in enumerate(regions, 1):
         rdir = region_dirs[i - 1]
         res = region_results[i - 1]
@@ -4514,6 +5520,10 @@ def run_pipeline(
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
             "pre_context_transcription": final.get("pre_context_transcription"),
             "contextual_evidence": final.get("contextual_evidence"),
+            "pre_high_rescue_transcription": final.get(
+                "pre_high_rescue_transcription"
+            ),
+            "high_uncertainty_evidence": final.get("high_uncertainty_evidence"),
             "alternative_transcriptions": final.get("alternative_transcriptions", []),
             "words": final.get("words", []),
             "notes": final.get("notes", []),
@@ -4533,13 +5543,17 @@ def run_pipeline(
         (rdir / "result.json").write_text(
             json.dumps(result_debug, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        all_results.append({
+        exported_result = {
             "region": i, "folder": rdir.name,
             "label": region.get("label"), "box": region["box"],
             "field_type": final.get("field_type"),
             "final_transcription": final.get("final_transcription"),
             "pre_context_transcription": final.get("pre_context_transcription"),
             "contextual_evidence": final.get("contextual_evidence"),
+            "pre_high_rescue_transcription": final.get(
+                "pre_high_rescue_transcription"
+            ),
+            "high_uncertainty_evidence": final.get("high_uncertainty_evidence"),
             "ivrit_ocr": ivrit_results[i - 1],
             "numeric_cells": final.get("numeric_cells", []),
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
@@ -4550,20 +5564,26 @@ def run_pipeline(
             "agreement_gate": final.get("agreement_gate"),
             "cross_engine_agreement": final.get("cross_engine_agreement"),
             "cross_region_consensus": final.get("cross_region_consensus"),
-        })
+        }
+        if should_emit_region(final, per_image):
+            all_results.append(exported_result)
+        else:
+            exported_result["exclusion_reason"] = "empty_no_handwriting"
+            rejected_results.append(exported_result)
         print(f"  [{i}] {region.get('label')}: {final.get('final_transcription', '')!r}")
 
     combined = {
         "source": input_path, "page": page,
         "region_map": overlay_name, "regions": all_results,
+        "rejected_regions": rejected_results,
         "ocr_strategy": OCR_STRATEGY,
     }
     # handwriting_result.json is written AFTER the merge step below so the token
     # totals include the merge call and the elapsed time covers the whole run.
 
     # ---- merged doc: handwriting (red) over printed page ------------------- #
-    cu_markdown = ""
-    if merge_md and cu_future is not None:
+    cu_markdown = cu_evidence_markdown if merge_md else ""
+    if merge_md and cu_future is not None and not cu_markdown:
         try:
             print("[CU] collecting background Content Understanding result ...")
             cu_markdown = cu_future.result()

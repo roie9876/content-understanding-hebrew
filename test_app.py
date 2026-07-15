@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 import app as web_app
 import compare_golden
 import handwriting_pipeline as pipeline
+import quality_replay
 
 
 class UploadFormatTests(unittest.TestCase):
@@ -98,6 +99,8 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertIn('<option value="gpt-5.4" selected>', html)
         self.assertIn('<option value="standard" selected>', html)
         self.assertNotIn('<option value="gpt-5.6-sol" selected>', html)
+        self.assertIn('<option value="copilot-claude-opus-4.8">', html)
+        self.assertIn('Claude Opus 4.8 · GitHub Copilot SDK · Core4', html)
         self.assertIn('data-view="ivrit"', html)
         self.assertIn('<span>Ivrit OCR</span>', html)
 
@@ -205,6 +208,57 @@ class ConcurrentJobTests(unittest.TestCase):
             compare_golden._exact_norm("731 5252"),
         )
 
+    def test_quality_replay_similarity_ignores_punctuation_and_layout(self):
+        self.assertEqual(
+            1.0,
+            quality_replay._quality_ratio(
+                "012123\n142 05686399", "012-123 / 142.05686399"
+            ),
+        )
+        self.assertLess(
+            quality_replay._quality_ratio("5252731", "731 5252"),
+            1.0,
+        )
+
+    def test_quality_replay_aggregate_weights_text_regions(self):
+        totals = quality_replay.aggregate([
+            {
+                "text_total": 2,
+                "before_exact": 1,
+                "after_exact": 2,
+                "before_similarity_sum": 1.0,
+                "after_similarity_sum": 2.0,
+                "classification_total": 1,
+                "before_classification_correct": 0,
+                "after_classification_correct": 1,
+                "golden_regions": 3,
+                "saved_regions": 3,
+                "processed_regions": 3,
+                "before_extras": 0,
+                "after_extras": 0,
+            },
+            {
+                "text_total": 1,
+                "before_exact": 0,
+                "after_exact": 0,
+                "before_similarity_sum": 0.5,
+                "after_similarity_sum": 0.5,
+                "classification_total": 0,
+                "before_classification_correct": 0,
+                "after_classification_correct": 0,
+                "golden_regions": 1,
+                "saved_regions": 1,
+                "processed_regions": 1,
+                "before_extras": 0,
+                "after_extras": 0,
+            },
+        ])
+
+        self.assertEqual(3, totals["text_total"])
+        self.assertEqual(2, totals["after_exact"])
+        self.assertEqual(2.5 / 3, totals["after_similarity"])
+        self.assertEqual(1, totals["after_classification_correct"])
+
     def test_strict_golden_scores_text_and_signature_classification(self):
         golden = {
             "regions": [
@@ -236,6 +290,37 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(1, result["strict"]["text_exact"])
         self.assertEqual(1, result["strict"]["classification_correct"])
         self.assertTrue(result["strict"]["pass"])
+
+    def test_golden_comparison_fails_extra_region_count(self):
+        golden = {"regions": [{
+            "box": [0, 0, 10, 10],
+            "final_transcription": "12/7/26",
+        }]}
+        current = {"regions": [
+            {
+                "box": [0, 0, 10, 10],
+                "final_transcription": "12/7/26",
+            },
+            {
+                "box": [20, 0, 10, 10],
+                "final_transcription": "extra",
+            },
+        ]}
+        with tempfile.TemporaryDirectory() as temp_dir, \
+             patch.object(compare_golden, "GOLDEN_DIR", Path(temp_dir) / "golden"):
+            stem = "sample"
+            golden_dir = compare_golden.GOLDEN_DIR / stem
+            golden_dir.mkdir(parents=True)
+            (golden_dir / "handwriting_result.json").write_text(
+                json.dumps(golden), encoding="utf-8"
+            )
+            current_path = Path(temp_dir) / "current.json"
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+
+            result = compare_golden.compare_sample(stem, current_path)
+
+        self.assertTrue(result["count_fail"])
+        self.assertEqual("FAIL", result["verdict"])
 
     def test_merged_png_download_renders_merged_document(self):
         page_dir = web_app._page_dir(web_app._jobs[self.job_id], 1)
@@ -454,9 +539,21 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertEqual("github-copilot-sdk", environment["MODEL_BACKEND"])
         self.assertEqual("claude-opus-4.8", environment["GPT_DEPLOYMENT"])
+        self.assertEqual("1", environment["OCR_MULTI_IMAGE"])
         self.assertEqual("account-specific-token", environment["COPILOT_GITHUB_TOKEN"])
         self.assertEqual("1", environment["COPILOT_DISABLE_KEYTAR"])
         self.assertIn("vision-user", run.call_args.args[0])
+
+    def test_copilot_opus_48_standard_page_uses_core4(self):
+        token_result = Mock(stdout="account-specific-token\n")
+        with patch.object(web_app.subprocess, "run", return_value=token_result):
+            environment = web_app._page_environment(
+                "copilot-claude-opus-4.8", "standard"
+            )
+
+        self.assertEqual("standard", environment["OCR_STRATEGY"])
+        self.assertEqual("1", environment["OCR_MULTI_IMAGE"])
+        self.assertEqual("github-copilot-sdk", environment["MODEL_BACKEND"])
 
     def test_copilot_gemini_35_flash_profile_uses_sdk_backend(self):
         token_result = Mock(stdout="account-specific-token\n")
@@ -866,6 +963,10 @@ class ConcurrentJobTests(unittest.TestCase):
                 "box": [100, 100, 200, 50],
             }]},
             RuntimeError("[GPT] all endpoints failed: primary read timeout"),
+            RuntimeError("[GPT] all endpoints failed: secondary empty output"),
+            RuntimeError("[GPT] all endpoints failed: primary empty output"),
+            RuntimeError("[GPT] all endpoints failed: secondary read timeout"),
+            RuntimeError("[GPT] all endpoints failed: primary read timeout"),
         ]
         colored_regions.side_effect = lambda _image, regions: regions
 
@@ -875,7 +976,277 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertEqual(1, len(regions))
         self.assertEqual("handwritten note", regions[0]["label"])
-        self.assertEqual(2, responses_call.call_count)
+        self.assertEqual(6, responses_call.call_count)
+
+    @patch.object(pipeline, "detect_colored_pen_regions")
+    @patch.object(pipeline, "add_handwriting_context", side_effect=lambda _image, box: box)
+    @patch.object(
+        pipeline, "refine_box_to_ink",
+        side_effect=lambda _image, box, color_hint=None: box,
+    )
+    @patch.object(pipeline, "_responses_call")
+    def test_detection_maps_tiled_coverage_to_full_page(
+        self, responses_call, _refine, _context, colored_regions,
+    ):
+        responses_call.side_effect = [
+            {"regions": [{
+                "label": "initial handwriting",
+                "box": [100, 100, 200, 50],
+            }]},
+            {"regions": [{
+                "label": "top handwriting",
+                "box": [100, 100, 200, 50],
+            }]},
+            {"regions": [{
+                "label": "middle handwriting",
+                "box": [100, 100, 200, 50],
+            }]},
+            {"regions": [{
+                "label": "bottom handwriting",
+                "box": [100, 100, 200, 50],
+            }]},
+            {"regions": [{
+                "label": "lower edge handwriting",
+                "box": [100, 100, 200, 50],
+            }]},
+            {"regions": [{
+                "label": "bottom edge handwriting",
+                "box": [100, 100, 200, 50],
+            }]},
+        ]
+        colored_regions.side_effect = lambda _image, regions: regions
+
+        regions = pipeline.detect_handwriting_regions(
+            Image.new("RGB", (1000, 1000), "white"), det_max_side=1000,
+        )
+
+        self.assertEqual(6, responses_call.call_count)
+        for call in responses_call.call_args_list:
+            evidence = call.args[0]
+            self.assertEqual(
+                2,
+                sum(item.get("type") == "input_image" for item in evidence),
+            )
+        self.assertEqual(
+            [94, 334, 514, 694, 854],
+            [region["box"][1] for region in regions],
+        )
+
+    @patch.object(pipeline, "detect_colored_pen_regions")
+    @patch.object(pipeline, "add_handwriting_context", side_effect=lambda _image, box: box)
+    @patch.object(
+        pipeline, "refine_box_to_ink",
+        side_effect=lambda _image, box, color_hint=None: box,
+    )
+    @patch.object(pipeline, "_responses_call")
+    def test_tiled_coverage_recovers_when_full_page_detection_fails(
+        self, responses_call, _refine, _context, colored_regions,
+    ):
+        responses_call.side_effect = [
+            RuntimeError("[GPT] all endpoints failed: primary read timeout"),
+            {"regions": [{"label": "top note", "box": [100, 100, 200, 50]}]},
+            {"regions": [{"label": "middle note", "box": [100, 100, 200, 50]}]},
+            {"regions": [{"label": "lower note", "box": [100, 100, 200, 50]}]},
+            {"regions": []},
+            {"regions": []},
+        ]
+        colored_regions.side_effect = lambda _image, regions: regions
+
+        regions = pipeline.detect_handwriting_regions(
+            Image.new("RGB", (1000, 1000), "white"), det_max_side=1000,
+        )
+
+        self.assertEqual(6, responses_call.call_count)
+        self.assertEqual(3, len(regions))
+        self.assertEqual(
+            [94, 334, 514],
+            [region["box"][1] for region in regions],
+        )
+
+    @patch.object(pipeline, "refine_box_to_colored_ink", return_value=None)
+    def test_compact_detection_refinement_uses_narrow_vertical_band(
+        self, _colored_refinement,
+    ):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.rectangle((130, 420, 170, 455), fill="black")
+        box = [100, 400, 200, 100]
+
+        compact = pipeline.refine_box_to_ink(
+            page, box, color_hint="handwritten date",
+        )
+        free_text = pipeline.refine_box_to_ink(
+            page, box, color_hint="handwritten note",
+        )
+
+        self.assertEqual(388, compact[1])
+        self.assertEqual(124, compact[3])
+        self.assertEqual(365, free_text[1])
+        self.assertEqual(170, free_text[3])
+
+    @patch.object(pipeline, "detect_colored_pen_regions")
+    @patch.object(pipeline, "refine_box_to_ink")
+    @patch.object(pipeline, "_responses_call")
+    def test_detection_keeps_compact_model_box_local(
+        self, responses_call, refine, colored_regions,
+    ):
+        responses_call.return_value = {"regions": [{
+            "label": "handwritten date",
+            "box": [100, 400, 200, 50],
+        }]}
+        colored_regions.side_effect = lambda _image, regions: regions
+
+        regions = pipeline.detect_handwriting_regions(
+            Image.new("RGB", (1000, 1000), "white"), det_max_side=1000,
+        )
+
+        refine.assert_not_called()
+        self.assertEqual([92, 394, 216, 62], regions[0]["box"])
+
+    @patch.object(pipeline, "enhance_pen_stroke_isolation")
+    def test_compact_black_pen_cleanup_drops_empty_candidate(self, isolation):
+        page = Image.new("RGB", (700, 700), "white")
+        ImageDraw.Draw(page).rectangle((100, 100, 300, 220), outline="black")
+        isolation.return_value = Image.new("L", page.size, 255)
+
+        cleaned = pipeline.clean_compact_black_pen_regions(page, [{
+            "label": "handwritten guarantee details",
+            "box": [100, 100, 200, 120],
+        }])
+
+        self.assertEqual([], cleaned)
+
+    @patch.object(pipeline, "enhance_pen_stroke_isolation")
+    def test_compact_black_pen_cleanup_keeps_less_clipped_duplicate(
+        self, isolation,
+    ):
+        page = Image.new("RGB", (700, 700), "white")
+        support = Image.new("L", page.size, 255)
+        for image in (page, support):
+            draw = ImageDraw.Draw(image)
+            for left in (130, 175, 220, 265):
+                draw.rectangle((left, 120, left + 20, 165), fill="black")
+        isolation.return_value = support
+        complete = {"label": "id number", "box": [100, 100, 220, 100]}
+        clipped = {
+            "label": "handwritten id number",
+            "box": [100, 70, 220, 85],
+        }
+
+        cleaned = pipeline.clean_compact_black_pen_regions(
+            page, [complete, clipped],
+        )
+
+        self.assertEqual([complete], cleaned)
+
+    @patch.object(pipeline, "enhance_pen_stroke_isolation")
+    def test_compact_black_pen_cleanup_keeps_distinct_generic_numbers(
+        self, isolation,
+    ):
+        page = Image.new("RGB", (700, 700), "white")
+        support = Image.new("L", page.size, 255)
+        for image in (page, support):
+            draw = ImageDraw.Draw(image)
+            for left in (130, 175, 220, 265):
+                draw.line((left, 180, left + 20, 120), fill="black", width=10)
+        isolation.return_value = support
+        regions = [
+            {"label": "handwritten building number", "box": [100, 100, 220, 100]},
+            {"label": "handwritten apartment number", "box": [110, 110, 210, 100]},
+        ]
+
+        cleaned = pipeline.clean_compact_black_pen_regions(page, regions)
+
+        self.assertEqual(regions, cleaned)
+
+    @patch.object(pipeline, "enhance_pen_stroke_isolation")
+    def test_compact_black_pen_cleanup_relocates_to_glyph_band(self, isolation):
+        page = Image.new("RGB", (800, 800), "white")
+        support = Image.new("L", page.size, 255)
+        page_draw = ImageDraw.Draw(page)
+        support_draw = ImageDraw.Draw(support)
+        page_draw.rectangle((400, 300, 600, 380), fill="black")
+        for row in (320, 340, 360):
+            support_draw.rectangle((410, row, 590, row + 1), fill="black")
+        page_draw.line((360, 450, 640, 450), fill="black", width=5)
+        support_draw.line((360, 450, 640, 450), fill="black", width=5)
+        for left in (440, 485, 530):
+            page_draw.rectangle((left, 500, left + 22, 550), fill="black")
+            support_draw.rectangle((left, 500, left + 22, 550), fill="black")
+        isolation.return_value = support
+
+        cleaned = pipeline.clean_compact_black_pen_regions(page, [{
+            "label": "handwritten date",
+            "box": [400, 300, 200, 80],
+        }])
+
+        self.assertEqual(1, len(cleaned))
+        self.assertGreaterEqual(cleaned[0]["box"][1], 490)
+        self.assertLessEqual(cleaned[0]["box"][1] + cleaned[0]["box"][3], 560)
+
+    def test_black_handwriting_peer_supplement_recovers_omitted_row_field(self):
+        page = Image.new("RGB", (1000, 1500), "white")
+        draw = ImageDraw.Draw(page)
+        for left in (180, 230, 280):
+            draw.line((left, 770, left + 28, 700), fill="black", width=12)
+            draw.line((left + 10, 735, left + 36, 760), fill="black", width=10)
+        for left in (650, 700, 750):
+            draw.line((left, 770, left + 28, 700), fill="black", width=12)
+            draw.line((left + 10, 735, left + 36, 760), fill="black", width=10)
+        regions = [{
+            "label": "handwritten name",
+            "box": [150, 680, 220, 120],
+        }]
+
+        supplemented = pipeline.supplement_black_handwriting_peer_regions(
+            page, regions,
+        )
+
+        self.assertEqual(2, len(supplemented))
+        self.assertTrue(all(
+            region["label"] == "handwritten declaration peer"
+            for region in supplemented
+        ))
+        self.assertLess(supplemented[0]["box"][0], 200)
+        self.assertGreater(supplemented[1]["box"][0], 600)
+
+    def test_black_handwriting_peer_supplement_ignores_colored_page(self):
+        page = Image.new("RGB", (1000, 1500), "white")
+        draw = ImageDraw.Draw(page)
+        for row in range(50, 1450, 20):
+            draw.line((50, row, 950, row), fill=(20, 60, 180), width=3)
+        regions = [{
+            "label": "handwritten name",
+            "box": [150, 680, 220, 120],
+        }]
+
+        supplemented = pipeline.supplement_black_handwriting_peer_regions(
+            page, regions,
+        )
+
+        self.assertEqual(regions, supplemented)
+
+    @patch.object(pipeline, "_large_black_handwriting_components")
+    def test_uncovered_group_supplement_adds_text_but_not_signature(
+        self, components,
+    ):
+        components.return_value = [
+            (100, 300, 130, 370), (150, 305, 180, 365), (200, 310, 230, 360),
+            (500, 500, 540, 610), (570, 510, 610, 600),
+            (700, 520, 730, 590), (750, 525, 780, 585), (800, 530, 830, 580),
+        ]
+        regions = [
+            {"label": "handwritten declaration peer", "box": [80, 280, 180, 110]},
+            {"label": "handwritten declaration peer", "box": [300, 280, 180, 110]},
+        ]
+
+        supplemented = pipeline.supplement_uncovered_black_handwriting_groups(
+            Image.new("RGB", (1000, 1000), "white"), regions,
+        )
+
+        self.assertEqual(3, len(supplemented))
+        self.assertEqual("handwritten stroke group", supplemented[-1]["label"])
+        self.assertGreater(supplemented[-1]["box"][0], 650)
 
     def test_detection_dedup_drops_oversized_containing_compact_field(self):
         regions = [
@@ -924,6 +1295,22 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertEqual(1, len(deduplicated))
         self.assertEqual([431, 658, 895, 642], deduplicated[0]["box"])
+
+    def test_detection_dedup_drops_same_label_clipped_fragment(self):
+        regions = [
+            {
+                "label": "small handwritten note at top right",
+                "box": [688, 0, 68, 38],
+            },
+            {
+                "label": "small handwritten note at top right",
+                "box": [672, 18, 117, 58],
+            },
+        ]
+
+        deduplicated = pipeline.deduplicate_detection_regions(regions, 1008, 943)
+
+        self.assertEqual([regions[1]], deduplicated)
 
     def test_detection_dedup_overlap_chain_does_not_grow_crop(self):
         regions = [
@@ -1342,6 +1729,48 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertNotIn("hash_confidence", candidate["ocr"])
         self.assertNotIn("confidence", candidate["ocr"]["words"][0])
 
+    def test_eligible_ivrit_candidate_breaks_visual_tie(self):
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "מויש פאלרמו",
+            "notes": [],
+            "needs_review": True,
+        }
+        evidence = {
+            "status": "complete",
+            "text": "מרטין פאלרמו",
+            "selected_variant": "blue_only",
+            "advisory_gate": {
+                "eligible": True,
+                "reason": "preprocessing_consensus",
+                "vision_source": "core4_multi",
+                "character_agreement": 0.7619,
+            },
+        }
+
+        selected = pipeline.prefer_eligible_ivrit_candidate(final, evidence)
+
+        self.assertEqual("מרטין פאלרמו", selected["final_transcription"])
+        self.assertEqual("ivrit_eligible_tiebreak", selected["decision_status"])
+        self.assertEqual("מויש פאלרמו", selected["alternative_transcriptions"][0])
+        self.assertNotIn("confidence", selected["ivrit_tiebreak"])
+
+    def test_ineligible_ivrit_candidate_cannot_replace_visual_result(self):
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "שלום",
+        }
+        evidence = {
+            "status": "complete",
+            "text": "חלום",
+            "advisory_gate": {"eligible": False, "reason": "unrelated"},
+        }
+
+        self.assertIs(
+            final,
+            pipeline.prefer_eligible_ivrit_candidate(final, evidence),
+        )
+
     def test_ivrit_blue_only_recovers_overlapping_single_line_segmentation(self):
         image = Image.new("RGB", (220, 110), "white")
         draw = ImageDraw.Draw(image)
@@ -1538,6 +1967,45 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("numeric_order_guard", final["decision_status"])
         self.assertEqual("handwritten_text", final["classification"])
 
+    def test_numeric_field_separates_standalone_x_mark(self):
+        final = {
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "final_transcription": "X 0,2 00,3,0,0,0",
+            "notes": [],
+        }
+
+        separated = pipeline.separate_numeric_field_marks(final)
+
+        self.assertEqual("0,2 00,3,0,0,0", separated["final_transcription"])
+        self.assertEqual(["x"], separated["marks"])
+        self.assertEqual("structured_mark_separation", separated["decision_status"])
+
+    def test_numeric_mark_separation_does_not_change_untyped_field(self):
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "012 056 x 6389",
+        }
+
+        self.assertIs(final, pipeline.separate_numeric_field_marks(final))
+
+    def test_numeric_s_homoglyph_normalizes_numeric_only_result(self):
+        final = {"final_transcription": "SSS6790", "notes": []}
+
+        normalized = pipeline.normalize_numeric_s_homoglyph(final)
+
+        self.assertEqual("5556790", normalized["final_transcription"])
+        self.assertEqual(
+            "numeric_homoglyph_normalization", normalized["decision_status"]
+        )
+
+    def test_numeric_s_homoglyph_rejects_semantic_or_hebrew_text(self):
+        semantic = {"final_transcription": "853 O+ 1/8/26"}
+        hebrew = {"final_transcription": "סניף S56790"}
+
+        self.assertIs(semantic, pipeline.normalize_numeric_s_homoglyph(semantic))
+        self.assertIs(hebrew, pipeline.normalize_numeric_s_homoglyph(hebrew))
+
     def test_candidate_protection_rejects_reorder_and_information_loss(self):
         usable = [{
             "source": "core4_multi",
@@ -1573,6 +2041,98 @@ class ConcurrentJobTests(unittest.TestCase):
         ))
         self.assertTrue(pipeline.should_contextual_recheck(
             {"classification": "handwritten_text", "final_transcription": "134/26"}, easy
+        ))
+
+    def test_high_uncertainty_rescue_requires_explicit_marker_and_no_text(self):
+        self.assertTrue(pipeline.should_high_uncertainty_rescue(
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "[?]",
+            },
+            signature_flourish=False,
+        ))
+        self.assertFalse(pipeline.should_high_uncertainty_rescue(
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "מילה[?]",
+            },
+            signature_flourish=False,
+        ))
+        self.assertFalse(pipeline.should_high_uncertainty_rescue(
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "",
+            },
+            signature_flourish=False,
+        ))
+        self.assertFalse(pipeline.should_high_uncertainty_rescue(
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "[?]",
+            },
+            signature_flourish=True,
+        ))
+
+    def test_high_uncertainty_rescue_accepts_only_confident_hebrew_text(self):
+        current = {
+            "classification": "handwritten_text",
+            "final_transcription": "[?]",
+            "confidence": 0.0,
+        }
+        accepted = pipeline.accept_high_uncertainty_rescue(current, {
+            "classification": "handwritten_text",
+            "final_transcription": "הפועלים",
+            "confidence": 0.70,
+        })
+
+        self.assertEqual("הפועלים", accepted["final_transcription"])
+        for rejected in (
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "encircling mark",
+                "confidence": 0.95,
+            },
+            {
+                "classification": "signature_non_text",
+                "final_transcription": "הפועלים",
+                "confidence": 0.95,
+            },
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "הפועלים",
+                "confidence": 0.69,
+            },
+        ):
+            self.assertIs(
+                current,
+                pipeline.accept_high_uncertainty_rescue(current, rejected),
+            )
+
+    def test_empty_no_handwriting_is_excluded_only_without_blind_text(self):
+        empty = {
+            "classification": "no_handwriting",
+            "final_transcription": "",
+        }
+
+        self.assertFalse(pipeline.should_emit_region(
+            empty, [{"full_transcription": ""}]
+        ))
+        self.assertTrue(pipeline.should_emit_region(
+            empty, [{"full_transcription": "כתב"}]
+        ))
+        self.assertTrue(pipeline.should_emit_region(
+            {
+                "classification": "no_handwriting",
+                "final_transcription": "[?] כתב",
+            },
+            [{"full_transcription": ""}],
+        ))
+        self.assertTrue(pipeline.should_emit_region(
+            {
+                "classification": "signature_non_text",
+                "final_transcription": "",
+            },
+            [{"full_transcription": ""}],
         ))
 
     def test_contextual_images_include_larger_crop_and_full_page(self):
@@ -1676,6 +2236,34 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("אורנים", unprotected["final_transcription"])
         self.assertEqual("contextual_recheck", unprotected["decision_status"])
 
+        related_vision = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "האלתיים[?]"},
+        }]
+        eligible_ivrit = {
+            **ivrit,
+            "advisory_gate": {
+                "eligible": True,
+                "reason": "related_compact_hebrew",
+                "vision_source": "core4_multi",
+                "character_agreement": 0.6667,
+            },
+        }
+        protected_by_eligible_hash = (
+            pipeline.protect_contextual_recheck_with_cross_engine_agreement(
+                current, recheck, accepted, related_vision, eligible_ivrit,
+            )
+        )
+        self.assertEqual(
+            "בארותיים", protected_by_eligible_hash["final_transcription"]
+        )
+        self.assertEqual(
+            "core4_multi",
+            protected_by_eligible_hash["cross_engine_agreement"][
+                "vision_correlated_source"
+            ],
+        )
+
     def test_repeated_structured_field_uses_stronger_one_digit_match(self):
         regions = [
             {"label": "top form customer number"},
@@ -1699,6 +2287,26 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("cross_region_structured_consensus", reconciled[1]["decision_status"])
         self.assertEqual("6252731", reconciled[1]["alternative_transcriptions"][0])
 
+    def test_repeated_structured_field_ignores_positional_label_words(self):
+        finals = [
+            {
+                "final_transcription": "5252 731",
+                "words": [{"text": "5252", "confidence": 0.99}],
+            },
+            {"final_transcription": "6252731", "words": []},
+        ]
+        regions = [
+            {"label": "handwritten number on next line"},
+            {"label": "handwritten number below lower table"},
+        ]
+
+        reconciled = pipeline.reconcile_repeated_structured_fields(finals, regions)
+
+        self.assertEqual("5252 731", reconciled[1]["final_transcription"])
+        self.assertEqual(
+            "cross_region_structured_consensus", reconciled[1]["decision_status"]
+        )
+
     def test_repeated_structured_field_rejects_weak_or_non_identifier_matches(self):
         weak = pipeline.reconcile_repeated_structured_fields(
             [
@@ -1720,6 +2328,133 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertEqual("6252731", weak[1]["final_transcription"])
         self.assertEqual("13/7/26", dates[1]["final_transcription"])
+
+    def test_repeated_date_uses_contextual_value_seen_in_another_region(self):
+        finals = [
+            {
+                "final_transcription": "7/2/26",
+                "contextual_evidence": {
+                    "final_transcription": "7/7/26",
+                    "alternative_transcriptions": ["7/2/26"],
+                },
+            },
+            {"final_transcription": "7/7/26"},
+        ]
+
+        reconciled = pipeline.reconcile_repeated_dates(
+            finals, [{"label": "date"}, {"label": "date"}],
+        )
+
+        self.assertEqual("7/7/26", reconciled[0]["final_transcription"])
+        self.assertEqual(
+            "cross_region_date_consensus", reconciled[0]["decision_status"]
+        )
+        self.assertEqual(
+            2, reconciled[0]["cross_region_date_consensus"]["matched_region"]
+        )
+
+    def test_repeated_date_rejects_unsupported_or_multi_date_change(self):
+        finals = [
+            {
+                "final_transcription": "10/7/23",
+                "contextual_evidence": {"final_transcription": "10/7/26"},
+            },
+            {"final_transcription": "11/7/26"},
+            {
+                "final_transcription": "31/12/26 7/7/26",
+                "contextual_evidence": {"final_transcription": "31/12/26 7/7/26"},
+            },
+        ]
+
+        reconciled = pipeline.reconcile_repeated_dates(
+            finals,
+            [{"label": "date"}, {"label": "date"}, {"label": "dates"}],
+        )
+
+        self.assertEqual("10/7/23", reconciled[0]["final_transcription"])
+        self.assertEqual("31/12/26 7/7/26", reconciled[2]["final_transcription"])
+
+    def test_cu_numeric_consensus_repairs_unique_one_edit_token(self):
+        reconciled = pipeline.reconcile_with_cu_numeric_tokens(
+            [{
+                "field_type": "numeric",
+                "final_transcription": "767735",
+                "notes": [],
+            }],
+            [{"label": "handwritten reference number"}],
+            "reference 7637735",
+        )
+
+        self.assertEqual("7637735", reconciled[0]["final_transcription"])
+        self.assertEqual("cu_numeric_consensus", reconciled[0]["decision_status"])
+
+    def test_cu_numeric_consensus_rejects_present_untyped_date_or_ambiguous(self):
+        present = pipeline.reconcile_with_cu_numeric_tokens(
+            [{"field_type": "numeric", "final_transcription": "5252731"}],
+            [{"label": "number"}],
+            "5252731 6252731",
+        )
+        untyped = pipeline.reconcile_with_cu_numeric_tokens(
+            [{"final_transcription": "767735"}],
+            [{"label": "reference number"}],
+            "7637735",
+        )
+        date = pipeline.reconcile_with_cu_numeric_tokens(
+            [{"field_type": "numeric", "final_transcription": "10/7/23"}],
+            [{"label": "date"}],
+            "10/7/26",
+        )
+        ambiguous = pipeline.reconcile_with_cu_numeric_tokens(
+            [{"field_type": "numeric", "final_transcription": "767735"}],
+            [{"label": "number"}],
+            "7637735 7677350",
+        )
+
+        self.assertEqual("5252731", present[0]["final_transcription"])
+        self.assertEqual("767735", untyped[0]["final_transcription"])
+        self.assertEqual("10/7/23", date[0]["final_transcription"])
+        self.assertEqual("767735", ambiguous[0]["final_transcription"])
+
+    def test_uncertain_repeated_number_uses_region_and_cu_agreement(self):
+        reconciled = pipeline.reconcile_uncertain_repeated_numbers(
+            [
+                {"field_type": "unknown", "final_transcription": "5556790"},
+                {
+                    "field_type": "numeric",
+                    "final_transcription": "5556[?]8",
+                    "notes": [],
+                },
+            ],
+            [{"label": "colored handwriting"}, {"label": "colored handwriting"}],
+            "ID 5556790",
+        )
+
+        self.assertEqual("5556790", reconciled[1]["final_transcription"])
+        self.assertEqual(
+            "repeated_numeric_cu_consensus", reconciled[1]["decision_status"]
+        )
+
+    def test_uncertain_repeated_number_requires_uncertainty_and_unique_cu_support(self):
+        no_question = pipeline.reconcile_uncertain_repeated_numbers(
+            [
+                {"final_transcription": "5556790"},
+                {"field_type": "numeric", "final_transcription": "555678"},
+            ],
+            [{}, {}],
+            "5556790",
+        )
+        ambiguous = pipeline.reconcile_uncertain_repeated_numbers(
+            [
+                {"final_transcription": "5556790"},
+                {"final_transcription": "5556789"},
+                {"field_type": "numeric", "final_transcription": "5556[?]8"},
+            ],
+            [{}, {}, {}],
+            "5556790 5556789",
+        )
+
+        self.assertEqual("555678", no_question[1]["final_transcription"])
+        self.assertEqual("5556[?]8", ambiguous[2]["final_transcription"])
 
     def test_contextual_acceptance_rejects_script_change_and_lost_structured_token(self):
         hebrew = {"final_transcription": "ביוב", "words": []}
@@ -1824,6 +2559,46 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertTrue(pipeline.is_signature_flourish(signature))
         self.assertFalse(pipeline.is_signature_flourish(word))
+
+    def test_black_signature_geometry_accepts_dominant_flourish(self):
+        signature = Image.new("RGB", (400, 160), "white")
+        draw = ImageDraw.Draw(signature)
+        draw.line((10, 130, 360, 35), fill="black", width=9)
+        draw.arc((110, 20, 300, 145), 20, 320, fill="black", width=8)
+        word = Image.new("RGB", (400, 160), "white")
+        draw = ImageDraw.Draw(word)
+        for left in (30, 100, 170, 240, 310):
+            draw.line((left, 130, left + 35, 35), fill="black", width=8)
+
+        self.assertTrue(pipeline.is_black_signature_flourish(signature))
+        self.assertFalse(pipeline.is_black_signature_flourish(word))
+
+    def test_empty_signature_notes_promote_geometry_backed_signature(self):
+        final = pipeline.finalize_region_semantics(
+            {
+                "classification": "handwritten_text",
+                "final_transcription": "",
+                "notes": ["נראה קו חתימה/שרבוט לא טקסטואלי"],
+            },
+            [],
+            signature_flourish=True,
+        )
+
+        self.assertEqual("signature_non_text", final["classification"])
+        self.assertEqual("signature_non_text", final["decision_status"])
+
+    def test_signature_notes_without_geometry_remain_text(self):
+        final = {
+            "classification": "handwritten_text",
+            "final_transcription": "",
+            "notes": ["signature-like but uncertain"],
+        }
+
+        resolved = pipeline.finalize_region_semantics(
+            final, [], signature_flourish=False,
+        )
+
+        self.assertEqual("handwritten_text", resolved["classification"])
 
     def test_mark_semantics_render_x_and_number(self):
         final = pipeline.finalize_region_semantics(
@@ -2006,6 +2781,11 @@ class ConcurrentJobTests(unittest.TestCase):
         final = {
             "classification": "handwritten_text",
             "final_transcription": "שלום",
+            "pre_high_rescue_transcription": "[?]",
+            "high_uncertainty_evidence": {
+                "final_transcription": "שלום",
+                "confidence": 0.72,
+            },
             "words": [],
             "notes": [],
         }
@@ -2044,11 +2824,80 @@ class ConcurrentJobTests(unittest.TestCase):
         saved_ivrit = json.loads((region_dir / "ivrit_ocr.json").read_text())
         saved_result = json.loads((region_dir / "result.json").read_text())
         saved_progress = json.loads((output_dir / "ocr_progress.json").read_text())
+        combined = json.loads((output_dir / "handwriting_result.json").read_text())
         self.assertEqual("שלום", saved_ivrit["text"])
         self.assertTrue(saved_ivrit["advisory_gate"]["eligible"])
         self.assertEqual("שלום", saved_result["ivrit_ocr"]["text"])
+        self.assertEqual("[?]", saved_result["pre_high_rescue_transcription"])
+        self.assertEqual(
+            "שלום", saved_result["high_uncertainty_evidence"]["final_transcription"]
+        )
+        self.assertEqual(
+            saved_result["high_uncertainty_evidence"],
+            combined["regions"][0]["high_uncertainty_evidence"],
+        )
         self.assertEqual("שלום", saved_progress["regions"][0]["ivrit_ocr"]["text"])
         self.assertEqual(1, len(saved_result["per_image"]))
+
+    def test_pipeline_uses_cu_numeric_evidence_without_model_context(self):
+        input_path = self.output_dir / "numeric-region.png"
+        Image.new("RGB", (120, 80), "white").save(input_path)
+        output_dir = self.output_dir / "cu-numeric-output"
+        gpt_read = {
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "full_transcription": "058329",
+            "words": [],
+        }
+        final = {
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "final_transcription": "058329",
+            "words": [],
+            "notes": [],
+        }
+
+        with patch.object(pipeline, "OCR_STRATEGY", "standard"), \
+             patch.object(pipeline, "NEARBY_CU_CONTEXT", False), \
+             patch.object(pipeline, "detect_handwriting_regions", return_value=[{
+                 "label": "handwritten phone number", "box": [0, 0, 120, 80],
+             }]), \
+             patch.object(
+                 pipeline, "ivrit_ocr_service_status", return_value=(False, "disabled")
+             ), \
+             patch.object(pipeline, "ocr_image_set", return_value=gpt_read), \
+             patch.object(pipeline, "should_contextual_recheck", return_value=False), \
+             patch.object(
+                 pipeline, "visual_reconcile_ocr_results", return_value=final,
+             ) as visual_reconcile, \
+             patch.object(pipeline, "cu_ocr_markdown", return_value="phone 058328"), \
+             patch.object(
+                 pipeline, "build_merged_html", return_value=output_dir / "merged.html"
+             ), \
+             patch.object(pipeline, "build_merged_jpg", return_value=None), \
+             patch.object(
+                 pipeline, "build_merged_markdown", return_value=output_dir / "merged.md"
+             ):
+            return_code = pipeline.run_pipeline(
+                str(input_path),
+                page=1,
+                dpi=400,
+                crops=None,
+                output_dir=str(output_dir),
+                chunk_width=900,
+                overlap=150,
+                ocr_mode="full",
+                auto_detect=True,
+                merge_md=True,
+            )
+
+        result = json.loads((output_dir / "handwriting_result.json").read_text())
+        self.assertEqual(0, return_code)
+        self.assertEqual("", visual_reconcile.call_args.args[2])
+        self.assertEqual("058328", result["regions"][0]["final_transcription"])
+        self.assertEqual(
+            "cu_numeric_consensus", result["regions"][0]["decision_status"]
+        )
 
     def test_standard_pipeline_retries_overlapping_hash_lines_with_blue_only(self):
         input_path = self.output_dir / "blue-form.png"

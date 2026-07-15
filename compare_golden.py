@@ -14,7 +14,7 @@ exact match. It:
 
 Usage:
   python3 compare_golden.py                 # compare output_handwriting/* vs golden/*
-  python3 compare_golden.py --run           # re-run the 3 samples first, then compare
+    python3 compare_golden.py --run           # re-run all registered samples, then compare
   python3 compare_golden.py --update-golden # snapshot current output as the new golden
 """
 from __future__ import annotations
@@ -35,6 +35,9 @@ SAMPLES = [
      "input": "sample/פרוטוקול משולב ידני ומודפס  דוגמה.pdf", "args": []},
     {"stem": "חיוב חשבון1", "input": "sample/חיוב חשבון1.pdf", "args": []},
     {"stem": "חיוב חשבון2", "input": "sample/חיוב חשבון2.pdf", "args": []},
+    {"stem": "דוח_אלעד", "input": "sample/דוח_אלעד.pdf", "args": []},
+    {"stem": "דוח_יוסי", "input": "sample/דוח_יוסי.pdf", "args": []},
+    {"stem": "דוח_כחלון", "input": "sample/דוח_כחלון.pdf", "args": []},
 ]
 
 OUTPUT_DIR = Path("output_handwriting")
@@ -254,7 +257,7 @@ def compare_sample(stem: str, current_result: Path | None = None) -> dict:
     md_ratio = (_ratio(gmd.read_text(encoding="utf-8"), cmd.read_text(encoding="utf-8"))
                 if gmd.exists() and cmd.exists() else None)
 
-    verdict = "PASS" if fails == 0 else "FAIL"
+    verdict = "PASS" if fails == 0 and not count_fail else "FAIL"
     return {
         "stem": stem, "rows": rows, "extras": extras,
         "golden_count": len(golden), "current_count": len(current),
@@ -338,7 +341,10 @@ def _update_golden() -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Regression check vs golden baseline.")
-    ap.add_argument("--run", action="store_true", help="re-run the 3 samples before comparing")
+    ap.add_argument(
+        "--run", action="store_true",
+        help="re-run all registered samples before comparing",
+    )
     ap.add_argument("--update-golden", action="store_true", help="snapshot current output as golden")
     ap.add_argument("--result", type=Path, help="score one saved handwriting_result.json")
     ap.add_argument("--golden-stem", choices=[sample["stem"] for sample in SAMPLES],

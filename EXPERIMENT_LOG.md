@@ -40,6 +40,10 @@ or reliability.
 - Word/glyph isolation is not adopted: it reduces cross-word semantic completion but also loses
   substantial Hebrew cursive accuracy.
 - Candidate-blind disagreement handling remains the strongest next direction.
+- Deterministic postprocessing is measured with `quality_replay.py`; CU evidence remains separate
+  from model-facing context.
+- High reasoning is not a general fallback. It is restricted to explicit uncertainty-only Hebrew
+  text after signature rejection.
 
 # Timeline
 
@@ -229,7 +233,18 @@ or reliability.
 - **Artifacts**: `analysis_results/חיוב חשבון1.pdf__2026-07-13_10-17-26/` and
   `...10-26-06/`.
 - **Outcome**: Faster in measured runs but did not outperform GPT-5.4 on the human-golden sample.
-- **Decision**: **AVAILABLE** for controlled experiments; hidden from normal customer picker.
+- **2026-07-15 UI integration**: The existing account-specific Copilot SDK backend is exposed as
+  `Claude Opus 4.8 · GitHub Copilot SDK · Core4`. The profile explicitly enables the standard
+  four-view multi-image Core4 call, high reasoning, visual reconciliation, and the existing
+  180-second timeout. The isolated-multiview strategy remains incompatible and selecting Claude
+  switches the UI back to `standard`.
+- **Fresh integrated validation**: `חיוב חשבון1.pdf__2026-07-15_18-00-19` completed through the
+  real SDK bridge with 21/21 detected regions, 67 Copilot calls, and 03:18 elapsed. It scored
+  7/20 strict exact text, approximately 0.75 mean region similarity, and 1/1 non-text
+  classification. Exact fields included `מרטין פאלרמו`, `5298570`, `4571130`, `בארותיים`,
+  `ביוב`, and `550`; important date/account errors remain. The configured account advertised
+  exact model ID `claude-opus-4.8` with vision enabled and policy state `enabled`.
+- **Decision**: **AVAILABLE** as an explicit high-cost experimental picker option; not the default.
 
 ### EXP-20260713-04: GitHub Copilot Gemini 3.5 Flash
 
@@ -666,8 +681,21 @@ or reliability.
   remains observational because Core4/visual outputs vary between runs. The live artifact also
   exposed a noisy `handwritten number` label on Hebrew `בארותיים`; the final gate ignores generic
   number labels when readings are nonnumeric and suppresses exact Core4-HASH duplicates.
+- **Eight-document deterministic ablation**: Replaying the final selective HASH replacement over
+  all 70 human text regions changed only three finals, all on `חיוב חשבון1`. Exact text improved
+  from 29/70 without HASH to 31/70 with HASH, and strict normalized similarity improved from
+  0.687 to 0.704. It recovered exact `מרטין פאלרמו` and `בורוכוב`; the third field improved from
+  0.333 to 0.667 similarity without becoming exact. No exact field regressed. Only 3/77 emitted
+  regions were eligible, confirming that HASH is a narrow spelling corrector rather than a general
+  OCR authority.
+- **Operational cost**: A warm local MPS benchmark processed all 21 `חיוב חשבון1` crops in 0.99s
+  total (35ms median, 104ms p95, 165ms maximum). Calls overlap GPT work, so normal minutes-long
+  page latency is effectively unchanged. The meaningful cost is maintaining the separate local
+  Python 3.12/FastAPI/model service; a failed health check remains nonfatal.
 - **Decision**: **ADOPTED** with the deterministic selective gate. Keep all raw HASH evidence in
   artifacts/UI, never expose its confidence to GPT, and never use HASH as a standalone fallback.
+  Keep it default-on in this quality-first local environment, but optional and fail-open rather
+  than a required deployment dependency.
 
 ### EXP-20260715-20: Cross-Mac HASH discrepancy and crop normalization
 
@@ -710,17 +738,152 @@ or reliability.
 - **Root cause**: `accept_contextual_recheck` used information length, script, structured-token
   preservation, and self-reported confidence, but had no protection for exact independent source
   agreement. Printed semantic context could therefore anchor a plausible replacement.
-- **Change**: If the pre-context visual result, at least one faithful/Core4 candidate, and raw HASH
-  text agree exactly after normalization, a differing contextual reread cannot replace them. The
-  contextual text remains an alternative, the region is marked `needs_review`, and
-  `cross_engine_agreement` records the supporting sources and rejected context text. Normal
-  contextual correction remains unchanged when HASH or faithful visual evidence does not agree.
+- **Change**: If the pre-context visual result and raw HASH text agree exactly after normalization,
+  and Core4 either agrees exactly or supplied the measured correlation that admitted HASH through
+  the selective gate, a differing contextual reread cannot replace them. The contextual text
+  remains an alternative, the region is marked `needs_review`, and `cross_engine_agreement`
+  records exact/correlated sources and rejected context text. Normal contextual correction remains
+  unchanged when HASH is absent, unrelated, or ineligible.
 - **Exact replay**: Saved region 8 now selects `בארותיים`, retains `אורנים` and `אורנית[?]` as
   alternatives, and records `cross_engine_agreement_protected` instead of `contextual_recheck`.
 - **Validation**: Exact-artifact replay and focused positive/control regressions pass. The complete
   suite passes 142 tests; JavaScript syntax, editor diagnostics, and `git diff --check` pass.
 - **Decision**: **ADOPTED**. Nearby printed context remains useful, but one context reread cannot
   overrule exact agreement from visual/Core4 plus independent HASH.
+
+### EXP-20260715-22: Region 4 blue-ink noise isolation
+
+- **Status**: INCONCLUSIVE / SEGMENTATION CONFIRMED
+- **Question**: Does removing printed Hebrew, horizontal form rules, and distant handwriting make
+  HASH reliable on the noisy multiline region 4 from `חיוב חשבון2.pdf`?
+- **Input**: Exact `1158x352` production crop from run
+  `חיוב חשבון2.pdf__2026-07-15_10-07-50`. Original HASH produced three heavily overlapping lines:
+  `קך רב ת`, `הת אדז במתג`, and `ל`.
+- **Isolation**: Retained only blue-dominant pen pixels, removed connected components below eight
+  pixels, tested color and black-on-white renderings, bridged small rule-crossing gaps with `3x3`
+  and `5x5` morphological close, then separated complete components into upper/lower rows and five
+  horizontal groups. No printed pixels, form lines, GPT candidates, or semantic labels were sent.
+- **Result**: Cleanup fixed segmentation: the full blue-only crop collapsed three overlapping HASH
+  detections to one. It did not make transcription reliable. Full clean variants returned
+  `קנד צץ רמתא`, `קד ֶצ רמתא`, or `קד ֶצ רמא`; component rows remained incorrect. Correctly isolated
+  groups returned `רבן`, `ב`, `רמת על`, `אצף`, and `הנצהר`. The numeric `23/4` group becoming `אצף`
+  confirms HASH is unsuitable for digits here.
+- **Limit**: This region has no verified human transcription, so the test proves a segmentation
+  improvement but cannot establish an accuracy improvement. Visual inspection confirms the masks
+  preserve complete connected strokes and contain no cross-row leakage.
+- **Artifacts**: Ignored folder
+  `analysis_results/חיוב חשבון2.pdf__2026-07-15_10-07-50/region_04_ivrit_noise_test/` contains 13
+  image variants, both contact sheets, raw `ocr_results.json`, and `SUMMARY.md`.
+- **Decision**: **DO NOT ADOPT** as a global HASH input or authoritative reading. Retain the existing
+  narrow duplicate-line recovery. A future component-level trial must exclude numeric groups and
+  require agreement with Core4 or another independent visual source.
+
+### EXP-20260715-23: Kahlon stacked-form detection geometry
+
+- **Status**: ADOPTED / DETECTION GEOMETRY
+- **Failure**: Run `דוח_כחלון.pdf__2026-07-15_11-41-33` produced nine regions, including empty
+  header/table boxes, overlapping crops, printed-only body text, and lower-form labels mapped onto
+  the first declaration. Six final OCR regions were empty. The original detector map did not cover
+  the actual stacked declaration fields reliably.
+- **Root cause**: When the coarse page scan saw only the header, one `LOWER 80%` recovery image still
+  contained the table plus both declarations. The model stopped early and its candidates were
+  appended to the already incomplete coarse scan. Compact `date`/`name`/ID boxes were then expanded
+  through neighboring black print by generic ink chaining.
+- **Change**: Detection now sends aligned original and pen-stroke-isolated support views. A coarse
+  scan that truly lacks lower-page coverage triggers five overlapping vertical segments
+  (`0-30%`, `24-48%`, `42-66%`, `60-82%`, `76-100%`). Complete tiled coverage replaces only that
+  incomplete coarse result; partial tile failures retain coarse candidates, and tiles can recover
+  from a coarse-call timeout. A broad low-count trigger was tested and removed because it increased
+  model variance on otherwise complete pages. Structured labels keep local model geometry instead
+  of generic ink expansion.
+- **Monochrome cleanup**: Compact black-pen candidates below 0.6% thick-pen density are removed.
+  Same-kind overlapping tile boxes retain the crop with less stroke contact at its borders. A weak
+  compact candidate below 23% thick-stroke retention can move only to a nearby band with at least
+  30% retention, a 10-point improvement, and at least two glyph-like components; this prevents a
+  signature stroke from winning a date relocation.
+- **Peer recovery**: On monochrome declaration rows, a compact detected name/ID/entry anchors the
+  row. Large thick-stroke component groups recover an omitted peer name or ID on that same line.
+  A gated post-dedup pass restores other uncovered groups with at least three large components;
+  the two-component signature remains excluded. It is disabled on colored pages and does not
+  activate on Elad's ruled form rows. Generic number fields are excluded from duplicate removal
+  after replay caught an `אישור מסירה` building/apartment regression.
+- **Frozen replay**: The saved section candidates reduced from 11 to eight text fields. The empty
+  table cell and two clipped duplicates were removed. The misplaced first-declaration date moved
+  from printed text at `[1864, 1708, 389, 130]` to the complete handwritten `10/7/26` crop at
+  `[1867, 1987, 402, 99]`. Artifacts are in the ignored Kahlon run folder as
+  `detection_sectioned_probe.*`, `detection_cleaned_probe.png`, and
+  `detection_cleaned_date.png`.
+- **Validation**: Eight focused detector regressions and the complete suite pass. Total suite:
+  149 tests before the dedicated benchmark additions. A detection-only matrix against human
+  geometry achieved full recall on five known-good documents: `אישור מסירה` 8/8, `דוח_אלעד` 6/6,
+  `דוח_יוסי` 10/10, `חיוב חשבון1` 20/20, and `חיוב חשבון2` 13/13. Deterministic saved-map replay
+  preserved exact counts and zero center drift for all five. The final source-to-detector Kahlon
+  run scores 8/8 with zero extras and 0.010 average normalized center drift against its local
+  detection-only golden. `detection_regression.py` makes this matrix repeatable. Final full-suite,
+  compilation, editor-diagnostic, and `git diff --check` results pass; the final suite contains
+  157 tests.
+- **Decision**: **ADOPTED** as general stacked-form recovery and conservative monochrome compact
+  geometry. Generated probe artifacts remain ignored and are not runtime inputs.
+
+### EXP-20260715-24: Cross-document deterministic quality stack and bounded rescue
+
+- **Status**: **ADOPTED**, with broad high-reasoning and generic numeric/date rescues **REJECTED**.
+- **Question/Hypothesis**: Can independent evidence and narrow deterministic gates improve the
+  human-golden corpus without exposing answers to inference, increasing normal model calls, or
+  regressing known-good fields?
+- **Input and reference**: Six established saved runs (`אישור מסירה`, `חיוב חשבון1/2`, Elad,
+  Yossi, Kahlon), plus fresh current-code runs for `חוזר מכר` and `פרוטוקול`. Human goldens were
+  opened only during scoring.
+- **Inference isolation**: Runtime prompts received no golden text. `quality_replay.py` completes
+  detector cleanup and all postprocessing before importing golden values for measurement. The
+  high-reasoning review received only crop, highlighted page context, and the current unresolved
+  candidate.
+- **Model/config**: GPT-5.4 medium for normal detection/OCR; GPT-5.4 high only for rescue
+  experiments; two configured endpoints; HASH v1 local MPS sidecar as advisory evidence. Fresh
+  uncovered-document runs used 10 workers and default Core4 multi-image OCR.
+- **Accepted deterministic rules**: Strict eligible HASH replacement; numeric mark separation;
+  numeric `S→5` homoglyph normalization; repeated-date consensus; unique one-edit CU numeric
+  consensus; repeated structured-field consensus; dual-source uncertain repeated-number
+  consensus; and blue/black signature geometry. CU is collected after model reconciliation and
+  supplied only to deterministic rules when nearby model context is disabled.
+- **Accepted runtime rescue**: A second high-reasoning reread triggers only for a non-signature
+  `handwritten_text` value containing `[?]` and no resolved information. Acceptance requires
+  Hebrew output and confidence `>=0.70`. The exhaustive eligible-state scan found one explicit
+  uncertainty-only field; saved high reasoning recovered exact `הפועלים` at 0.72. Empty fields,
+  partial words, English semantic descriptions, signatures, and lower-confidence outputs remain
+  unchanged. Raw evidence is persisted as `high_uncertainty_recheck.json` and
+  `high_uncertainty_evidence`.
+- **Accepted geometry/output cleanup**: An exact descriptive-label compact fragment with >=45%
+  containment, >=1.5 area ratio, nearby centers, and <=5% page area is removed in favor of its
+  complete larger crop. Empty `no_handwriting` output is excluded only when every blind vision
+  read is empty; the record remains in `rejected_regions`. The detection scorer now permits a
+  tight crop >=80% contained in a broad human box while covering >=5% of that target.
+- **Established six-run result**: Exact text 19/66 -> 28/66 (28.8% -> 42.4%); strict normalized
+  similarity 0.658 -> 0.701; classification 5/7 -> 7/7. No additional model calls are required by
+  this deterministic stack.
+- **Eight-document result**: Exact text 20/70 -> 31/70; similarity 0.646 -> 0.704;
+  classification 5/7 -> 7/7. `חוזר מכר` replays from 1/3 to 3/3 exact and 0.611 to 1.000
+  similarity: duplicate top-note geometry collapses, and independent CU corrects phone
+  `058329→058328`. `פרוטוקול` emits one target region after dropping an empty seam false positive,
+  but its date remains 0/1 exact.
+- **Rejected high-cost experiments**: Broad high-reasoning contextual rereads produced only one
+  clear exact gain and several confident semantic regressions (`בי"ב` became an English mark
+  description; bank-name crops became signatures; names and dates remained wrong). Date-specific
+  protocol rereads correctly inferred field type but disagreed across `9/12`, `24/4/14`,
+  `29/04/1[?]`, and other values. Blue-only whole-date, RTL-group, and mechanically segmented
+  three-group audits also disagreed. A candidate-free numeric audit recovered the final phone
+  glyph as `8`, but failed badly on the only other eligible numeric field; no generic glyph rescue
+  was integrated.
+- **Artifacts**: `analysis_results/high_context_review__2026-07-15/results.json`, fresh ignored
+  `חוזר מכר...__quality-current__2026-07-15/` and
+  `פרוטוקול...__quality-current__2026-07-15/` folders, plus per-region date/numeric review JSON.
+- **Validation**: Permanent trigger, acceptance, CU-flow, output-filter, detector-dedup, scorer,
+  and replay tests cover every accepted gate. `quality_replay.py` reproduces the six- and
+  eight-document totals without model calls. Final suite: 182 tests; compilation, editor
+  diagnostics, and `git diff --check` are clean.
+- **Decision**: Keep deterministic, independently corroborated changes and the single explicit
+  uncertainty-only fallback. Preserve the protocol date as unresolved; do not force a plausible
+  date or deploy broad high reasoning.
 
 # Experiment Template
 

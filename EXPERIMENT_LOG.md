@@ -885,6 +885,32 @@ or reliability.
   uncertainty-only fallback. Preserve the protocol date as unresolved; do not force a plausible
   date or deploy broad high reasoning.
 
+### EXP-20260715-25: Candidate-blind Hebrew-versus-numeric script conflict
+
+- **Status**: **ADOPTED / REVIEW-GATED**.
+- **Failure**: On `חיוב חשבון2` region 13, human text `דנית ראובן` repeatedly became numeric
+  variants (`12/2/13`, `1242 13`, `2142 13`). Core4 first classified the cursive Hebrew strokes as
+  digits. The HASH result contained nine Hebrew letters but was rejected as
+  `structured_or_numeric_region`; the ordinary contextual reread then received the numeric
+  candidate plus a preservation instruction and repeated it.
+- **Root cause**: Circular script anchoring, not HASH replacement. Disabling HASH would remove the
+  only independent evidence that the region may be Hebrew while leaving the original Core4
+  numeric mistake unchanged.
+- **Change**: Before ordinary context, numeric-only Core4 output plus substantial Hebrew HASH
+  evidence can trigger a high-reasoning candidate-blind audit. It receives original, blue-only,
+  local-context, and full-page images but no OCR strings. A Hebrew `name/address/free_text` result
+  at confidence >=0.55 may replace the digits. A credible Hebrew result at confidence >=0.35 is
+  retained with uncertainty and `needs_review`; false digits remain only as an alternative.
+- **Safety gate**: Trigger only for strong name-slot labels, or generic colored handwriting with
+  at least three HASH line fragments; exclude dates, phone/email/account/reference/ID, signatures,
+  marks, amounts, totals, numbers, and codes. Eight-document saved-run replay triggered exactly
+  one of 77 emitted regions: this failing field.
+- **Candidate-blind probe**: Without golden text or prior OCR candidates, the audit classified the
+  strokes as Hebrew `name` and returned `ב[?]לין` at 0.39. Exact letters remain unresolved, but the
+  false numeric output is no longer represented as confident text.
+- **Decision**: Keep HASH enabled as the conflict signal. Prefer honest uncertain Hebrew plus
+  review over a confidently wrong numeric transcription.
+
 # Experiment Template
 
 Copy this section for every new experiment.

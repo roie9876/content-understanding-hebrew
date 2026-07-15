@@ -534,6 +534,15 @@ high-reasoning reread is even narrower: it runs only when non-signature text rem
 `>=0.70`. Empty `no_handwriting` detections are omitted from exported/merged regions only when all
 blind vision reads are also empty; their diagnostics remain in `rejected_regions`.
 
+When Core4 returns only digits but independent HASH output contains substantial Hebrew in a
+name/text slot, the pipeline performs a candidate-blind script audit before the normal contextual
+reread. It sends the tight crop, blue-only support, larger context, and highlighted page without
+either OCR candidate. A confident Hebrew name replaces the digits; a lower-confidence but credible
+Hebrew result is emitted with `[?]` and `needs_review` instead of preserving false numeric text.
+The audit is intentionally narrow: strong name-slot labels, or a generic colored-handwriting label
+with at least three overlapping HASH fragments. Dates, accounts, amounts, IDs, and normal numeric
+fields are excluded.
+
 For crop/detection changes, run the detector without OCR or reconciliation. It matches current
 boxes against human text-region geometry, supports tight crops inside older broad/overlapping
 golden boxes, and fails on missed regions, excessive extras, or large center drift:

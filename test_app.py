@@ -1729,6 +1729,159 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertNotIn("hash_confidence", candidate["ocr"])
         self.assertNotIn("confidence", candidate["ocr"]["words"][0])
 
+    def test_hebrew_numeric_script_conflict_requires_semantic_text_slot(self):
+        final = {
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "final_transcription": "1242 13",
+        }
+        evidence = {
+            "status": "complete",
+            "text": "צתראך\nות כ\nץ",
+        }
+
+        self.assertTrue(pipeline.should_recheck_hebrew_numeric_script_conflict(
+            final, evidence, {"label": "handwritten acknowledgment entry"}
+        ))
+        for label in (
+            "handwritten date",
+            "account number",
+            "black handwritten form row 4",
+        ):
+            self.assertFalse(
+                pipeline.should_recheck_hebrew_numeric_script_conflict(
+                    final, evidence, {"label": label}
+                ),
+                label,
+            )
+        self.assertTrue(pipeline.should_recheck_hebrew_numeric_script_conflict(
+            final,
+            {**evidence, "lines": [{}, {}, {}]},
+            {"label": "colored handwriting"},
+        ))
+        self.assertFalse(pipeline.should_recheck_hebrew_numeric_script_conflict(
+            final,
+            {**evidence, "lines": [{}]},
+            {"label": "colored handwriting"},
+        ))
+        self.assertFalse(pipeline.should_recheck_hebrew_numeric_script_conflict(
+            {**final, "final_transcription": "דנית ראובן"},
+            evidence,
+            {"label": "handwritten acknowledgment entry"},
+        ))
+
+    def test_script_conflict_recheck_is_candidate_blind(self):
+        page = Image.new("RGB", (800, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        draw.line((300, 400, 500, 400), fill="black", width=2)
+        draw.line((330, 360, 470, 430), fill=(30, 70, 190), width=8)
+        response = {
+            "script": "hebrew",
+            "classification": "handwritten_text",
+            "field_type": "name",
+            "final_transcription": "דנית ראובן",
+            "confidence": 0.61,
+        }
+
+        with patch.object(
+            pipeline, "_responses_call", return_value=response,
+        ) as responses_call:
+            result, images = pipeline.script_conflict_region_recheck(
+                page,
+                {"label": "handwritten acknowledgment entry", "box": [300, 340, 200, 100]},
+            )
+
+        prompt_text = "\n".join(
+            item.get("text", "")
+            for item in responses_call.call_args.args[0]
+            if item.get("type") == "input_text"
+        )
+        self.assertEqual(response, result)
+        self.assertIn("NO prior OCR strings", prompt_text)
+        self.assertNotIn("1242 13", prompt_text)
+        self.assertIn("context", images)
+        self.assertIn("page", images)
+        self.assertEqual("high", responses_call.call_args.kwargs["reasoning"])
+
+    def test_script_conflict_acceptance_requires_confident_hebrew_name(self):
+        current = {
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "final_transcription": "1242 13",
+        }
+        accepted = pipeline.accept_hebrew_numeric_script_recheck(current, {
+            "script": "hebrew",
+            "classification": "handwritten_text",
+            "field_type": "name",
+            "final_transcription": "דנית ראובן",
+            "confidence": 0.61,
+            "notes": [],
+        })
+
+        self.assertEqual("דנית ראובן", accepted["final_transcription"])
+        self.assertEqual(
+            "hebrew_numeric_script_conflict", accepted["decision_status"]
+        )
+        self.assertIn("1242 13", accepted["alternative_transcriptions"])
+        self.assertTrue(accepted["needs_review"])
+        for rejected in (
+            {
+                "script": "numeric",
+                "classification": "handwritten_text",
+                "field_type": "numeric",
+                "final_transcription": "1242 13",
+                "confidence": 0.95,
+            },
+            {
+                "script": "hebrew",
+                "classification": "handwritten_text",
+                "field_type": "name",
+                "final_transcription": "בן כהן",
+                "confidence": 0.54,
+            },
+            {
+                "script": "hebrew",
+                "classification": "handwritten_text",
+                "field_type": "name",
+                "final_transcription": "דנית 13",
+                "confidence": 0.90,
+            },
+        ):
+            self.assertIs(
+                current,
+                pipeline.accept_hebrew_numeric_script_recheck(current, rejected),
+            )
+
+    def test_low_confidence_hebrew_script_replaces_false_digits_for_review(self):
+        current = {
+            "classification": "handwritten_text",
+            "field_type": "numeric",
+            "final_transcription": "2142 13",
+        }
+        recheck = {
+            "script": "hebrew",
+            "classification": "handwritten_text",
+            "field_type": "name",
+            "final_transcription": "ב[?]לין",
+            "confidence": 0.39,
+            "notes": [],
+        }
+
+        unresolved = pipeline.preserve_uncertain_hebrew_script_conflict(
+            current, recheck,
+        )
+
+        self.assertEqual("ב[?]לין", unresolved["final_transcription"])
+        self.assertEqual("script_conflict_unresolved", unresolved["decision_status"])
+        self.assertTrue(unresolved["needs_review"])
+        self.assertIn("2142 13", unresolved["alternative_transcriptions"])
+        self.assertIs(
+            current,
+            pipeline.preserve_uncertain_hebrew_script_conflict(
+                current, {**recheck, "confidence": 0.34}
+            ),
+        )
+
     def test_eligible_ivrit_candidate_breaks_visual_tie(self):
         final = {
             "classification": "handwritten_text",

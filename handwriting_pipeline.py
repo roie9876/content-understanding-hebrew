@@ -1100,6 +1100,44 @@ def ivrit_ocr_candidate(evidence: dict) -> dict | None:
     }
 
 
+def should_recheck_hebrew_numeric_script_conflict(
+    final: dict, evidence: dict, region: dict,
+) -> bool:
+    """Escalate a numeric read when independent OCR sees Hebrew in a text slot."""
+    if final.get("classification") in {"signature_non_text", "no_handwriting"}:
+        return False
+    text = str(final.get("final_transcription") or "").replace("[?]", "")
+    compact = re.sub(r"[\s,./:+-]", "", text)
+    if len(compact) < 2 or not compact.isdigit():
+        return False
+    if evidence.get("status") != "complete":
+        return False
+    if len(_hebrew_letter_sequence(str(evidence.get("text") or ""))) < 4:
+        return False
+    label = str(region.get("label") or "")
+    if re.search(
+        r"\b(?:date|phone|email|account|reference|identifier|signature|"
+        r"mark|checkbox|amount|total|number|code|id)\b",
+        label,
+        re.I,
+    ):
+        return False
+    strong_text_slot = re.search(
+        r"\b(?:name|acknowledg\w*|instruction\w*|recipient|beneficiary|"
+        r"holder|owner)\b",
+        label,
+        re.I,
+    )
+    generic_multiline_conflict = (
+        label.strip().lower() in {
+            "handwriting", "colored handwriting", "blue handwriting",
+        }
+        and str(final.get("field_type") or "").lower() != "date"
+        and len(evidence.get("lines") or []) >= 3
+    )
+    return bool(strong_text_slot or generic_multiline_conflict)
+
+
 def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
     # Raw per-image OCR keeps the original image evidence and reasoning quality.
     return _responses_call([
@@ -2401,6 +2439,127 @@ Return JSON only:
         {"type": "input_image", "image_url": _to_data_uri(highlighted_page)},
     ], retries=0, max_tokens=10000, reasoning=reasoning)
     return result, (context_image, highlighted_page)
+
+
+def script_conflict_region_recheck(
+    page_img: Image.Image, region: dict, printed_context: str = "",
+) -> tuple[dict, dict[str, Image.Image]]:
+    """Resolve Hebrew-versus-numeric disagreement without exposing OCR candidates."""
+    context_image, highlighted_page = build_contextual_region_images(
+        page_img, region["box"]
+    )
+    original_crop = crop_region(page_img, *region["box"])
+    blue_only = prepare_ivrit_blue_only_image(original_crop)
+    context_block = build_context_block(printed_context)
+    prompt = f"""Candidate-blind script audit for handwriting inside the RED rectangle.
+
+Independent OCR engines disagree whether these pen strokes are Hebrew letters or digits.
+You receive NO prior OCR strings. Determine the script directly from the visible strokes.
+
+Rules:
+- First classify script as hebrew, numeric, mixed, mark, signature, or none.
+- Use surrounding printed grammar only to identify the field type, never to invent its value.
+- If script is hebrew, transcribe the handwriting right-to-left.
+- If script is numeric, preserve physical left-to-right digit order.
+- Ignore black printed text and the horizontal form line crossing the blue handwriting.
+- Use [?] for unsupported characters. Do not substitute a plausible name for unclear strokes.
+{context_block}
+Return JSON only:
+{{
+  "script": "hebrew | numeric | mixed | mark | signature | none",
+  "classification": "handwritten_text | mark_or_checkbox | signature_non_text | no_handwriting",
+  "field_type": "date | numeric | name | address | free_text | mark | signature | unknown",
+  "final_transcription": "...",
+  "confidence": 0.0,
+  "alternative_transcriptions": [],
+  "words": [],
+  "notes": []
+}}
+"""
+    content: list[dict] = [
+        {"type": "input_text", "text": prompt},
+        {"type": "input_text", "text": "Authoritative tight original crop:"},
+        {"type": "input_image", "image_url": _to_data_uri(original_crop)},
+    ]
+    images = {
+        "original": original_crop,
+        "context": context_image,
+        "page": highlighted_page,
+    }
+    if blue_only is not None:
+        images["blue_only"] = blue_only
+        content.extend([
+            {"type": "input_text", "text": "Blue-pen-only support view:"},
+            {"type": "input_image", "image_url": _to_data_uri(blue_only)},
+        ])
+    content.extend([
+        {"type": "input_text", "text": "Larger context with target rectangle:"},
+        {"type": "input_image", "image_url": _to_data_uri(context_image)},
+        {"type": "input_text", "text": "Full page with the same target rectangle:"},
+        {"type": "input_image", "image_url": _to_data_uri(highlighted_page)},
+    ])
+    result = _responses_call(
+        content, retries=0, max_tokens=8000, reasoning="high"
+    )
+    return result, images
+
+
+def accept_hebrew_numeric_script_recheck(current: dict, recheck: dict) -> dict:
+    """Replace numeric text only with a confident candidate-blind Hebrew field read."""
+    text = str(recheck.get("final_transcription") or "").strip()
+    if (
+        str(recheck.get("script") or "").lower() != "hebrew"
+        or recheck.get("classification") != "handwritten_text"
+        or str(recheck.get("field_type") or "").lower()
+        not in {"name", "address", "free_text"}
+        or len(_hebrew_letter_sequence(text)) < 3
+        or re.search(r"\d", text)
+        or float(recheck.get("confidence", 0.0) or 0.0) < 0.55
+    ):
+        return current
+    accepted = dict(recheck)
+    alternatives = list(accepted.get("alternative_transcriptions") or [])
+    previous = str(current.get("final_transcription") or "")
+    if previous and previous != text and previous not in alternatives:
+        alternatives.append(previous)
+    accepted["alternative_transcriptions"] = alternatives
+    accepted.setdefault("notes", []).append(
+        "candidate-blind script audit replaced a numeric read with Hebrew text"
+    )
+    accepted["needs_review"] = True
+    accepted["decision_status"] = "hebrew_numeric_script_conflict"
+    accepted["pre_script_conflict_transcription"] = previous
+    accepted["script_conflict_evidence"] = recheck
+    return accepted
+
+
+def preserve_uncertain_hebrew_script_conflict(
+    current: dict, recheck: dict,
+) -> dict:
+    """Do not retain numeric text after a credible audit identifies Hebrew script."""
+    text = str(recheck.get("final_transcription") or "").strip()
+    if (
+        str(recheck.get("script") or "").lower() != "hebrew"
+        or recheck.get("classification") != "handwritten_text"
+        or len(_hebrew_letter_sequence(text)) < 3
+        or re.search(r"\d", text)
+        or float(recheck.get("confidence", 0.0) or 0.0) < 0.35
+    ):
+        return current
+    unresolved = dict(recheck)
+    previous = str(current.get("final_transcription") or "")
+    alternatives = list(unresolved.get("alternative_transcriptions") or [])
+    if previous and previous != text and previous not in alternatives:
+        alternatives.append(previous)
+    unresolved["alternative_transcriptions"] = alternatives
+    unresolved.setdefault("notes", []).append(
+        "candidate-blind script audit identified Hebrew but exact letters require review"
+    )
+    unresolved["needs_review"] = True
+    unresolved["decision_status"] = "script_conflict_unresolved"
+    unresolved["pre_script_conflict_transcription"] = previous
+    unresolved["script_conflict_evidence"] = recheck
+    return unresolved
 
 
 def should_high_uncertainty_rescue(
@@ -5338,6 +5497,45 @@ def run_pipeline(
             final = finalize_region_semantics(
                 final, semantic_usable, signature_flourish,
             )
+            if should_recheck_hebrew_numeric_script_conflict(
+                final, ivrit_results[ri], regions[ri],
+            ):
+                try:
+                    script_recheck, script_images = script_conflict_region_recheck(
+                        page_img, regions[ri], region_context,
+                    )
+                    _write_json_atomic(
+                        region_dirs[ri] / "script_conflict_recheck.json",
+                        script_recheck,
+                    )
+                    if "blue_only" in script_images:
+                        script_images["blue_only"].save(
+                            region_dirs[ri] / "08_script_blue_only.png"
+                        )
+                    script_images["context"].save(
+                        region_dirs[ri] / "09_script_context.png"
+                    )
+                    script_images["page"].save(
+                        region_dirs[ri] / "10_script_page.png"
+                    )
+                    script_resolved = dict(accept_hebrew_numeric_script_recheck(
+                        final, script_recheck,
+                    ))
+                    if script_resolved.get("final_transcription") != final.get(
+                        "final_transcription"
+                    ):
+                        return script_resolved
+                    unresolved = dict(preserve_uncertain_hebrew_script_conflict(
+                        final, script_recheck,
+                    ))
+                    if unresolved.get("final_transcription") != final.get(
+                        "final_transcription"
+                    ):
+                        return unresolved
+                except Exception as script_exc:
+                    final.setdefault("notes", []).append(
+                        f"script conflict recheck failed: {script_exc}"
+                    )
             if not should_contextual_recheck(final, usable):
                 return final
             try:
@@ -5524,6 +5722,10 @@ def run_pipeline(
                 "pre_high_rescue_transcription"
             ),
             "high_uncertainty_evidence": final.get("high_uncertainty_evidence"),
+            "pre_script_conflict_transcription": final.get(
+                "pre_script_conflict_transcription"
+            ),
+            "script_conflict_evidence": final.get("script_conflict_evidence"),
             "alternative_transcriptions": final.get("alternative_transcriptions", []),
             "words": final.get("words", []),
             "notes": final.get("notes", []),
@@ -5554,6 +5756,10 @@ def run_pipeline(
                 "pre_high_rescue_transcription"
             ),
             "high_uncertainty_evidence": final.get("high_uncertainty_evidence"),
+            "pre_script_conflict_transcription": final.get(
+                "pre_script_conflict_transcription"
+            ),
+            "script_conflict_evidence": final.get("script_conflict_evidence"),
             "ivrit_ocr": ivrit_results[i - 1],
             "numeric_cells": final.get("numeric_cells", []),
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),

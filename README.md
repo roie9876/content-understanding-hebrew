@@ -40,6 +40,25 @@ flowchart LR
 
 Authentication is **Microsoft Entra ID only** — no API keys are stored in the repo.
 
+## Quick start for team members
+
+```bash
+git clone https://github.com/roie9876/content-understanding-hebrew.git
+cd content-understanding-hebrew
+make setup
+cp .env.example .env
+# Edit .env with your team's Azure resource names, then authenticate.
+az login
+make check
+make run
+```
+
+Open [http://127.0.0.1:5173](http://127.0.0.1:5173). The repository is private, so each teammate
+needs GitHub access plus the Azure RBAC roles listed above. Real documents, human transcriptions,
+generated outputs, and local configuration are intentionally not distributed through Git. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the team workflow and [`docs/SECURITY.md`](docs/SECURITY.md)
+before sharing data or changing repository visibility.
+
 ## Web UI
 
 The local review workspace supports document upload, live page/stage progress, page-level
@@ -265,8 +284,12 @@ A short summary is also printed to the console after each run.
 ├── exp_determinism.py       # stability probe: single-draw vs self-consistency vote
 ├── azure_ocr_benchmark.py   # Azure Document Intelligence vs GPT-voting benchmark
 ├── requirements.txt         # Python dependencies
+├── package.json             # optional GitHub Copilot SDK integration
+├── Makefile                 # setup, test, check, and run commands
+├── CONTRIBUTING.md          # team workflow and data-handling rules
 ├── .env.example             # configuration template
 ├── .gitignore
+├── tests/                   # offline unit tests
 ├── sample/                  # example input documents
 ├── golden/                  # approved results per sample (regression baseline)
 ├── out/                     # extract_hebrew.py results (git-ignored)

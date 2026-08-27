@@ -7,7 +7,7 @@ Azure AI engines together:
 | --- | --- |
 | **Azure AI Content Understanding** | OCR of printed Hebrew + layout + structured field extraction, with confidence scores |
 | **Azure OpenAI GPT vision** (`gpt-5.4`, `gpt-5.6-luna`, or `gpt-5.6-sol`) | Reads Hebrew **handwriting** (which classic OCR does not support) and separates printed vs handwritten text |
-| **Ivrit OCR HASH v1** (optional local sidecar) | Independent CNN-BiLSTM-CTC Hebrew reading used as advisory spelling evidence during GPT visual adjudication |
+| **Classical OCR** (optional Ivrit OCR / Kraken) | Independent local handwriting evidence used to challenge or support the vision reading |
 
 The two outputs are merged side-by-side so you can compare how each engine read the document.
 
@@ -21,6 +21,11 @@ The two outputs are merged side-by-side so you can compare how each engine read 
 ![InkSight high-level document intelligence pipeline](architecture/inkSight-pipeline.svg)
 
 [Open the editable Draw.io source](architecture/inkSight-pipeline.drawio).
+
+Evidence fusion is already part of the pipeline: eligible classical OCR readings are compared with
+GPT candidates, but the original handwriting image remains the authority. The system gates weak or
+unrelated evidence, asks GPT vision to reconcile supported alternatives, and overlays the final
+handwriting result on the original document.
 
 ## Prerequisites
 

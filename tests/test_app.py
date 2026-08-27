@@ -103,6 +103,8 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertIn('Claude Opus 4.8 · GitHub Copilot SDK · Core4', html)
         self.assertIn('data-view="ivrit"', html)
         self.assertIn('<span>Ivrit OCR</span>', html)
+        self.assertIn('data-view="kraken"', html)
+        self.assertIn('<span>Kraken OCR</span>', html)
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -441,6 +443,19 @@ class ConcurrentJobTests(unittest.TestCase):
             web_app._jobs[self.job_id]["page_states"][2]["stage"],
         )
 
+    def test_tiled_detection_progress_is_visible(self):
+        web_app._jobs[self.job_id]["status"] = "running"
+        web_app._jobs[self.job_id]["page_states"][2]["stage"] = "detecting_handwriting"
+
+        web_app._handle_output(
+            self.job_id, 2,
+            "[detect] scanning coverage segment 2/5 (24%-48%) ...",
+        )
+
+        page_state = web_app._jobs[self.job_id]["page_states"][2]
+        self.assertEqual("detecting_handwriting", page_state["stage"])
+        self.assertEqual("Scanning handwriting coverage 2/5", page_state["message"])
+
     def test_luna_profile_sets_page_subprocess_environment(self):
         environment = web_app._model_environment("gpt-5.6-luna")
 
@@ -515,9 +530,24 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("low", environment["OCR_REASONING"])
         self.assertEqual("4000", environment["OCR_MAX_TOKENS"])
         self.assertEqual("0", environment["OCR_FINAL_ORIGINAL_RESCUE"])
-        self.assertEqual("low", environment["DETECTION_REASONING"])
-        self.assertEqual("2500", environment["DETECTION_MAX_TOKENS"])
-        self.assertEqual("60", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("medium", environment["DETECTION_REASONING"])
+        self.assertEqual("6000", environment["DETECTION_MAX_TOKENS"])
+        self.assertEqual("90", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("0", environment["KRAKEN_OCR_ENABLED"])
+
+    def test_kraken_strategy_enables_advisory_with_same_fast_profile(self):
+        environment = web_app._page_environment(
+            "gpt-5.4", "standard-kraken-medium",
+        )
+
+        self.assertEqual("1", environment["KRAKEN_OCR_ENABLED"])
+        self.assertEqual("low", environment["OCR_REASONING"])
+        self.assertEqual("medium", environment["DETECTION_REASONING"])
+        self.assertEqual("6000", environment["DETECTION_MAX_TOKENS"])
+        self.assertEqual("90", environment["GPT_READ_TIMEOUT"])
+        self.assertEqual("PP-OCRv6 medium", pipeline.KRAKEN_OCR_MODEL_NAME)
+        self.assertTrue(pipeline.KRAKEN_OCR_MODEL.endswith("medium.safetensors"))
+        self.assertEqual("kraken_ppocrv6_medium", pipeline.KRAKEN_OCR_SOURCE)
 
     def test_sol_none_profile_sets_fast_page_subprocess_environment(self):
         environment = web_app._model_environment("gpt-5.6-sol-none")
@@ -1728,6 +1758,47 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertIsNotNone(candidate)
         self.assertNotIn("hash_confidence", candidate["ocr"])
         self.assertNotIn("confidence", candidate["ocr"]["words"][0])
+
+    @patch.object(pipeline.subprocess, "run")
+    def test_kraken_ocr_runs_local_small_model_in_rtl_line_mode(self, run):
+        def complete(command, **_kwargs):
+            Path(command[command.index("-i") + 2]).write_text(
+                "רחלי רחלה\n", encoding="utf-8"
+            )
+            return Mock(returncode=0, stdout="", stderr="")
+
+        run.side_effect = complete
+        result = pipeline.ocr_image_with_kraken(
+            Image.new("RGB", (200, 80), "white")
+        )
+
+        self.assertEqual("רחלי רחלה", result["text"])
+        self.assertEqual(pipeline.KRAKEN_OCR_SOURCE, result["source"])
+        command = run.call_args.args[0]
+        self.assertIn("--no-segmentation", command)
+        self.assertIn("--base-dir", command)
+        self.assertIn("R", command)
+        self.assertIn("cpu", command)
+
+    def test_kraken_gate_admits_only_correlated_compact_hebrew(self):
+        vision = [{
+            "source": "core4_multi",
+            "ocr": {"full_transcription": "רחלי כחלה"},
+        }]
+        related = pipeline.kraken_ocr_advisory_gate(
+            {"status": "complete", "text": "דהלי רחלה"},
+            vision,
+            {"label": "handwritten Hebrew word"},
+        )
+        numeric = pipeline.kraken_ocr_advisory_gate(
+            {"status": "complete", "text": "5252731"},
+            vision,
+            {"label": "account number"},
+        )
+
+        self.assertTrue(related["eligible"])
+        self.assertFalse(numeric["eligible"])
+        self.assertEqual("structured_or_numeric_region", numeric["reason"])
 
     def test_hebrew_numeric_script_conflict_requires_semantic_text_slot(self):
         final = {
@@ -2990,7 +3061,7 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertTrue((output_dir / region["folder"] / "result.json").exists())
         visual_reconcile.assert_not_called()
 
-    def test_standard_pipeline_persists_ivrit_advisory_evidence(self):
+    def test_standard_pipeline_persists_external_advisory_evidence(self):
         input_path = self.output_dir / "region.png"
         Image.new("RGB", (120, 80), "white").save(input_path)
         output_dir = self.output_dir / "ivrit-output"
@@ -3012,6 +3083,13 @@ class ConcurrentJobTests(unittest.TestCase):
             }],
             "raw_response": {"text": "שלום", "pages": []},
         }
+        kraken_read = {
+            "status": "complete",
+            "source": pipeline.KRAKEN_OCR_SOURCE,
+            "model": pipeline.KRAKEN_OCR_MODEL_NAME,
+            "text": "שלים",
+            "lines": [{"text": "שלים"}],
+        }
         final = {
             "classification": "handwritten_text",
             "final_transcription": "שלום",
@@ -3030,6 +3108,8 @@ class ConcurrentJobTests(unittest.TestCase):
              }]), \
              patch.object(pipeline, "ivrit_ocr_service_status", return_value=(True, "ready")), \
              patch.object(pipeline, "ocr_image_with_ivrit", return_value=ivrit_read), \
+             patch.object(pipeline, "kraken_ocr_service_status", return_value=(True, "ready")), \
+             patch.object(pipeline, "ocr_image_with_kraken", return_value=kraken_read), \
              patch.object(pipeline, "ocr_image_set", return_value=gpt_read), \
              patch.object(pipeline, "should_contextual_recheck", return_value=False), \
              patch.object(
@@ -3051,17 +3131,21 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(0, return_code)
         reconciliation_results = visual_reconcile.call_args.args[1]
         self.assertEqual(
-            ["core4_multi", pipeline.IVRIT_OCR_SOURCE],
+            ["core4_multi", pipeline.IVRIT_OCR_SOURCE, pipeline.KRAKEN_OCR_SOURCE],
             [result["source"] for result in reconciliation_results],
         )
         region_dir = next(output_dir.glob("region_*"))
         saved_ivrit = json.loads((region_dir / "ivrit_ocr.json").read_text())
+        saved_kraken = json.loads((region_dir / "kraken_ocr.json").read_text())
         saved_result = json.loads((region_dir / "result.json").read_text())
         saved_progress = json.loads((output_dir / "ocr_progress.json").read_text())
         combined = json.loads((output_dir / "handwriting_result.json").read_text())
         self.assertEqual("שלום", saved_ivrit["text"])
         self.assertTrue(saved_ivrit["advisory_gate"]["eligible"])
+        self.assertEqual("שלים", saved_kraken["text"])
+        self.assertTrue(saved_kraken["advisory_gate"]["eligible"])
         self.assertEqual("שלום", saved_result["ivrit_ocr"]["text"])
+        self.assertEqual("שלים", saved_result["kraken_ocr"]["text"])
         self.assertEqual("[?]", saved_result["pre_high_rescue_transcription"])
         self.assertEqual(
             "שלום", saved_result["high_uncertainty_evidence"]["final_transcription"]
@@ -3071,6 +3155,7 @@ class ConcurrentJobTests(unittest.TestCase):
             combined["regions"][0]["high_uncertainty_evidence"],
         )
         self.assertEqual("שלום", saved_progress["regions"][0]["ivrit_ocr"]["text"])
+        self.assertEqual("שלים", saved_progress["regions"][0]["kraken_ocr"]["text"])
         self.assertEqual(1, len(saved_result["per_image"]))
 
     def test_pipeline_uses_cu_numeric_evidence_without_model_context(self):

@@ -38,6 +38,7 @@ import random
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -120,6 +121,23 @@ IVRIT_OCR_MIN_AGREEMENT = float(
 )
 IVRIT_OCR_MIN_PREPROCESS_AGREEMENT = float(
     os.environ.get("IVRIT_OCR_MIN_PREPROCESS_AGREEMENT", "0.55")
+)
+KRAKEN_OCR_ENABLED = os.environ.get("KRAKEN_OCR_ENABLED", "0") not in (
+    "", "0", "false", "False",
+)
+KRAKEN_OCR_EXECUTABLE = os.environ.get(
+    "KRAKEN_OCR_EXECUTABLE",
+    str(Path(__file__).resolve().parent / ".models/kraken-venv/bin/kraken"),
+)
+KRAKEN_OCR_MODEL = os.environ.get(
+    "KRAKEN_OCR_MODEL",
+    str(Path(__file__).resolve().parent / ".models/pp-ocrv6-medium/medium.safetensors"),
+)
+KRAKEN_OCR_TIMEOUT = max(1, int(os.environ.get("KRAKEN_OCR_TIMEOUT", "30")))
+KRAKEN_OCR_SOURCE = "kraken_ppocrv6_medium"
+KRAKEN_OCR_MODEL_NAME = "PP-OCRv6 medium"
+KRAKEN_OCR_MIN_AGREEMENT = float(
+    os.environ.get("KRAKEN_OCR_MIN_AGREEMENT", "0.50")
 )
 CONTEXTUAL_RECHECK_MIN_CONFIDENCE = float(
     os.environ.get("CONTEXTUAL_RECHECK_MIN_CONFIDENCE", "0.60")
@@ -846,6 +864,54 @@ def ivrit_ocr_service_status() -> tuple[bool, str]:
     return True, "HASH v1 ready"
 
 
+def kraken_ocr_service_status() -> tuple[bool, str]:
+    """Validate the optional local Kraken executable and checkpoint."""
+    if not KRAKEN_OCR_ENABLED:
+        return False, "disabled by KRAKEN_OCR_ENABLED"
+    if not Path(KRAKEN_OCR_EXECUTABLE).is_file():
+        return False, f"Kraken executable not found: {KRAKEN_OCR_EXECUTABLE}"
+    if not Path(KRAKEN_OCR_MODEL).is_file():
+        return False, f"Kraken model not found: {KRAKEN_OCR_MODEL}"
+    return True, f"{KRAKEN_OCR_MODEL_NAME} ready"
+
+
+def ocr_image_with_kraken(image: Image.Image) -> dict:
+    """Recognize one pre-cropped RTL line with local PP-OCRv6 medium."""
+    with tempfile.TemporaryDirectory(prefix="ink-kraken-") as directory:
+        input_path = Path(directory) / "region.png"
+        output_path = Path(directory) / "result.txt"
+        image.convert("RGB").save(input_path, format="PNG")
+        command = [
+            KRAKEN_OCR_EXECUTABLE,
+            "--device", "cpu",
+            "--raise-on-error",
+            "--native",
+            "-i", str(input_path), str(output_path),
+            "ocr",
+            "--no-segmentation",
+            "--base-dir", "R",
+            "-m", KRAKEN_OCR_MODEL,
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=KRAKEN_OCR_TIMEOUT,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(detail[-2000:] or f"Kraken exited {completed.returncode}")
+        text = output_path.read_text(encoding="utf-8").strip()
+    return {
+        "status": "complete",
+        "source": KRAKEN_OCR_SOURCE,
+        "model": KRAKEN_OCR_MODEL_NAME,
+        "text": text,
+        "lines": [{"text": text}] if text else [],
+    }
+
+
 def prepare_ivrit_blue_only_image(image: Image.Image) -> Image.Image | None:
     """Remove black form print while preserving the original blue pen pixels."""
     rgb = np.array(image.convert("RGB"))
@@ -1094,6 +1160,70 @@ def ivrit_ocr_candidate(evidence: dict) -> dict | None:
         "ocr": {
             "full_transcription": text,
             "words": words,
+            "advisory": True,
+            "advisory_gate": evidence.get("advisory_gate"),
+        },
+    }
+
+
+def kraken_ocr_advisory_gate(
+    evidence: dict, vision_results: list[dict], region: dict,
+) -> dict:
+    """Admit Kraken only when it independently resembles the Core4 reading."""
+    kraken_text = str(evidence.get("text") or "").strip()
+    if evidence.get("status") != "complete" or not kraken_text:
+        return {"eligible": False, "reason": "no_complete_kraken_reading"}
+    core_result = _ivrit_core_result(vision_results)
+    if core_result is None:
+        return {"eligible": False, "reason": "no_vision_reading_to_correlate"}
+    core_ocr = core_result.get("ocr") or {}
+    core_text = str(core_ocr.get("full_transcription") or "").strip()
+    if core_ocr.get("classification") in {
+        "mark_or_checkbox", "signature_non_text", "no_handwriting",
+    }:
+        return {"eligible": False, "reason": "non_text_region"}
+    label = str(region.get("label") or "")
+    if re.search(
+        r"\b(?:date|phone|email|account|reference|identifier|signature|"
+        r"mark|checkbox|amount|total|number)\b", label, re.I,
+    ) or re.search(r"\d", core_text) or re.search(r"\d", kraken_text):
+        return {"eligible": False, "reason": "structured_or_numeric_region"}
+    if "\n" in core_text or "\n" in kraken_text:
+        return {"eligible": False, "reason": "multiline_reading"}
+    core_letters = _hebrew_letter_sequence(core_text)
+    kraken_letters = _hebrew_letter_sequence(kraken_text)
+    if len(core_letters) < 3 or len(kraken_letters) < 3:
+        return {"eligible": False, "reason": "insufficient_hebrew_letters"}
+    if core_letters == kraken_letters:
+        return {"eligible": False, "reason": "duplicate_of_vision_reading"}
+    agreement = difflib.SequenceMatcher(None, core_letters, kraken_letters).ratio()
+    length_overlap = min(len(core_letters), len(kraken_letters)) / max(
+        len(core_letters), len(kraken_letters)
+    )
+    eligible = agreement >= KRAKEN_OCR_MIN_AGREEMENT and length_overlap >= 0.60
+    return {
+        "eligible": eligible,
+        "reason": "related_compact_hebrew" if eligible else "unrelated_to_vision_reading",
+        "vision_source": core_result.get("source"),
+        "character_agreement": round(agreement, 4),
+        "length_overlap": round(length_overlap, 4),
+    }
+
+
+def kraken_ocr_candidate(evidence: dict) -> dict | None:
+    """Convert gated Kraken evidence into a weak visual-adjudication candidate."""
+    text = str(evidence.get("text") or "").strip()
+    if evidence.get("status") != "complete" or not text:
+        return None
+    return {
+        "source": KRAKEN_OCR_SOURCE,
+        "ocr": {
+            "full_transcription": text,
+            "words": [{
+                "text": text,
+                "alternatives": [],
+                "reason": f"{KRAKEN_OCR_MODEL_NAME} advisory line reading",
+            }],
             "advisory": True,
             "advisory_gate": evidence.get("advisory_gate"),
         },
@@ -3173,7 +3303,7 @@ def visual_reconcile_ocr_results(
     readings = [
         (r.get("ocr") or {}).get("full_transcription", "")
         for r in usable
-        if r.get("source") != IVRIT_OCR_SOURCE
+        if r.get("source") not in {IVRIT_OCR_SOURCE, KRAKEN_OCR_SOURCE}
         if (r.get("ocr") or {}).get("full_transcription", "").strip()
     ]
     agreement = aggregate_votes(readings) if readings else {}
@@ -3186,6 +3316,12 @@ def visual_reconcile_ocr_results(
   word error rate is high. Use it only as spelling evidence when the visible strokes
   support it. Never select it solely because it supplies a complete or familiar Hebrew word.
 """
+    kraken_rule = ""
+    if any(result.get("source") == KRAKEN_OCR_SOURCE for result in usable):
+        kraken_rule = """- The candidate source kraken_ppocrv6_medium is an independent local
+  CTC line reading. It is experimental and may confuse scripts. Use it only when the visible
+  strokes support it; never select it because it forms a more familiar word.
+"""
     instruction = f"""You are doing final visual adjudication of Hebrew handwriting OCR.
 
 You will receive:
@@ -3196,7 +3332,7 @@ You will receive:
 Rules:
 - The images are the source of truth.
 - Candidate readings are hints only.
-{ivrit_rule}- Original crop, contrast, denoised, and original-image chunks are faithful evidence.
+{ivrit_rule}{kraken_rule}- Original crop, contrast, denoised, and original-image chunks are faithful evidence.
 - Thresholded, thickened, line-removed, and isolated-stroke images are supporting evidence only.
 - Never choose a reading supported only by one supporting transform when the faithful images
     disagree with it. Return uncertain letters/words instead of completing a plausible name.
@@ -4721,7 +4857,6 @@ Each box should tightly cover the handwriting with a small margin."""
             retries=0,
             reasoning=DETECTION_REASONING,
             max_tokens=DETECTION_MAX_TOKENS,
-            endpoint_limit=1,
         )
 
     try:
@@ -4801,6 +4936,10 @@ Each box must tightly cover one handwritten field or line with a small margin.""
                     ),
                 },
             ]
+            print(
+                f"[detect] scanning coverage segment {band_index}/"
+                f"{len(coverage_bands)} ({start_fraction:.0%}-{end_fraction:.0%}) ..."
+            )
             try:
                 lower_response = detection_call(lower_content)
             except RuntimeError as exc:
@@ -5264,6 +5403,33 @@ def run_pipeline(
     else:
         print(f"[ivrit] HASH v1 advisory OCR unavailable: {ivrit_detail}")
 
+    kraken_available, kraken_detail = kraken_ocr_service_status()
+    kraken_status = "pending" if kraken_available else (
+        "disabled" if not KRAKEN_OCR_ENABLED else "unavailable"
+    )
+    kraken_results: list[dict] = [{
+        "status": kraken_status,
+        "source": KRAKEN_OCR_SOURCE,
+        "model": KRAKEN_OCR_MODEL_NAME,
+        "text": "",
+        "lines": [],
+        "detail": kraken_detail,
+    } for _region in regions]
+    kraken_executor = None
+    kraken_futures = {}
+    if kraken_available:
+        print(f"[kraken] scheduling {len(regions)} original region crop(s) ...")
+        kraken_executor = ThreadPoolExecutor(max_workers=1)
+        kraken_futures = {
+            kraken_executor.submit(
+                ocr_image_with_kraken,
+                dict(region_images[region_index])["01_original_crop.png"],
+            ): region_index
+            for region_index in range(len(regions))
+        }
+    else:
+        print(f"[kraken] advisory OCR unavailable: {kraken_detail}")
+
     # ---- run ALL vision calls in parallel across ALL regions -------------- #
     # Self-consistency: draw each image version VOTE_SEEDS times (distinct seeds)
     # so the deterministic aggregation has multiple genuine samples to vote over.
@@ -5324,6 +5490,7 @@ def run_pipeline(
                     "box": regions[index]["box"],
                     "completed_draws": len(results),
                     "ivrit_ocr": ivrit_results[index],
+                    "kraken_ocr": kraken_results[index],
                     "candidates": [
                         {
                             "source": result["source"],
@@ -5501,6 +5668,31 @@ def run_pipeline(
         for region_index, evidence in enumerate(ivrit_results):
             _write_json_atomic(region_dirs[region_index] / "ivrit_ocr.json", evidence)
 
+    if kraken_futures:
+        for future in as_completed(kraken_futures):
+            region_index = kraken_futures[future]
+            try:
+                kraken_results[region_index] = future.result()
+                print(
+                    f"[kraken] region {region_index + 1}: "
+                    f"{kraken_results[region_index].get('text', '')!r}"
+                )
+            except Exception as exc:
+                kraken_results[region_index] = {
+                    "status": "failed",
+                    "source": KRAKEN_OCR_SOURCE,
+                    "model": KRAKEN_OCR_MODEL_NAME,
+                    "text": "",
+                    "lines": [],
+                    "detail": str(exc),
+                }
+                print(
+                    f"[kraken] region {region_index + 1} failed: {exc}",
+                    file=sys.stderr,
+                )
+            _publish_ocr_progress()
+        kraken_executor.shutdown(wait=True)
+
     blue_only_inputs = {}
     for region_index, evidence in enumerate(ivrit_results):
         if not should_try_ivrit_blue_only(
@@ -5561,6 +5753,16 @@ def run_pipeline(
                 f"({evidence['advisory_gate']['character_agreement']:.0%} "
                 "character agreement)"
             )
+    for region_index, evidence in enumerate(kraken_results):
+        evidence["advisory_gate"] = kraken_ocr_advisory_gate(
+            evidence, region_results[region_index], regions[region_index]
+        )
+        _write_json_atomic(region_dirs[region_index] / "kraken_ocr.json", evidence)
+        if evidence["advisory_gate"]["eligible"]:
+            print(
+                f"[kraken] region {region_index + 1}: advisory candidate eligible "
+                f"({evidence['advisory_gate']['character_agreement']:.0%} agreement)"
+            )
     _publish_ocr_progress()
 
     cu_context_markdown = ""
@@ -5574,7 +5776,7 @@ def run_pipeline(
     print("[vote] aggregating self-consistency draws per region ..." if VOTE_ENABLED
           else "[reconcile] final visual adjudication per region ...")
 
-    def _results_with_ivrit(region_index: int) -> list[dict]:
+    def _results_with_advisory_ocr(region_index: int) -> list[dict]:
         results = list(region_results[region_index])
         evidence = ivrit_results[region_index]
         candidate = (
@@ -5584,12 +5786,20 @@ def run_pipeline(
         )
         if candidate is not None:
             results.append(candidate)
+        kraken_evidence = kraken_results[region_index]
+        kraken_candidate = (
+            kraken_ocr_candidate(kraken_evidence)
+            if (kraken_evidence.get("advisory_gate") or {}).get("eligible")
+            else None
+        )
+        if kraken_candidate is not None:
+            results.append(kraken_candidate)
         return results
 
     def _reconcile_region(ri: int) -> dict:
         if segmented_finals[ri] is not None:
             return segmented_finals[ri] or {}
-        res = _results_with_ivrit(ri)
+        res = _results_with_advisory_ocr(ri)
         usable = [
             result for result in res
             if (result.get("ocr") or {}).get("full_transcription", "").strip()
@@ -5597,7 +5807,7 @@ def run_pipeline(
         ]
         semantic_usable = [
             result for result in usable
-            if result.get("source") != IVRIT_OCR_SOURCE
+            if result.get("source") not in {IVRIT_OCR_SOURCE, KRAKEN_OCR_SOURCE}
         ]
         if VOTE_ENABLED:
             readings = [
@@ -5801,7 +6011,7 @@ def run_pipeline(
     for i, region in enumerate(regions, 1):
         rdir = region_dirs[i - 1]
         res = region_results[i - 1]
-        reconciliation_results = _results_with_ivrit(i - 1)
+        reconciliation_results = _results_with_advisory_ocr(i - 1)
         final = finals[i - 1] or {}
         local_cu_context = nearby_printed_context(
             cu_context_markdown, region["box"], page_img.height
@@ -5840,6 +6050,7 @@ def run_pipeline(
             "printed_context_used": region_context,
             "per_image": per_image,
             "ivrit_ocr": ivrit_results[i - 1],
+            "kraken_ocr": kraken_results[i - 1],
             "field_type": final.get("field_type"),
             "final_transcription": final.get("final_transcription", ""),
             "numeric_cells": final.get("numeric_cells", []),
@@ -5889,6 +6100,7 @@ def run_pipeline(
             ),
             "script_conflict_evidence": final.get("script_conflict_evidence"),
             "ivrit_ocr": ivrit_results[i - 1],
+            "kraken_ocr": kraken_results[i - 1],
             "numeric_cells": final.get("numeric_cells", []),
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
             "words": final.get("words"), "notes": final.get("notes"),

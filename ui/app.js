@@ -432,6 +432,77 @@ function renderIvritOcr(diagnostics) {
   adminOutput.append(list);
 }
 
+function renderKrakenOcr(diagnostics) {
+  const progressRegions = diagnostics.progress?.regions || [];
+  const finalRegions = diagnostics.final_regions || [];
+  const regions = progressRegions.length ? progressRegions : finalRegions.map((region, index) => ({
+    ...region,
+    region: index + 1,
+  }));
+  const evidenceByRegion = regions.map((region, index) =>
+    region.kraken_ocr || finalRegions[index]?.kraken_ocr || {
+      status: "pending",
+      text: "",
+      lines: [],
+    }
+  );
+  const complete = evidenceByRegion.filter((evidence) => evidence.status === "complete").length;
+  const offered = evidenceByRegion.filter((evidence) => evidence.advisory_gate?.eligible).length;
+  const failed = evidenceByRegion.filter((evidence) => evidence.status === "failed").length;
+  const unavailable = evidenceByRegion.filter((evidence) =>
+    ["disabled", "unavailable"].includes(evidence.status)
+  ).length;
+  const summary = createElement("div", "admin-summary");
+  addAdminStat(summary, "Kraken responses", `${complete} / ${regions.length}`);
+  addAdminStat(summary, "Sent to GPT", offered);
+  addAdminStat(summary, "Unavailable", unavailable);
+  addAdminStat(summary, "Failed", failed);
+  adminOutput.append(summary);
+  adminOutput.append(createElement(
+    "div",
+    "admin-empty",
+    "PP-OCRv6 medium is local advisory line OCR. Only correlated single-line Hebrew is offered to GPT visual adjudication.",
+  ));
+  const list = createElement("div", "diagnostic-list");
+  regions.forEach((region, index) => {
+    const evidence = evidenceByRegion[index];
+    const details = regionDetails(region, (evidence.lines || []).length, "Kraken lines");
+    if (index === 0) details.open = true;
+    const body = createElement("div", "diagnostic-body");
+    body.append(createElement(
+      "div",
+      "candidate-source",
+      `${evidence.model || "PP-OCRv6 medium"} · ${evidence.status || "pending"}`,
+    ));
+    if (evidence.status === "complete") {
+      const gate = evidence.advisory_gate || {};
+      const agreement = gate.character_agreement === undefined
+        ? ""
+        : ` · ${Math.round(Number(gate.character_agreement) * 100)}% character agreement`;
+      body.append(
+        createElement("div", "decision-selected", evidence.text || "(empty reading)"),
+        createElement(
+          "div",
+          "decision-method",
+          `${gate.eligible ? "Sent to GPT as advisory evidence" : "Excluded from GPT evidence"} · ${gate.reason || "gate pending"}${agreement}`,
+        ),
+      );
+    } else {
+      body.append(createElement(
+        "div",
+        "admin-empty",
+        evidence.detail || "Waiting for local Kraken OCR",
+      ));
+    }
+    details.append(body);
+    list.append(details);
+  });
+  if (!regions.length) {
+    list.append(createElement("div", "admin-empty", "Kraken OCR starts after handwriting detection"));
+  }
+  adminOutput.append(list);
+}
+
 function renderDecision(diagnostics) {
   const regions = diagnostics.final_regions || [];
   const summary = createElement("div", "admin-summary");
@@ -511,6 +582,7 @@ async function showAdminView(page) {
     if (activeView === "detection") renderDetection(diagnostics, page);
     if (activeView === "candidates") renderCandidates(diagnostics);
     if (activeView === "ivrit") renderIvritOcr(diagnostics);
+    if (activeView === "kraken") renderKrakenOcr(diagnostics);
     if (activeView === "decision") renderDecision(diagnostics);
     if (activeView === "logs") renderLogs(diagnostics);
     if (hadRegionDetails) {
@@ -722,7 +794,7 @@ async function showResultView(page) {
     if (mergedDocumentFrame.src !== mergedUrl) mergedDocumentFrame.src = page.merged_document_url;
   } else if (activeView === "golden" && page.golden_comparison_url && page.stage === "complete") {
     showGoldenComparison(page);
-  } else if (["detection", "candidates", "ivrit", "decision", "logs"].includes(activeView)) {
+  } else if (["detection", "candidates", "ivrit", "kraken", "decision", "logs"].includes(activeView)) {
     showAdminView(page);
   } else {
     if (activeView === "merged") mergedDocumentFrame.src = "about:blank";

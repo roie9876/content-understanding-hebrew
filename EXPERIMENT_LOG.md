@@ -915,6 +915,109 @@ or reliability.
 - **Decision**: Keep HASH enabled as the conflict signal. Prefer honest uncertain Hebrew plus
   review over a confidently wrong numeric transcription.
 
+## 2026-08-27
+
+### EXP-20260827-01: Kraken PP-OCRv6 small and medium
+
+- **Status**: REJECTED for runtime use; benchmark retained.
+- **Question/Hypothesis**: The multilingual PP-OCRv6 Kraken checkpoints might provide useful
+  deterministic Hebrew handwriting recognition. Zenodo reports in-domain Hebrew CER of 6.50% for
+  small (`21788405`) and 5.06% for medium (`21788410`).
+- **Model/config**: Kraken 7.1 on CPU, native text output, RTL base direction, direct whole-line
+  recognition. Small is 3.24M parameters; medium is 15.92M. Downloaded checkpoints matched the
+  published MD5 values. MPS was unusable because Kraken mixed MPS and CPU tensors.
+- **Cross-region result**: On 14 original crops from
+  `analysis_results/דוח_יוסי.pdf__2026-08-25_09-14-19/`, small scored 2/14 normalized exact and
+  0.3262 mean similarity in 63.0 seconds. Medium scored the same 2/14 exact and 0.3536 similarity
+  in 64.9 seconds. Both frequently returned short fragments, empty text, or the wrong script.
+- **Requested crop result**: Kraken's baseline segmenter found no lines in
+  `analysis_results/01_original_crop.png__2026-07-14_10-35-43/page_1_regions.png`. After splitting
+  its clean line-removed source into three fixed line bands, small scored 0.4634 mean similarity
+  and medium scored 0.4792. Medium predictions were `ביה הבועלים`, `סני4 כארה ה'רהוול`, and
+  `הסית הר אותר` against `בנק הפועלים`, `סניף פתח תקווה`, and `הרצל אחד`; none was exact.
+- **Clean word counterexample**: On
+  `analysis_results/01_original_crop.png__2026-07-14_21-29-03/region_01_handwritten_Hebrew_word_/01_original_crop.png`,
+  the human golden is `רחלי רחלה`. Small returned `דהלי רחלה` (0.7500 similarity), while medium
+  returned `דח8 (חה` (0.4615). Medium is therefore not consistently better despite its aggregate
+  advantage.
+- **Artifacts**: `kraken_benchmark.py`; ignored model files under `.models/`; ignored reports and
+  line crops under `analysis_results/`.
+- **Decision and next step**: Medium is slightly better than small but remains unusable on these
+  modern blue-ink forms. Do not add either base checkpoint to production or advisory OCR. A future
+  trial requires accurate line segmentation and Hebrew-specific fine-tuning on representative
+  contemporary forms.
+
+### EXP-20260827-02: Gated Kraken-small pipeline ablation
+
+- **Status**: AVAILABLE / UNMEASURED.
+- **Question/Hypothesis**: Although PP-OCRv6-small is weak standalone, a correlated reading may
+  occasionally repair one ambiguous Hebrew letter when GPT Core4 and visual reconciliation drift.
+- **Change**: Added the opt-in UI strategy **Experimental standard + Kraken small advisory**.
+  The control strategy leaves Kraken disabled. Treatment runs execute the local CPU checkpoint in
+  parallel with GPT, persist `kraken_ocr.json`, and admit only nonnumeric single-line Hebrew with
+  at least 50% character agreement and 60% length overlap with Core4. Duplicate and unrelated
+  readings remain diagnostic only. Kraken is excluded from deterministic voting and semantics;
+  eligible text is only a weak candidate in image-grounded visual adjudication.
+- **Safety/operations**: Missing executable, model, timeout, and recognition failures are nonfatal.
+  One Kraken worker prevents multiple PyTorch imports from spiking memory. The existing GPT model,
+  prompts, and fast-profile settings are identical between control and treatment.
+- **Verification**: Adapter, gate, strategy environment, persistence, and reconciliation-boundary
+  tests pass; the complete app module passes 158 tests.
+- **Decision and next step**: Run paired control/treatment analyses on identical selected pages and
+  score both raw `handwriting_result.json` files against the same human golden. Do not promote this
+  strategy unless exact text or mean similarity improves across multiple document types without
+  classification regressions.
+
+### EXP-20260827-04: Switch pipeline ablation to Kraken medium
+
+- **Status**: AVAILABLE / UNMEASURED.
+- **Change**: New treatment runs now use the verified PP-OCRv6-medium checkpoint from Zenodo
+  `21788410` (15.92M parameters, MD5 `e3411a453ce3b9e9efae3f8631d85762`) and source identifier
+  `kraken_ppocrv6_medium`. Historical small-run metadata remains readable.
+- **Reason**: Medium scored slightly higher than small on the 14-region standalone benchmark
+  (0.3536 versus 0.3262 mean similarity), although it regressed on one clean word crop. The same
+  conservative gate and visual-only advisory role remain unchanged.
+- **Decision and next step**: Repeat the paired control/treatment run. Do not infer improvement from
+  the model-size change until the medium treatment is scored against the same human golden.
+
+### EXP-20260827-05: MiDRASH Geniza 01 medieval HTR model
+
+- **Status**: REJECTED for modern forms.
+- **Model**: `MiDRASH_Gen_01.mlmodel` from Zenodo `10.5281/zenodo.17931017`, checksum
+  `f42d75dd8b5fa99d136ac6ddf6606172`. Kraken 7.1 loaded the 23 MB checkpoint successfully.
+  The newer v2 record only corrects metadata. Upstream reports 86.78% in-domain accuracy and uses
+  NFKD normalization. License: CC-BY-NC-SA-4.0.
+- **Domain**: Medieval Cairo Genizah documentary and literary manuscripts in Hebrew, Aramaic, and
+  Judeo-Arabic, with manuscript-specific transcription conventions.
+- **Result**: On the clean `רחלי רחלה` crop it returned `נתן רה` (0.3077 similarity). On the
+  three-line sample it averaged 0.3638 similarity. On the same 14-region modern-form benchmark used
+  for PP-OCRv6, it scored 0/14 exact and 0.0679 mean similarity in 72.2 seconds. Several outputs
+  were empty or contained non-Hebrew Coptic-like graphemes.
+- **Comparison**: PP-OCRv6 medium scored 2/14 exact and 0.3536 mean similarity on the 14-region
+  benchmark. MiDRASH therefore regressed substantially despite its strong medieval in-domain score.
+- **Decision**: Do not add MiDRASH to the app pipeline. Retain the ignored checkpoint and benchmark
+  artifacts only for reproducibility; its non-commercial license and severe domain mismatch both
+  preclude production adoption.
+
+### EXP-20260827-03: Restore GPT-5.4 detection quality profile
+
+- **Status**: ADOPTED.
+- **Observed regression**: A Kraken treatment run on `אישור מסירה -דירה 8.pdf` detected only six
+  regions, merging or omitting the top date/building/apartment fields and adding redaction-adjacent
+  partial-stroke false positives. The known detection target count is eight.
+- **Root cause**: The UI's GPT-5.4 fast profile had changed detection from the pipeline's known-good
+  medium reasoning, 6,000-token settings to low reasoning and 2,500 tokens with a 60-second global
+  read timeout. This affected both standard and Kraken treatment runs; Kraken itself runs only after
+  region detection and did not cause the missing boxes.
+- **Change**: Keep handwriting OCR at low reasoning, 4,000 tokens, and no final original rescue, but
+  restore detection to medium reasoning, 6,000 tokens, and a 90-second read timeout for both
+  `standard` and `standard-kraken-small`.
+- **Live validation**: Detection-only rerun on the exact sample passed the human geometry gate with
+  recall 8/8, zero extras, and average center distance 0.045. Artifact:
+  `analysis_results/detection_regression__2026-08-27_restored-profile/`.
+- **Decision**: Preserve detector quality independently from OCR speed tuning. The completed
+  six-region run is invalid for the Kraken A/B and must be rerun from the upload screen.
+
 # Experiment Template
 
 Copy this section for every new experiment.

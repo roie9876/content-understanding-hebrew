@@ -5,6 +5,7 @@
 /analysis_results/
 /agent_benchmarks/
 /.ui_data/
+/.models/
 run*.log
 
 # ---- Private source documents and human transcriptions ----

@@ -121,6 +121,12 @@ DEFAULT_MODEL_PROFILE = "gpt-5.4"
 DEFAULT_OCR_STRATEGY = "standard"
 OCR_STRATEGIES = {
     "standard": {"label": "Standard core4 + visual reconciliation"},
+    "standard-kraken-small": {
+        "label": "Experimental standard + Kraken small advisory (legacy)",
+    },
+    "standard-kraken-medium": {
+        "label": "Experimental standard + Kraken medium advisory",
+    },
     "isolated-multiview": {
         "label": "Experimental isolated multi-view (lined handwriting)",
         "model_profiles": {"gpt-5.4", "gpt-5.6-sol"},
@@ -408,14 +414,21 @@ def _model_environment(profile_name: str) -> dict[str, str]:
 def _page_environment(model_profile: str, ocr_strategy: str) -> dict[str, str]:
     environment = _model_environment(model_profile)
     environment["OCR_STRATEGY"] = ocr_strategy
-    if model_profile == "gpt-5.4" and ocr_strategy == "standard":
+    environment["KRAKEN_OCR_ENABLED"] = (
+        "1" if ocr_strategy in {
+            "standard-kraken-small", "standard-kraken-medium",
+        } else "0"
+    )
+    if model_profile == "gpt-5.4" and ocr_strategy in {
+        "standard", "standard-kraken-small", "standard-kraken-medium",
+    }:
         environment["GPT_REASONING"] = "low"
         environment["OCR_REASONING"] = "low"
         environment["OCR_MAX_TOKENS"] = "4000"
         environment["OCR_FINAL_ORIGINAL_RESCUE"] = "0"
-        environment["DETECTION_REASONING"] = "low"
-        environment["DETECTION_MAX_TOKENS"] = "2500"
-        environment["GPT_READ_TIMEOUT"] = "60"
+        environment["DETECTION_REASONING"] = "medium"
+        environment["DETECTION_MAX_TOKENS"] = "6000"
+        environment["GPT_READ_TIMEOUT"] = "90"
     if ocr_strategy == "isolated-multiview":
         environment["GPT_READ_TIMEOUT"] = "120" if model_profile == "gpt-5.4" else "240"
         environment["ISOLATED_MULTIVIEW_WORKERS"] = "2"
@@ -589,6 +602,13 @@ def _handle_output(job_id: str, page_number: int, line: str) -> None:
             count = re.search(r"found (\d+)", line)
             stage = "handwriting_ocr"
             message = f"Reading {count.group(1) if count else ''} handwritten regions".strip()
+        elif "[detect] scanning coverage segment" in line:
+            segment = re.search(r"segment (\d+/\d+)", line)
+            stage = "detecting_handwriting"
+            message = (
+                f"Scanning handwriting coverage {segment.group(1)}"
+                if segment else "Scanning handwriting coverage"
+            )
         elif line.startswith("[OCR]"):
             stage = "handwriting_ocr"
             message = "Running multi-pass handwriting recognition"

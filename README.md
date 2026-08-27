@@ -151,6 +151,36 @@ The **Ivrit OCR** tab therefore exposes its evidence independently; final text s
 to verify the visible strokes. Preserve the upstream `NOTICE.md` when redistributing its checkpoint
 or container. Stop the native Uvicorn process with Ctrl+C, or use `docker compose down` for Docker.
 
+### Experimental Kraken PP-OCRv6 ablation
+
+The **Experimental standard + Kraken medium advisory** OCR strategy runs the normal Core4 + visual
+reconciliation pipeline and adds a local PP-OCRv6-medium line reading as weak evidence. Kraken never
+replaces GPT directly. Empty, numeric, multiline, duplicate, and weakly correlated readings are
+saved for inspection but excluded from visual adjudication. The standard strategy keeps Kraken off.
+
+Install the ignored local environment and Apache-2.0 checkpoint once:
+
+```bash
+uv venv .models/kraken-venv --python 3.12
+.models/kraken-venv/bin/python -m pip install 'kraken>=7.1.0'
+mkdir -p .models/pp-ocrv6-medium
+curl -L --fail 'https://zenodo.org/records/21788410/files/medium.safetensors?download=1' \
+  -o .models/pp-ocrv6-medium/medium.safetensors
+test "$(md5 -q .models/pp-ocrv6-medium/medium.safetensors)" = \
+  'e3411a453ce3b9e9efae3f8631d85762'
+```
+
+For a controlled UI comparison, analyze the same document pages twice with the same vision model:
+
+1. Select **Standard core4 + visual reconciliation** for the control run.
+2. Select **Experimental standard + Kraken medium advisory** for the treatment run.
+3. Compare each run's `handwriting_result.json` with the same local human golden using
+  `python3 compare_golden.py --result PATH --golden-stem STEM`.
+
+Each treatment region records raw text and gate diagnostics in `kraken_ocr.json`; eligible Kraken
+text also appears in `visual_reconcile_input.json`. CPU inference is intentional because Kraken 7.1
+mixes CPU and MPS tensors on this model. This strategy is an ablation tool, not a quality default.
+
 The upload screen lists completed local analyses. Selecting one reopens the full source,
 detection, candidates, decision, final overlay, and logs without calling Azure again. Saved
 runs are restored from their manifests whenever the server starts.
@@ -168,9 +198,10 @@ most two independent draws concurrently. GPT-5.4 receives a larger output budget
 does not repeatedly exhaust a Sol-sized cap and trigger endpoint failover. Stable word groups run
 before expensive whole-line audits. Other model profiles use the standard strategy.
 
-For the standard strategy, GPT-5.4 uses low reasoning throughout. Detection is a one-endpoint,
-2,500-token request with no hidden retries. OCR uses a 4,000-token budget; each attempt targets
-one rotating endpoint for at most 60 seconds, with one faithful rescue attempt.
+For the standard strategies, GPT-5.4 handwriting OCR uses low reasoning and a 4,000-token budget.
+Detection preserves the quality profile: medium reasoning, a 6,000-token budget, a 90-second
+per-endpoint timeout, and failover across the configured endpoint pool. If the full-page scan
+fails, five overlapping coverage segments run sequentially and report visible progress in the UI.
 
 The UI hides Content Understanding's internal Markdown comments and figure descriptions while
 preserving the raw artifact on disk. Every upload performs fresh Azure analysis; OCR responses,

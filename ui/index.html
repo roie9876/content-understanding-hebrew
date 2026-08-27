@@ -61,6 +61,7 @@
             <span>OCR strategy</span>
             <select id="strategySelect" name="ocr_strategy">
               <option value="standard" selected>Standard core4 + visual reconciliation</option>
+              <option value="standard-kraken-medium">Experimental standard + Kraken medium advisory</option>
               <option value="isolated-multiview">Experimental isolated multi-view · lined handwriting</option>
             </select>
           </label>
@@ -228,6 +229,9 @@
                 </button>
                 <button class="stage-tab" type="button" data-view="ivrit" role="tab" aria-selected="false">
                   <i data-lucide="languages"></i><span>Ivrit OCR</span>
+                </button>
+                <button class="stage-tab" type="button" data-view="kraken" role="tab" aria-selected="false">
+                  <i data-lucide="text-search"></i><span>Kraken OCR</span>
                 </button>
                 <button class="stage-tab" type="button" data-view="decision" role="tab" aria-selected="false">
                   <i data-lucide="git-compare-arrows"></i><span>Decision</span>

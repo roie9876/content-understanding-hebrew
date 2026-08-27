@@ -18,16 +18,9 @@ The two outputs are merged side-by-side so you can compare how each engine read 
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    A[Scanned PDF] --> B[Render page to PNG<br/>PyMuPDF]
-    A --> C[Content Understanding<br/>custom analyzer]
-    B --> D[GPT-5.x vision<br/>Responses API]
-    B --> H[Ivrit OCR HASH v1<br/>local sidecar]
-    C --> E[Printed text + fields<br/>+ confidence]
-    D & H --> F[Handwritten text + fields]
-    E & F --> G[out/result.json]
-```
+![InkSight high-level document intelligence pipeline](architecture/inkSight-pipeline.svg)
+
+[Open the editable Draw.io source](architecture/inkSight-pipeline.drawio).
 
 ## Prerequisites
 

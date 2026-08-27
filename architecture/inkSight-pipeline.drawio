@@ -1,0 +1,41 @@
+<mxfile host="app.diagrams.net" modified="2026-08-27T00:00:00.000Z" agent="GitHub Copilot" version="24.0.0" type="device">
+  <diagram id="pipeline" name="InkSight Pipeline">
+    <mxGraphModel dx="1422" dy="762" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1600" pageHeight="700" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="title" value="From document to trusted insight" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=30;fontStyle=1;fontColor=#202020;" vertex="1" parent="1">
+          <mxGeometry x="90" y="55" width="750" height="50" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="One flow for printed content, handwriting, and human-ready review" style="text;html=1;align=left;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=16;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="90" y="105" width="800" height="35" as="geometry"/>
+        </mxCell>
+        <mxCell id="document" value="&lt;b&gt;Document&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#666666&quot;&gt;PDF or image&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#ffffff;strokeColor=#C81E4B;strokeWidth=2;fontSize=18;fontColor=#202020;align=center;verticalAlign=middle;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="90" y="245" width="200" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="understand" value="&lt;b&gt;Understand&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#666666&quot;&gt;Layout + printed text&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#F7F3EF;strokeColor=#D6CDC5;strokeWidth=2;fontSize=18;fontColor=#202020;align=center;verticalAlign=middle;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="365" y="245" width="220" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="read" value="&lt;b&gt;Read handwriting&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#666666&quot;&gt;Vision + OCR evidence&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#E9F4F1;strokeColor=#76A99C;strokeWidth=2;fontSize=18;fontColor=#202020;align=center;verticalAlign=middle;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="660" y="245" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="reconcile" value="&lt;b&gt;Reconcile&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#666666&quot;&gt;Verify against the image&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#FCEEF2;strokeColor=#D98AA2;strokeWidth=2;fontSize=18;fontColor=#202020;align=center;verticalAlign=middle;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="975" y="245" width="220" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="review" value="&lt;b&gt;Review&lt;/b&gt;&lt;br&gt;&lt;font color=&quot;#666666&quot;&gt;Structured, traceable result&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;arcSize=8;fillColor=#202020;strokeColor=#202020;strokeWidth=2;fontSize=18;fontColor=#ffffff;align=center;verticalAlign=middle;shadow=1;" vertex="1" parent="1">
+          <mxGeometry x="1270" y="245" width="240" height="120" as="geometry"/>
+        </mxCell>
+        <mxCell id="edge-1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9B928B;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="document" target="understand"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9B928B;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="understand" target="read"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#9B928B;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1" source="read" target="reconcile"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="edge-4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#C81E4B;strokeWidth=3;endArrow=block;endFill=1;" edge="1" parent="1" source="reconcile" target="review"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="evidence" value="Azure Content Understanding · GPT vision · Optional local OCR" style="rounded=1;whiteSpace=wrap;html=1;arcSize=20;fillColor=#ffffff;strokeColor=#E1DAD4;dashed=1;fontSize=14;fontColor=#666666;align=center;verticalAlign=middle;" vertex="1" parent="1">
+          <mxGeometry x="420" y="425" width="660" height="52" as="geometry"/>
+        </mxCell>
+        <mxCell id="promise" value="Printed and handwritten content become one explainable result." style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=18;fontStyle=1;fontColor=#202020;" vertex="1" parent="1">
+          <mxGeometry x="420" y="520" width="760" height="40" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

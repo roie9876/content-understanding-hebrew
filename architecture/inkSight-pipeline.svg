@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="620" viewBox="0 0 1600 620" role="img" aria-labelledby="title desc">
+  <title id="title">InkSight document intelligence pipeline</title>
+  <desc id="desc">A clean five-stage flow from source document through understanding, handwriting recognition, reconciliation, and review.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#202020" flood-opacity=".10"/></filter>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#9b928b"/></marker>
+    <marker id="arrowAccent" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#c81e4b"/></marker>
+    <style>
+      .title{font:700 34px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#202020}.subtitle{font:400 17px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#666}.box-title{font:700 19px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#202020}.box-copy{font:400 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#666}.box-title-light{font:700 19px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#fff}.box-copy-light{font:400 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#ddd}.pill{font:400 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#666}.promise{font:700 18px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#202020}
+    </style>
+  </defs>
+  <rect width="1600" height="620" fill="#faf8f5"/>
+  <text class="title" x="80" y="72">From document to trusted insight</text>
+  <text class="subtitle" x="80" y="108">One flow for printed content, handwriting, and human-ready review</text>
+  <g fill="none" stroke="#9b928b" stroke-width="2.5" marker-end="url(#arrow)"><path d="M280 290H350"/><path d="M570 290H640"/><path d="M880 290H950"/></g>
+  <path d="M1170 290H1240" fill="none" stroke="#c81e4b" stroke-width="3" marker-end="url(#arrowAccent)"/>
+  <g filter="url(#shadow)">
+    <rect x="80" y="230" width="200" height="120" rx="8" fill="#fff" stroke="#c81e4b" stroke-width="2"/>
+    <rect x="350" y="230" width="220" height="120" rx="8" fill="#f7f3ef" stroke="#d6cdc5" stroke-width="2"/>
+    <rect x="640" y="230" width="240" height="120" rx="8" fill="#e9f4f1" stroke="#76a99c" stroke-width="2"/>
+    <rect x="950" y="230" width="220" height="120" rx="8" fill="#fceef2" stroke="#d98aa2" stroke-width="2"/>
+    <rect x="1240" y="230" width="240" height="120" rx="8" fill="#202020" stroke="#202020" stroke-width="2"/>
+  </g>
+  <g text-anchor="middle"><text class="box-title" x="180" y="280">Document</text><text class="box-copy" x="180" y="309">PDF or image</text><text class="box-title" x="460" y="280">Understand</text><text class="box-copy" x="460" y="309">Layout + printed text</text><text class="box-title" x="760" y="280">Read handwriting</text><text class="box-copy" x="760" y="309">Vision + OCR evidence</text><text class="box-title" x="1060" y="280">Reconcile</text><text class="box-copy" x="1060" y="309">Verify against the image</text><text class="box-title-light" x="1360" y="280">Review</text><text class="box-copy-light" x="1360" y="309">Structured, traceable result</text></g>
+  <rect x="410" y="410" width="670" height="52" rx="26" fill="#fff" stroke="#d8d0ca" stroke-dasharray="6 5"/>
+  <text class="pill" x="745" y="442" text-anchor="middle">Azure Content Understanding · GPT vision · Optional local OCR</text>
+  <text class="promise" x="800" y="530" text-anchor="middle">Printed and handwritten content become one explainable result.</text>
+</svg>

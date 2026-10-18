@@ -7,7 +7,6 @@ Azure AI engines together:
 | --- | --- |
 | **Azure AI Content Understanding** | OCR of printed Hebrew + layout + structured field extraction, with confidence scores |
 | **Azure OpenAI GPT vision** (`gpt-5.4`, `gpt-5.6-luna`, or `gpt-5.6-sol`) | Reads Hebrew **handwriting** (which classic OCR does not support) and separates printed vs handwritten text |
-| **Classical OCR** (optional Ivrit OCR / Kraken) | Independent local handwriting evidence used to challenge or support the vision reading |
 
 The two outputs are merged side-by-side so you can compare how each engine read the document.
 
@@ -18,25 +17,58 @@ The two outputs are merged side-by-side so you can compare how each engine read 
 
 ## Architecture
 
+The app uses Content Understanding for printed text and the selected vision model for
+handwriting detection, Core4 recognition, visual reconciliation, and document merging.
+Ivrit OCR / HASH v1 and Kraken are no longer called by the application; their tabs,
+strategy options, and sidecar configuration have been removed. Existing saved analyses
+remain readable, and the standalone Kraken benchmark is retained for historical experiments.
+
+Detection preserves multi-line handwritten blocks, even when their labels also mention
+dates or contact details. Single-row form snapping applies only to individual fields or
+rows; it must not collapse a note or paragraph to its strongest ruled line.
+Row selection stays anchored to the model's original coordinates and retains strokes
+crossing notebook rules. Mixed Hebrew/numeric lines are not treated as isolated numeric
+fields, and yellow paper is excluded from blue/green pen masks.
+A final bounded stroke-edge check expands a box when an already mostly-covered
+pen component would otherwise be clipped; it never chains expansion into neighboring text.
+
 ![InkSight high-level document intelligence pipeline](architecture/inkSight-pipeline.svg)
 
 [Open the editable Draw.io source](architecture/inkSight-pipeline.drawio).
-
-Evidence fusion is already part of the pipeline: eligible classical OCR readings are compared with
-GPT candidates, but the original handwriting image remains the authority. The system gates weak or
-unrelated evidence, asks GPT vision to reconcile supported alternatives, and overlays the final
-handwriting result on the original document.
 
 ## Prerequisites
 
 - Python 3.9+
 - Azure CLI, logged in: `az login`
-- Optional: Docker Desktop or another Docker-compatible runtime for the local HASH v1 sidecar
 - Access (Entra ID RBAC) to:
   - a **Content Understanding** resource (`Cognitive Services User`)
   - an **Azure OpenAI** resource with a vision model deployment (`Cognitive Services OpenAI User`)
 
 Authentication is **Microsoft Entra ID only** — no API keys are stored in the repo.
+
+Local authentication defaults to `AZURE_AUTH_MODE=azure-cli`. On Azure compute, set
+`AZURE_AUTH_MODE=managed-identity` and assign an identity with the resource roles above.
+Leave `AZURE_CLIENT_ID` unset for a system-assigned identity, or set it to the client ID
+of a user-assigned identity attached to that compute resource. Managed identity mode
+never falls back to a developer's CLI login. Do not copy `.env`, Azure CLI profiles,
+tokens, source documents, or saved results into a container image.
+
+For multi-tenant development, set `AZURE_TENANT_ID` in `.env` to the resource tenant.
+The app requests tokens for that tenant rather than following another window's default
+Azure CLI subscription. For complete profile isolation, also set `AZURE_CONFIG_DIR`
+to a private, ignored directory such as this project's `.ui_data/azure-cli`.
+Use the same directory when signing in:
+
+```bash
+export AZURE_CONFIG_DIR="$PWD/.ui_data/azure-cli"
+az login --tenant <resource-tenant-id> --scope https://cognitiveservices.azure.com/.default
+```
+
+The app reads `.env`, but Azure CLI does not; export the directory in this project's
+terminal or prefix its `az` commands explicitly. Other VS Code windows may continue
+using their own profiles. Do not log out or switch the machine-wide profile to repair
+this app's authentication. Access/MFA errors now fail the analysis explicitly and are
+excluded from golden accuracy comparisons, rather than appearing as empty OCR success.
 
 ## Quick start for team members
 
@@ -75,118 +107,137 @@ and local start time, for example `document.pdf__2026-07-12_10-30-45/`. Each run
 all page artifacts plus a `run.json` manifest and is excluded from Git because results may
 contain PII.
 
-### Optional Ivrit OCR evidence
+### Container image and isolated Azure demo
 
-The pipeline can query the HASH v1 service from
-[roie9876/heb-handfree](https://github.com/roie9876/heb-handfree). Keep it as a sibling clone so
-its Python 3.11+/PyTorch environment stays isolated from this Python 3.9 application:
+The container uses the same GPT-6.1 Sol / Standard Core4 pipeline, a single threaded
+Gunicorn worker, and port `8080`. It runs as non-root user `10001`. Local defaults
+remain unchanged when running `python app.py`.
 
-```bash
-git clone https://github.com/roie9876/heb-handfree.git ../heb-handfree
-cd ../heb-handfree
-brew install uv
-make install
-IVRIT_OCR_DEVICE=mps .venv/bin/python -m uvicorn \
-  ivrit_ocr.api:app --host 127.0.0.1 --port 8000 --workers 1 --limit-concurrency 16
-```
-
-Keep that command running in a separate terminal. On a machine with Docker, the containerized CPU
-service is an alternative:
+**Never upload the entire repository as a build context.** Stage only the explicitly
+allowlisted application files:
 
 ```bash
-cd ../heb-handfree
-docker compose up --build -d
-curl --fail http://127.0.0.1:8000/health
+python container/build_context.py --destination .ui_data/docker-context
+docker build --platform linux/amd64 -t inksight:demo .ui_data/docker-context
 ```
 
-The local clone used for this integration was inspected at commit `b63051c`. Each page checks
-`GET /health` once. When ready, original region crops are sent to `POST /v1/ocr` while Core4 runs.
-The raw response is saved as `region_*/ivrit_ocr.json`, including line text, uncalibrated
-confidence, crop-relative boxes, and the advisory-gate decision. HASH text is shown to GPT as
-`ivrit_hash_v1` spelling evidence only when all of these deterministic checks pass:
+The staging tool refuses a non-empty destination or a symlink/out-of-repository input.
+Both `.dockerignore` and explicit Dockerfile `COPY` statements provide additional
+exclusions. The context and image must not contain `.env`, credentials, CLI caches,
+Git history, private documents, golden references, screenshots, tests, or saved analyses.
+The optional corpus comparator and Node/Copilot benchmarks are not packaged.
+Do not disable TLS verification if package downloads fail; an approved private ACR
+build can perform the same code-only build in Azure.
 
-- Core4 and HASH are both single-line, nonnumeric Hebrew readings.
-- The field is not an explicit date, account, reference, amount, mark, or signature; a noisy generic
-  `number` detector label does not veto two visibly nonnumeric Hebrew readings.
-- Both readings contain at least three Hebrew letters and have at least 60% length overlap.
-- Their punctuation- and diacritic-free Hebrew character agreement is at least 40%.
-- An exact Core4-HASH duplicate is omitted because it adds no spelling information.
-
-All other HASH responses remain visible in the **Ivrit OCR** tab but are excluded from the GPT
-prompt. HASH is also excluded from deterministic agreement, faithful-source guards, and standalone
-fallbacks. Its uncalibrated model confidence is never sent to GPT. If the service is disabled,
-absent, or times out, the normal GPT pipeline continues unchanged.
-
-Contextual rereads may use nearby printed labels to understand a field, but they cannot replace an
-exact transcription independently supported by the visual decision and an eligible HASH reading.
-Core4 must either agree exactly or have supplied the measured character correlation that admitted
-HASH through the advisory gate. A conflicting contextual reading is retained as an alternative,
-the selected visual text is preserved, and the region is marked for review. This prevents semantic
-labels such as `עיר` (`city`) from turning agreed visible strokes into a more familiar place name.
-
-For compact blue handwriting, InkSight also detects a specific segmentation failure: HASH returns
-multiple vertically overlapping lines while Core4 sees one nonnumeric Hebrew line. Only in that
-case, InkSight retries HASH on a tight blue-only image that removes black form print. The blue-only
-result replaces the original HASH result only when it collapses to one line and retains at least
-55% Hebrew character agreement and 80% length overlap with the original HASH reading. This recovers
-line samples that were trained/evaluated as tight crops without globally applying a transform that
-regresses other fields. The Ivrit OCR tab records `original` or `blue_only` as the selected input.
-
-Configure the sidecar in `.env`:
-
-```dotenv
-IVRIT_OCR_ENABLED=1
-IVRIT_OCR_URL=http://127.0.0.1:8000
-IVRIT_OCR_TIMEOUT=60
-IVRIT_OCR_WORKERS=1
-IVRIT_OCR_MIN_AGREEMENT=0.40
-IVRIT_OCR_MIN_PREPROCESS_AGREEMENT=0.55
-```
-
-HASH v1 is an assisted-transcription model, not an authority. Its model card reports 45.95% CER
-and 100% WER on the confirmed natural ruled-form evaluation, and its confidence is not calibrated.
-The **Ivrit OCR** tab therefore exposes its evidence independently; final text still requires GPT
-to verify the visible strokes. Preserve the upstream `NOTICE.md` when redistributing its checkpoint
-or container. Stop the native Uvicorn process with Ctrl+C, or use `docker compose down` for Docker.
-
-### Experimental Kraken PP-OCRv6 ablation
-
-The **Experimental standard + Kraken medium advisory** OCR strategy runs the normal Core4 + visual
-reconciliation pipeline and adds a local PP-OCRv6-medium line reading as weak evidence. Kraken never
-replaces GPT directly. Empty, numeric, multiline, duplicate, and weakly correlated readings are
-saved for inspection but excluded from visual adjudication. The standard strategy keeps Kraken off.
-
-Install the ignored local environment and Apache-2.0 checkpoint once:
+Run the local privacy gate before deployment:
 
 ```bash
-uv venv .models/kraken-venv --python 3.12
-.models/kraken-venv/bin/python -m pip install 'kraken>=7.1.0'
-mkdir -p .models/pp-ocrv6-medium
-curl -L --fail 'https://zenodo.org/records/21788410/files/medium.safetensors?download=1' \
-  -o .models/pp-ocrv6-medium/medium.safetensors
-test "$(md5 -q .models/pp-ocrv6-medium/medium.safetensors)" = \
-  'e3411a453ce3b9e9efae3f8631d85762'
+python container/privacy_audit.py --context .ui_data/docker-context \
+  --image inksight:demo --report .ui_data/image-privacy-report.json
 ```
 
-For a controlled UI comparison, analyze the same document pages twice with the same vision model:
+Without `--image`, this checks only the context and explicitly reports that image
+verification is pending. With an image, it checks configuration, history and **every
+image layer**, including files deleted by later layers. It checks credential and
+connection-string patterns, compares local private-file fingerprints (even renamed
+copies), and verifies the application bytes match the audited context. Private values
+and fingerprints stay local and are never printed or sent to the image builder.
+A clean context alone is not proof that a completed image has passed this gate.
+Remote builds use a private quarantine tag; do not deploy/share the app until the
+resulting image is pulled and passes the full audit.
 
-1. Select **Standard core4 + visual reconciliation** for the control run.
-2. Select **Experimental standard + Kraken medium advisory** for the treatment run.
-3. Compare each run's `handwriting_result.json` with the same local human golden using
-  `python3 compare_golden.py --result PATH --golden-stem STEM`.
+If Docker exports only OCI metadata, `container/registry_archive.py` can retrieve the
+immutable image directly from private ACR using the isolated CLI identity. It verifies
+the manifest and every blob digest, keeps authentication in memory, and does not print
+credentials or signed redirect URLs. Pass the resulting archive with `--archive`.
+Do not broadly suppress scanner matches: a public dependency fixture must be separately
+verified against an immutable official base and restricted to its exact image digest,
+file hash and pattern through `--reviewed-public-material`. Local credential matches
+are never exempt. Reviewed public material is explicitly listed in the audit report.
 
-Each treatment region records raw text and gate diagnostics in `kraken_ocr.json`; eligible Kraken
-text also appears in `visual_reconcile_input.json`. CPU inference is intentional because Kraken 7.1
-mixes CPU and MPS tensors on this model. This strategy is an ablation tool, not a quality default.
+The image's default authentication is `AZURE_AUTH_MODE=managed-identity`. Full analysis
+requires an Azure-assigned identity with access to the configured AI resources; do not
+copy a developer's login cache into the image. For a UI-only local smoke test:
+
+```bash
+docker run --rm -p 127.0.0.1:5174:8080 -e PUBLIC_DEMO=0 inksight:demo
+```
+
+`GET /healthz` is a process-health probe and makes no model calls. `container_wsgi.py`
+initializes storage and restores saved runs before Gunicorn serves requests. Use only
+one WSGI worker and one replica: active jobs are process-local and do not resume after
+a restart. An interrupted public-demo run is restored as failed, not successful.
+
+#### Public demo, without sign-in
+
+`PUBLIC_DEMO=1` is an explicitly limited, anonymous demonstration mode, **not a
+confidential-document service**. Anyone finding the URL can submit work and incur AI
+charges. The UI displays that warning and the configured limits.
+
+- Signed, Secure, HttpOnly, SameSite cookies associate uploads and all result/API
+  surfaces with the same browser. There is no shared public history.
+- Only GPT-6.1 Sol / Standard is accepted; corpus comparisons are unavailable.
+- Defaults: 20 MiB per file, two pages, 40 detected regions per page, one active
+  analysis, ten starts per hour, 25 total starts, and a seven-day processing window.
+  Over-complex pages are rejected, never silently truncated. Images/PDF page sizes
+  are also bounded to avoid oversized rendering. Upload admissions are limited too.
+- The processing deadline blocks new uploads/analyses, not access to existing owned
+  results. Limits are operational safeguards, **not a hard dollar spending cap**.
+- Rendered document HTML is sandboxed; cross-origin POSTs are rejected.
+
+Set `INKSIGHT_DATA_DIR` and `INKSIGHT_RESULTS_DIR` to private runtime directories.
+For persistence, mount a **new** private Azure Files share at `/data` and set results
+to `/data/analysis_results`. New uploads, upload metadata, results, browser signing
+material and usage counters survive restarts. The signing key is created at runtime
+under `/data/.private`, outside all served paths; it is never in the image or logs.
+Missing/corrupt persisted signing or admission state causes an explicit startup failure
+rather than silently resetting ownership or usage limits.
+
+There is no automatic deletion of persistent files. Clearing the browser cookie loses
+normal access to that browser's history; anonymous mode has no account-based recovery.
+Review retention and delete the dedicated Azure environment when finished.
+
+The Bicep deployment creates a dedicated Container Apps environment, private ACR,
+Foundry account and model deployments, managed identity, Azure Files and diagnostics.
+AI access and image pulls use scoped managed identity roles. The SMB mount credential
+and diagnostic workspace key are resolved server-side in Azure-managed configuration,
+not copied into the application, source, image, logs or deployment outputs.
+The Content Understanding resource also needs its completion-mini and embedding
+aliases mapped to its new model deployments using API `2025-11-01`; creating only the
+GPT-6.1 Sol deployment is not sufficient.
+
+Deploy only after checking the target tenant/subscription, regional quotas, cost and
+the deployment plan. Use an isolated Azure CLI profile and explicit subscription;
+never switch the machine-wide default account. Remote ACR builds must use the staged
+code-only context. Verify anonymous browser isolation and synthetic-only analysis
+before sharing the HTTPS URL. Do not seed it with this repository's private corpus.
+
+Tenant policy can modify storage settings after an ARM deployment reports success.
+Private-only Azure Files cannot mount from an environment without a private network
+path; inspect actual policy/settings and live health, not only deployment status.
+Do not weaken governance controls to unblock deployment. Use an approved private-network
+design or an explicitly non-persistent demo. If an environment owner changes settings
+outside IaC, record that change and review whether future policy remediation/redeployment
+will reapply the restriction.
+
+### GPT-6.1 Sol
+
+The web UI only offers **GPT-6.1 Sol** with the **Standard** OCR strategy, and new
+web/API analyses default to this model. The profile uses low reasoning and deployment
+name `gpt-6.1-sol`. Older model profiles remain available through the API for legacy
+experiments, and saved analyses retain their original model labels.
+It reuses `GPT_SOL_ENDPOINT`, falling back to `GPT_ENDPOINT`. If you deployed it on
+a different Foundry resource, set `GPT_61_SOL_ENDPOINT` in your local `.env` to that
+resource's `/openai/v1/` endpoint. Set `GPT_61_SOL_DEPLOYMENT` if your deployment name
+differs. Restart the app after configuration changes using `make run`.
 
 The upload screen lists completed local analyses. Selecting one reopens the full source,
 detection, candidates, decision, final overlay, and logs without calling Azure again. Saved
 runs are restored from their manifests whenever the server starts.
 
-To reproduce the isolated multi-view experiment from the UI, upload a blue-handwritten lined
-image, select either **GPT-5.4** (medium reasoning) or **GPT-5.6 Sol · low reasoning**, and set
-**OCR strategy** to
-**Experimental isolated multi-view · lined handwriting** before selecting **Analyze selected**.
+The isolated multi-view experiment remains available through the API with
+`ocr_strategy=isolated-multiview` and `model_profile=gpt-5.4` or `gpt-5.6-sol`.
+It is not shown in the GPT-6.1-only UI because that model is not supported by this experiment.
 The strategy isolates lined rows, uses stable word groups only when geometry supports them, sends
 three faithful views of each unit through two candidate-blind reads, and aligns the results in
 code. Regions without valid colored lined geometry automatically use standard OCR. Experimental
@@ -196,7 +247,7 @@ most two independent draws concurrently. GPT-5.4 receives a larger output budget
 does not repeatedly exhaust a Sol-sized cap and trigger endpoint failover. Stable word groups run
 before expensive whole-line audits. Other model profiles use the standard strategy.
 
-For the standard strategies, GPT-5.4 handwriting OCR uses low reasoning and a 4,000-token budget.
+For the standard strategy, GPT-5.4 handwriting OCR uses low reasoning and a 4,000-token budget.
 Detection preserves the quality profile: medium reasoning, a 6,000-token budget, a 90-second
 per-endpoint timeout, and failover across the configured endpoint pool. If the full-page scan
 fails, five overlapping coverage segments run sequentially and report visible progress in the UI.
@@ -204,6 +255,17 @@ fails, five overlapping coverage segments run sequentially and report visible pr
 The UI hides Content Understanding's internal Markdown comments and figure descriptions while
 preserving the raw artifact on disk. Every upload performs fresh Azure analysis; OCR responses,
 Content Understanding responses, and completed document results are never replayed.
+
+Standard Core4 processing overlaps each region's visual verification with OCR still running
+on other regions. OCR and verification share the same per-page worker pool, so this does not
+increase the configured concurrency budget. Multi-draw voting and model-facing CU context
+retain their full evidence barriers. HTTP connections are reused per worker instead of
+reconnecting for every request, including CU status polling. Model deployments, prompts,
+image resolution, reasoning, token budgets, retries, rescue reads, and final cross-region
+checks are unchanged; this optimization does not cache or replay model responses.
+Latency still depends on model response times and retries. Compare the same detected
+regions when benchmarking scheduling changes; independent detections and transcriptions
+can vary between runs even with unchanged model settings.
 
 For PDFs, upload is followed by a page-selection workspace before any Azure analysis
 starts. Users can inspect page previews, click individual page thumbnails, select all
@@ -221,8 +283,6 @@ The page workspace exposes the complete analysis trail for administrators:
 - **Content Understanding** appears as soon as its background call completes.
 - **Detection** lists every handwriting region with its page coordinates and numbered overlay.
 - **Candidates** updates after each vision draw and groups alternate readings by region.
-- **Ivrit OCR** shows HASH v1 availability, text, line confidence, crop-relative boxes, and whether
-  the deterministic gate sent or excluded that reading from GPT evidence.
 - **Decision** records the selected transcription, voting method, alternatives, word confidence,
   and visual reasons.
 - **Final** shows the red handwriting overlay; **Logs** shows page-scoped pipeline events.
@@ -444,6 +504,52 @@ Hebrew handwriting).
 
 ## Quality authority and optional voting
 
+The current quality path preserves model-detected multi-line paragraph boxes instead of
+replacing a handwritten page with tiny blue-pixel fragments or colored margin artifacts.
+Clearly hand-circled or checked printed options are retained as selected values, with
+`selection`, `marks`, and `digits` exported in region diagnostics and the combined JSON.
+Ordinary unmarked printed text is still excluded from handwriting OCR.
+Mixed crops keep their genuine words/numbers in `handwritten_transcription`; a selected
+printed label is separate metadata and cannot replace that handwriting. Multi-digit
+amounts are not converted into prose descriptions of X marks. Ruled-row crops retain
+short trailing glyphs and stroke extents rather than clipping them to the tallest cores.
+
+Numeric fields receive an independent reread with the tight original crop shown before
+the larger context. Prior candidates are withheld, and other fields are context only.
+A changed numeric value is accepted only when a second candidate-blind, faithful-crop
+read agrees at confidence >=0.80. Disagreements retain the original with `[?]`, alternatives,
+and a visible human-review flag. These extra audits intentionally prioritize accuracy and
+can add latency; the normal model remains GPT-6.1 Sol with low reasoning, while disputed
+numeric confirmations use medium reasoning.
+Similar account/reference values in different regions are not interchangeable. A more
+confident neighboring value is retained as an alternative for review, never copied into
+another field solely because the labels and digits look similar.
+
+### Evaluating the complete local golden corpus
+
+`evaluate_golden.py` discovers both region-based `handwriting_result.json` references and
+document-based `golden.json` references, including their source paths:
+
+```bash
+.venv/bin/python evaluate_golden.py --run
+.venv/bin/python evaluate_golden.py --run --stem "חיוב חשבון1" --stem "העברה-קוקי"
+.venv/bin/python evaluate_golden.py --results /path/to/completed/corpus
+```
+
+Each fresh run uses GPT-6.1 Sol, 400-DPI rendering, the standard strategy, and the complete
+verification path. References are never sent to the OCR subprocess or updated by this tool.
+The private output directory contains per-document artifacts, logs, and `quality-report.json`.
+Metrics include exact region text, character/word error rates, spatial detection recall,
+signature safety, numeric-group values/order, and critical-value presence in merged text.
+Numeric-group metrics distinguish a legitimate ordering difference from changed digits or
+incorrectly joined/split account groups; word-inventory metrics are also reported separately.
+Internal relationship indexes
+are reported separately because plaintext OCR cannot validate source/destination association.
+Exact region matching is spatial and one-to-one, so segmentation changes must also be reviewed
+visually. A successful evaluator exit means evaluation completed, not perfect OCR accuracy.
+
+### Visual authority and voting
+
 The default quality path reads four core views in one multi-image call, then performs final
 **visual adjudication** with the image evidence attached again. Candidates are hints, while
 visible strokes remain the authority. Deterministic guards preserve numeric cell order, prevent
@@ -471,7 +577,7 @@ Two later quality experiments are retained but disabled by default:
 
 GPT-5.4 can use a two-endpoint pool configured locally in `.env`.
 
-The UI also offers high-cost experimental
+Legacy API profiles also include high-cost experimental
 `Claude Opus 4.8 · GitHub Copilot SDK · Core4`. It uses the standard four-view Core4 OCR call and
 visual reconciliation through the
 official `@github/copilot-sdk` Node package and image blob attachments, not an Azure/model API
@@ -483,8 +589,8 @@ account's premium usage allowance; Opus 4.8 is marked high cost in Copilot.
 
 `Gemini 3.5 Flash · GitHub Copilot SDK` uses the same account-specific, Keychain-free bridge with
 the exact enabled vision model `gemini-3.5-flash`. It uses low reasoning and a shorter timeout as
-a speed-oriented experimental profile. GPT-5.4 remains the default until golden evaluation proves
-that another profile improves quality.
+a speed-oriented experimental profile. These legacy profiles are not offered in the web UI;
+GPT-6.1 Sol is the default for new web/API analyses.
 
 Calls start on each endpoint in round-robin order. Connection failures, timeouts, 408/409/429,
 and transient 5xx responses immediately fail over to the other endpoint before normal backoff.
@@ -563,7 +669,7 @@ or a **stable** field (dates, numbers, IDs, emails) changing; volatile cursive/`
 are reported but never failed, since the model rewords them run-to-run.
 
 For deterministic quality-rule development, `quality_replay.py` reapplies current detector
-deduplication, HASH selection, numeric/date consensus, signature geometry, and output filtering to
+deduplication, numeric/date consensus, signature geometry, and output filtering to
 saved OCR evidence. It makes no model calls and loads golden answers only after all transformations:
 
 ```bash
@@ -573,7 +679,8 @@ python3 quality_replay.py \
 ```
 
 Repeat `--run 'GOLDEN_STEM=SAVED_RUN_DIR'` for any set of documents; add `--json` for
-machine-readable output. The final eight-document replay improved strict exact text from
+machine-readable output. A historical eight-document replay, before external OCR removal,
+improved strict exact text from
 20/70 to 31/70, mean similarity from 0.646 to 0.704, and non-text classification from 5/7 to
 7/7. On the two newly evaluated documents, current deterministic rules produce 3/3 exact fields
 for `חוזר מכר` and retain the one unresolved `פרוטוקול` date without inventing a correction.
@@ -585,17 +692,6 @@ high-reasoning reread is even narrower: it runs only when non-signature text rem
 `[?]` with no resolved characters, and accepts only Hebrew `handwritten_text` at confidence
 `>=0.70`. Empty `no_handwriting` detections are omitted from exported/merged regions only when all
 blind vision reads are also empty; their diagnostics remain in `rejected_regions`.
-
-When Core4 returns only digits but independent HASH output contains substantial Hebrew in a
-name/text slot, the pipeline performs two independent candidate-blind script audits before the
-normal contextual reread. Each audit uses one model endpoint and receives the tight crop, blue-only
-support, larger context, and highlighted page without either OCR candidate. A Hebrew name is emitted
-only when both audits exactly agree at sufficient confidence. Hebrew disagreement, mixed-script
-disagreement, a partial timeout with one Hebrew result, or two endpoint timeouts emit `[?]` with
-`needs_review` instead of preserving false numeric text or inventing a plausible name.
-The audit is intentionally narrow: strong name-slot labels, or a generic colored-handwriting label
-with at least three overlapping HASH fragments. Dates, accounts, amounts, IDs, and normal numeric
-fields are excluded.
 
 For crop/detection changes, run the detector without OCR or reconciliation. It matches current
 boxes against human text-region geometry, supports tight crops inside older broad/overlapping

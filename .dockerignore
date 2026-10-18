@@ -1,0 +1,15 @@
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!requirements-container.txt
+!app.py
+!handwriting_pipeline.py
+!segmented_ocr.py
+!public_demo.py
+!container_wsgi.py
+!ui/
+ui/*
+!ui/index.html
+!ui/app.js
+!ui/styles.css

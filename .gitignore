@@ -14,10 +14,21 @@ run*.log
 /golden/*
 !/golden/README.md
 
+# Private cloud validation evidence and financial rollout notes.
+/architecture/bank-money-transfer-project-transfer11.png
+/architecture/foundry-downstream-agents-v3.png
+/architecture/power-automate-e2e-email-attachments-success.png
+/architecture/power-automate-json-and-markdown-success.png
+/architecture/power-automate-renamed-merger-judge-success.png
+/architecture/power-automate-transfer11-success.png
+/docs/CU_IDENTIFIER_PRECEDENCE.md
+/docs/SOURCE_ACCOUNT_LINKING.md
+
 # ---- Local config / secrets ----
 .env
 .env.*
 !.env.example
+.copilot-azure/
 
 # ---- Python ----
 __pycache__/

@@ -38,7 +38,6 @@ import random
 import re
 import subprocess
 import sys
-import tempfile
 import time
 import unicodedata
 import uuid
@@ -52,7 +51,9 @@ import fitz  # PyMuPDF
 import numpy as np
 import requests
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageDraw, ImageFont
-from azure.identity import AzureCliCredential
+from azure.identity import AzureCliCredential, ManagedIdentityCredential
+from azure.core.exceptions import ClientAuthenticationError
+from azure.core.credentials import TokenCredential
 from dotenv import load_dotenv
 from segmented_ocr import (
     PROMPT_A as SEGMENTED_PROMPT_A,
@@ -77,6 +78,7 @@ GPT_DEPLOYMENT = os.environ.get("GPT_DEPLOYMENT", "gpt-5.4")
 GPT_TARGETS_JSON = os.environ.get("GPT_TARGETS", "")
 GPT_REASONING = os.environ.get("GPT_REASONING", "medium")  # low | medium | high
 MODEL_BACKEND = os.environ.get("MODEL_BACKEND", "azure-responses")
+AZURE_AUTH_MODE = os.environ.get("AZURE_AUTH_MODE", "azure-cli").strip().lower()
 SCOPE = "https://cognitiveservices.azure.com/.default"
 MAX_SEND_SIDE = int(os.environ.get("MAX_SEND_SIDE", "3000"))  # cap px sent to LLM
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))  # parallel GPT calls in flight
@@ -109,36 +111,6 @@ CU_API_VERSION = os.environ.get("CU_API_VERSION", "2025-11-01")
 GPT_TEMPERATURE = float(os.environ.get("GPT_TEMPERATURE", "0"))
 GPT_SEED = int(os.environ.get("GPT_SEED", "7"))
 GPT_READ_TIMEOUT = int(os.environ.get("GPT_READ_TIMEOUT", "90"))  # per-call read timeout (s); stuck calls retry fast
-IVRIT_OCR_URL = os.environ.get("IVRIT_OCR_URL", "http://127.0.0.1:8000").rstrip("/")
-IVRIT_OCR_TIMEOUT = max(1, int(os.environ.get("IVRIT_OCR_TIMEOUT", "60")))
-IVRIT_OCR_ENABLED = os.environ.get("IVRIT_OCR_ENABLED", "1") not in (
-    "", "0", "false", "False",
-)
-IVRIT_OCR_WORKERS = max(1, int(os.environ.get("IVRIT_OCR_WORKERS", "1")))
-IVRIT_OCR_SOURCE = "ivrit_hash_v1"
-IVRIT_OCR_MIN_AGREEMENT = float(
-    os.environ.get("IVRIT_OCR_MIN_AGREEMENT", "0.40")
-)
-IVRIT_OCR_MIN_PREPROCESS_AGREEMENT = float(
-    os.environ.get("IVRIT_OCR_MIN_PREPROCESS_AGREEMENT", "0.55")
-)
-KRAKEN_OCR_ENABLED = os.environ.get("KRAKEN_OCR_ENABLED", "0") not in (
-    "", "0", "false", "False",
-)
-KRAKEN_OCR_EXECUTABLE = os.environ.get(
-    "KRAKEN_OCR_EXECUTABLE",
-    str(Path(__file__).resolve().parent / ".models/kraken-venv/bin/kraken"),
-)
-KRAKEN_OCR_MODEL = os.environ.get(
-    "KRAKEN_OCR_MODEL",
-    str(Path(__file__).resolve().parent / ".models/pp-ocrv6-medium/medium.safetensors"),
-)
-KRAKEN_OCR_TIMEOUT = max(1, int(os.environ.get("KRAKEN_OCR_TIMEOUT", "30")))
-KRAKEN_OCR_SOURCE = "kraken_ppocrv6_medium"
-KRAKEN_OCR_MODEL_NAME = "PP-OCRv6 medium"
-KRAKEN_OCR_MIN_AGREEMENT = float(
-    os.environ.get("KRAKEN_OCR_MIN_AGREEMENT", "0.50")
-)
 CONTEXTUAL_RECHECK_MIN_CONFIDENCE = float(
     os.environ.get("CONTEXTUAL_RECHECK_MIN_CONFIDENCE", "0.60")
 )
@@ -172,9 +144,58 @@ NEARBY_CU_CONTEXT = os.environ.get("OCR_NEARBY_CU_CONTEXT", "0") not in (
 # (from the separate Content Understanding pipeline) may be passed as a SOFT hint
 # only — it never overrides the visible handwriting strokes.
 
-_credential = AzureCliCredential()
+class ModelAccessError(RuntimeError):
+    """A non-recoverable resource authentication/authorization failure."""
+
+
+def _make_azure_credential() -> TokenCredential:
+    if AZURE_AUTH_MODE == "azure-cli":
+        return AzureCliCredential(tenant_id=os.environ.get("AZURE_TENANT_ID") or None)
+    if AZURE_AUTH_MODE == "managed-identity":
+        return ManagedIdentityCredential(client_id=os.environ.get("AZURE_CLIENT_ID") or None)
+    raise ValueError("AZURE_AUTH_MODE must be 'azure-cli' or 'managed-identity'.")
+
+
+_credential = _make_azure_credential()
 _token_cache: dict[str, tuple[float, str]] = {}
 _token_lock = threading.Lock()
+_http_local = threading.local()
+_http_sessions: list[requests.Session] = []
+_http_sessions_lock = threading.Lock()
+
+
+def _http_session() -> requests.Session:
+    session = getattr(_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        _http_local.session = session
+        with _http_sessions_lock:
+            _http_sessions.append(session)
+    return session
+
+
+def _require_model_access(response: requests.Response, source: str) -> None:
+    tenant_mismatch = (
+        response.status_code == 400
+        and "tenant provided in token" in response.text.lower()
+    )
+    if response.status_code in {401, 403} or tenant_mismatch:
+        raise ModelAccessError(
+            f"{source} access denied (HTTP {response.status_code}). "
+            "Verify AZURE_AUTH_MODE, AZURE_TENANT_ID and the identity's access to the configured resource. "
+            + response.text[:300]
+        )
+
+
+def _close_http_sessions() -> None:
+    with _http_sessions_lock:
+        sessions = list(_http_sessions)
+        _http_sessions.clear()
+    for session in sessions:
+        session.close()
+
+
+atexit.register(_close_http_sessions)
 
 
 def _responses_url(endpoint: str) -> str:
@@ -224,7 +245,21 @@ def _bearer() -> str:
         exp, tok = _token_cache.get(SCOPE, (0.0, ""))
         if time.time() < exp - 60:
             return tok
-        at = _credential.get_token(SCOPE)
+        try:
+            at = _credential.get_token(SCOPE)
+        except ClientAuthenticationError as exc:
+            if AZURE_AUTH_MODE == "managed-identity":
+                raise ModelAccessError(
+                    "Azure managed identity could not obtain a token. "
+                    "Verify that the identity is assigned to this compute resource and "
+                    "AZURE_CLIENT_ID matches it when using a user-assigned identity. "
+                    "Check the managed identity endpoint and network connectivity."
+                ) from exc
+            raise ModelAccessError(
+                "Azure CLI could not obtain a token for the configured resource tenant. "
+                "Check network/DNS and sign-in state. If MFA is required, complete az login "
+                "for AZURE_TENANT_ID using this project's AZURE_CONFIG_DIR."
+            ) from exc
         _token_cache[SCOPE] = (at.expires_on, at.token)
         return at.token
 
@@ -540,6 +575,24 @@ def nearby_printed_context(
 # --------------------------------------------------------------------------- #
 # 5. Vision-LLM OCR
 # --------------------------------------------------------------------------- #
+_MARK_SELECTION_RULE = """- Always transcribe ALL genuine handwriting, even when this crop also contains marks.
+  Keep the genuine handwriting separately in handwritten_transcription; a selected option
+  must never replace, suppress, or be mixed into those handwritten words or numbers.
+- A clearly hand-circled or hand-checked PRINTED option is a selected form value.
+  Read only the visibly selected printed label into selection.text, set selection.kind
+  to circle or check, and describe the pen evidence in selection.visual_evidence.
+  Use selection=null when no printed option is clearly selected.
+  If genuine handwritten words or a multi-digit value are present, classify the crop as
+  handwritten_text and use that handwriting as the transcription. Only when there is no
+  genuine handwriting may the selected label become the transcription (mark_or_checkbox).
+  Standalone marks with a single accompanying digit may also be mark_or_checkbox.
+  Do not infer a selection from proximity, a printed border, or an unmarked label.
+- Preserve every visible X/check mark and accompanying handwritten digit in marks and digits,
+  but never replace a multi-digit value with a prose mark description.
+"""
+_MARK_SELECTION_SCHEMA = '  "selection": null,'
+
+
 def build_ocr_prompt(printed_context: str = "", italic: bool = False) -> str:
     context_block = build_context_block(printed_context)
     written = "handwritten or italic/cursive-printed" if italic else "handwritten"
@@ -557,6 +610,7 @@ Rules:
 - Transcribe only the {written} text.
 - Ignore printed body text, form lines, stamps, and black redactions.
 - Describe visible X/checkbox marks in the structured mark fields.
+{_MARK_SELECTION_RULE}
 - The attached image is the source of truth.
 - Use printed context only to resolve ambiguous handwriting when the visible strokes support it.
 - Do not copy printed context as handwriting.
@@ -567,9 +621,12 @@ Rules:
 {context_block}
 Return only JSON:
 {{
+  "classification": "handwritten_text | mark_or_checkbox | signature_non_text | no_handwriting",
   "full_transcription": "...",
+  "handwritten_transcription": "genuine handwritten words and numbers only, or empty",
     "marks": ["x"],
     "digits": ["1"],
+{_MARK_SELECTION_SCHEMA}
   "alternative_transcriptions": ["...", "..."],
   "words": [
     {{"text": "word", "confidence": 0.0, "alternatives": ["alt1", "alt2"], "reason": "short visual reason"}}
@@ -744,7 +801,7 @@ def _responses_text(content: list[dict], retries: int = 4,
         for target in ordered_targets:
             target_payload = {**payload, "model": target["deployment"]}
             try:
-                r = requests.post(
+                r = _http_session().post(
                     target["url"],
                     headers={
                         "Authorization": f"Bearer {_bearer()}",
@@ -757,6 +814,7 @@ def _responses_text(content: list[dict], retries: int = 4,
                 last_err = f"{target['name']} request error: {exc}"
                 continue
 
+            _require_model_access(r, f"[GPT] {target['name']}")
             if r.status_code == 400:
                 low = r.text.lower()
                 popped = False
@@ -809,110 +867,7 @@ def _responses_call(content: list[dict], retries: int = 2,
                                           endpoint_limit=endpoint_limit))
 
 
-def ocr_image_with_ivrit(image: Image.Image) -> dict:
-    """Send one region crop to the optional HASH v1 OCR sidecar."""
-    image_bytes = io.BytesIO()
-    image.convert("RGB").save(image_bytes, format="PNG")
-    response = requests.post(
-        f"{IVRIT_OCR_URL}/v1/ocr",
-        files={"file": ("region.png", image_bytes.getvalue(), "image/png")},
-        timeout=(3, IVRIT_OCR_TIMEOUT),
-    )
-    response.raise_for_status()
-    payload = response.json()
-    lines = []
-    for page in payload.get("pages") or []:
-        for line in page.get("lines") or []:
-            text = str(line.get("text") or "").strip()
-            if not text:
-                continue
-            lines.append({
-                "text": text,
-                "confidence": float(line.get("confidence") or 0.0),
-                "box": dict(line.get("box") or {}),
-            })
-    text = str(payload.get("text") or "").strip()
-    if not text:
-        text = "\n".join(line["text"] for line in lines)
-    confidence = (
-        sum(line["confidence"] for line in lines) / len(lines)
-        if lines else 0.0
-    )
-    return {
-        "status": "complete",
-        "source": IVRIT_OCR_SOURCE,
-        "model": "HASH v1",
-        "text": text,
-        "confidence": confidence,
-        "lines": lines,
-        "raw_response": payload,
-    }
-
-
-def ivrit_ocr_service_status() -> tuple[bool, str]:
-    """Check the optional sidecar once so absent Docker never fails a page."""
-    if not IVRIT_OCR_ENABLED:
-        return False, "disabled by IVRIT_OCR_ENABLED"
-    try:
-        response = requests.get(f"{IVRIT_OCR_URL}/health", timeout=(1, 2))
-        response.raise_for_status()
-        status = str((response.json() or {}).get("status") or "")
-        if status != "ok":
-            return False, f"service reported {status or 'unknown status'}"
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        return False, str(exc)
-    return True, "HASH v1 ready"
-
-
-def kraken_ocr_service_status() -> tuple[bool, str]:
-    """Validate the optional local Kraken executable and checkpoint."""
-    if not KRAKEN_OCR_ENABLED:
-        return False, "disabled by KRAKEN_OCR_ENABLED"
-    if not Path(KRAKEN_OCR_EXECUTABLE).is_file():
-        return False, f"Kraken executable not found: {KRAKEN_OCR_EXECUTABLE}"
-    if not Path(KRAKEN_OCR_MODEL).is_file():
-        return False, f"Kraken model not found: {KRAKEN_OCR_MODEL}"
-    return True, f"{KRAKEN_OCR_MODEL_NAME} ready"
-
-
-def ocr_image_with_kraken(image: Image.Image) -> dict:
-    """Recognize one pre-cropped RTL line with local PP-OCRv6 medium."""
-    with tempfile.TemporaryDirectory(prefix="ink-kraken-") as directory:
-        input_path = Path(directory) / "region.png"
-        output_path = Path(directory) / "result.txt"
-        image.convert("RGB").save(input_path, format="PNG")
-        command = [
-            KRAKEN_OCR_EXECUTABLE,
-            "--device", "cpu",
-            "--raise-on-error",
-            "--native",
-            "-i", str(input_path), str(output_path),
-            "ocr",
-            "--no-segmentation",
-            "--base-dir", "R",
-            "-m", KRAKEN_OCR_MODEL,
-        ]
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=KRAKEN_OCR_TIMEOUT,
-            check=False,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout).strip()
-            raise RuntimeError(detail[-2000:] or f"Kraken exited {completed.returncode}")
-        text = output_path.read_text(encoding="utf-8").strip()
-    return {
-        "status": "complete",
-        "source": KRAKEN_OCR_SOURCE,
-        "model": KRAKEN_OCR_MODEL_NAME,
-        "text": text,
-        "lines": [{"text": text}] if text else [],
-    }
-
-
-def prepare_ivrit_blue_only_image(image: Image.Image) -> Image.Image | None:
+def prepare_blue_only_image(image: Image.Image) -> Image.Image | None:
     """Remove black form print while preserving the original blue pen pixels."""
     rgb = np.array(image.convert("RGB"))
     work = rgb.astype(np.int16)
@@ -934,338 +889,12 @@ def prepare_ivrit_blue_only_image(image: Image.Image) -> Image.Image | None:
     return Image.fromarray(isolated[top:bottom, left:right])
 
 
-def _ivrit_core_result(vision_results: list[dict]) -> dict | None:
-    readings = [
-        result for result in vision_results
-        if result.get("source") != IVRIT_OCR_SOURCE
-        and (result.get("ocr") or {}).get("full_transcription", "").strip()
-    ]
-    if not readings:
-        return None
-    return next(
-        (
-            result for result in readings
-            if result.get("source", "").split("#", 1)[0] == "core4_multi"
-        ),
-        max(
-            readings,
-            key=lambda result: len(
-                _information_text(
-                    (result.get("ocr") or {}).get("full_transcription", "")
-                )
-            ),
-        ),
-    )
-
-
-def _ivrit_lines_overlap(lines: list[dict]) -> bool:
-    for first_index, first in enumerate(lines):
-        first_box = first.get("box") or {}
-        first_top = int(first_box.get("y") or 0)
-        first_height = int(first_box.get("height") or 0)
-        for second in lines[first_index + 1:]:
-            second_box = second.get("box") or {}
-            second_top = int(second_box.get("y") or 0)
-            second_height = int(second_box.get("height") or 0)
-            overlap = max(
-                0,
-                min(first_top + first_height, second_top + second_height)
-                - max(first_top, second_top),
-            )
-            if overlap >= 0.50 * max(1, min(first_height, second_height)):
-                return True
-    return False
-
-
-def should_try_ivrit_blue_only(
-    evidence: dict, vision_results: list[dict], region: dict,
-) -> bool:
-    """Retry only when one Core4 line became overlapping HASH line fragments."""
-    if evidence.get("status") != "complete":
-        return False
-    lines = evidence.get("lines") or []
-    if len(lines) < 2 or not _ivrit_lines_overlap(lines):
-        return False
-    core_result = _ivrit_core_result(vision_results)
-    if core_result is None:
-        return False
-    core_text = str(
-        (core_result.get("ocr") or {}).get("full_transcription") or ""
-    ).strip()
-    if "\n" in core_text or re.search(r"\d", core_text):
-        return False
-    if len(_hebrew_letter_sequence(core_text)) < 3:
-        return False
-    return not re.search(
-        r"\b(?:date|phone|email|account|reference|identifier|signature|"
-        r"mark|checkbox|amount|total)\b",
-        str(region.get("label") or ""),
-        re.I,
-    )
-
-
-def select_ivrit_preprocessing_variant(
-    original: dict, blue_only: dict, vision_results: list[dict], region: dict,
-) -> dict:
-    """Use a clean single blue line when two HASH preprocessors still agree."""
-    variants = {
-        "original": {
-            key: original.get(key)
-            for key in ("status", "text", "confidence", "lines", "detail")
-            if original.get(key) is not None
-        },
-        "blue_only": {
-            key: blue_only.get(key)
-            for key in ("status", "text", "confidence", "lines", "detail")
-            if blue_only.get(key) is not None
-        },
-    }
-    selected = dict(original)
-    selected["selected_variant"] = "original"
-    selected["variants"] = variants
-    if blue_only.get("status") != "complete" or len(blue_only.get("lines") or []) != 1:
-        return selected
-
-    original_letters = _hebrew_letter_sequence(str(original.get("text") or ""))
-    blue_letters = _hebrew_letter_sequence(str(blue_only.get("text") or ""))
-    if len(original_letters) < 3 or len(blue_letters) < 3:
-        return selected
-    agreement = difflib.SequenceMatcher(
-        None, original_letters, blue_letters
-    ).ratio()
-    length_overlap = min(len(original_letters), len(blue_letters)) / max(
-        len(original_letters), len(blue_letters)
-    )
-    if (
-        agreement < IVRIT_OCR_MIN_PREPROCESS_AGREEMENT
-        or length_overlap < 0.80
-    ):
-        return selected
-    selected = dict(blue_only)
-    selected["selected_variant"] = "blue_only"
-    selected["variants"] = variants
-    selected["preprocessing_consensus"] = {
-        "eligible": True,
-        "character_agreement": round(agreement, 4),
-        "length_overlap": round(length_overlap, 4),
-        "reason": "overlapping_hash_lines_collapsed_by_blue_isolation",
-    }
-    return selected
-
-
 def _hebrew_letter_sequence(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text or "")
     return "".join(
         character for character in normalized
         if "\u05d0" <= character <= "\u05ea"
     )
-
-
-def ivrit_ocr_advisory_gate(
-    evidence: dict, vision_results: list[dict], region: dict,
-) -> dict:
-    """Offer HASH to GPT only as a nearby spelling hypothesis."""
-    hash_text = str(evidence.get("text") or "").strip()
-    if evidence.get("status") != "complete" or not hash_text:
-        return {"eligible": False, "reason": "no_complete_hash_reading"}
-
-    core_result = _ivrit_core_result(vision_results)
-    if core_result is None:
-        return {"eligible": False, "reason": "no_vision_reading_to_correlate"}
-    core_ocr = core_result.get("ocr") or {}
-    core_text = str(core_ocr.get("full_transcription") or "").strip()
-    if core_ocr.get("classification") in {
-        "mark_or_checkbox", "signature_non_text", "no_handwriting",
-    }:
-        return {"eligible": False, "reason": "non_text_region"}
-
-    label = str(region.get("label") or "")
-    structured_label = re.search(
-        r"\b(?:date|phone|email|account|reference|"
-        r"identifier|signature|mark|checkbox|amount|total)\b",
-        label,
-        re.I,
-    )
-    if structured_label or re.search(r"\d", core_text) or re.search(r"\d", hash_text):
-        return {"eligible": False, "reason": "structured_or_numeric_region"}
-    if "\n" in core_text or "\n" in hash_text or len(evidence.get("lines") or []) != 1:
-        return {"eligible": False, "reason": "multiline_reading"}
-
-    core_letters = _hebrew_letter_sequence(core_text)
-    hash_letters = _hebrew_letter_sequence(hash_text)
-    if len(core_letters) < 3 or len(hash_letters) < 3:
-        return {"eligible": False, "reason": "insufficient_hebrew_letters"}
-    if core_letters == hash_letters:
-        return {
-            "eligible": False,
-            "reason": "duplicate_of_vision_reading",
-            "vision_source": core_result.get("source"),
-            "character_agreement": 1.0,
-            "length_overlap": 1.0,
-        }
-    preprocessing_consensus = evidence.get("preprocessing_consensus") or {}
-    if preprocessing_consensus.get("eligible"):
-        return {
-            "eligible": True,
-            "reason": "preprocessing_consensus",
-            "vision_source": core_result.get("source"),
-            "character_agreement": round(
-                difflib.SequenceMatcher(None, core_letters, hash_letters).ratio(),
-                4,
-            ),
-            "length_overlap": round(
-                min(len(core_letters), len(hash_letters)) / max(
-                    len(core_letters), len(hash_letters)
-                ),
-                4,
-            ),
-            "preprocessing_consensus": preprocessing_consensus,
-        }
-    length_overlap = min(len(core_letters), len(hash_letters)) / max(
-        len(core_letters), len(hash_letters)
-    )
-    agreement = difflib.SequenceMatcher(
-        None, core_letters, hash_letters
-    ).ratio()
-    gate = {
-        "eligible": (
-            agreement >= IVRIT_OCR_MIN_AGREEMENT and length_overlap >= 0.60
-        ),
-        "reason": "related_compact_hebrew" if (
-            agreement >= IVRIT_OCR_MIN_AGREEMENT and length_overlap >= 0.60
-        ) else "unrelated_to_vision_reading",
-        "vision_source": core_result.get("source"),
-        "character_agreement": round(agreement, 4),
-        "length_overlap": round(length_overlap, 4),
-    }
-    return gate
-
-
-def ivrit_ocr_candidate(evidence: dict) -> dict | None:
-    """Convert raw HASH evidence into a weak candidate for GPT adjudication."""
-    text = str(evidence.get("text") or "").strip()
-    if evidence.get("status") != "complete" or not text:
-        return None
-    words = [
-        {
-            "text": line.get("text", ""),
-            "alternatives": [],
-            "reason": "HASH v1 CNN-CTC advisory reading; confidence is uncalibrated",
-        }
-        for line in evidence.get("lines") or []
-        if line.get("text")
-    ]
-    return {
-        "source": IVRIT_OCR_SOURCE,
-        "ocr": {
-            "full_transcription": text,
-            "words": words,
-            "advisory": True,
-            "advisory_gate": evidence.get("advisory_gate"),
-        },
-    }
-
-
-def kraken_ocr_advisory_gate(
-    evidence: dict, vision_results: list[dict], region: dict,
-) -> dict:
-    """Admit Kraken only when it independently resembles the Core4 reading."""
-    kraken_text = str(evidence.get("text") or "").strip()
-    if evidence.get("status") != "complete" or not kraken_text:
-        return {"eligible": False, "reason": "no_complete_kraken_reading"}
-    core_result = _ivrit_core_result(vision_results)
-    if core_result is None:
-        return {"eligible": False, "reason": "no_vision_reading_to_correlate"}
-    core_ocr = core_result.get("ocr") or {}
-    core_text = str(core_ocr.get("full_transcription") or "").strip()
-    if core_ocr.get("classification") in {
-        "mark_or_checkbox", "signature_non_text", "no_handwriting",
-    }:
-        return {"eligible": False, "reason": "non_text_region"}
-    label = str(region.get("label") or "")
-    if re.search(
-        r"\b(?:date|phone|email|account|reference|identifier|signature|"
-        r"mark|checkbox|amount|total|number)\b", label, re.I,
-    ) or re.search(r"\d", core_text) or re.search(r"\d", kraken_text):
-        return {"eligible": False, "reason": "structured_or_numeric_region"}
-    if "\n" in core_text or "\n" in kraken_text:
-        return {"eligible": False, "reason": "multiline_reading"}
-    core_letters = _hebrew_letter_sequence(core_text)
-    kraken_letters = _hebrew_letter_sequence(kraken_text)
-    if len(core_letters) < 3 or len(kraken_letters) < 3:
-        return {"eligible": False, "reason": "insufficient_hebrew_letters"}
-    if core_letters == kraken_letters:
-        return {"eligible": False, "reason": "duplicate_of_vision_reading"}
-    agreement = difflib.SequenceMatcher(None, core_letters, kraken_letters).ratio()
-    length_overlap = min(len(core_letters), len(kraken_letters)) / max(
-        len(core_letters), len(kraken_letters)
-    )
-    eligible = agreement >= KRAKEN_OCR_MIN_AGREEMENT and length_overlap >= 0.60
-    return {
-        "eligible": eligible,
-        "reason": "related_compact_hebrew" if eligible else "unrelated_to_vision_reading",
-        "vision_source": core_result.get("source"),
-        "character_agreement": round(agreement, 4),
-        "length_overlap": round(length_overlap, 4),
-    }
-
-
-def kraken_ocr_candidate(evidence: dict) -> dict | None:
-    """Convert gated Kraken evidence into a weak visual-adjudication candidate."""
-    text = str(evidence.get("text") or "").strip()
-    if evidence.get("status") != "complete" or not text:
-        return None
-    return {
-        "source": KRAKEN_OCR_SOURCE,
-        "ocr": {
-            "full_transcription": text,
-            "words": [{
-                "text": text,
-                "alternatives": [],
-                "reason": f"{KRAKEN_OCR_MODEL_NAME} advisory line reading",
-            }],
-            "advisory": True,
-            "advisory_gate": evidence.get("advisory_gate"),
-        },
-    }
-
-
-def should_recheck_hebrew_numeric_script_conflict(
-    final: dict, evidence: dict, region: dict,
-) -> bool:
-    """Escalate a numeric read when independent OCR sees Hebrew in a text slot."""
-    if final.get("classification") in {"signature_non_text", "no_handwriting"}:
-        return False
-    text = str(final.get("final_transcription") or "").replace("[?]", "")
-    compact = re.sub(r"[\s,./:+-]", "", text)
-    if len(compact) < 2 or not compact.isdigit():
-        return False
-    if evidence.get("status") != "complete":
-        return False
-    if len(_hebrew_letter_sequence(str(evidence.get("text") or ""))) < 4:
-        return False
-    label = str(region.get("label") or "")
-    if re.search(
-        r"\b(?:date|phone|email|account|reference|identifier|signature|"
-        r"mark|checkbox|amount|total|number|code|id)\b",
-        label,
-        re.I,
-    ):
-        return False
-    strong_text_slot = re.search(
-        r"\b(?:name|acknowledg\w*|instruction\w*|recipient|beneficiary|"
-        r"holder|owner)\b",
-        label,
-        re.I,
-    )
-    generic_multiline_conflict = (
-        label.strip().lower() in {
-            "handwriting", "colored handwriting", "blue handwriting",
-        }
-        and str(final.get("field_type") or "").lower() != "date"
-        and len(evidence.get("lines") or []) >= 3
-    )
-    return bool(strong_text_slot or generic_multiline_conflict)
 
 
 def ocr_image(image: Image.Image, prompt: str, seed: int | None = None) -> dict:
@@ -1440,6 +1069,8 @@ def run_isolated_multiview_plan(
                 successful_calls += 1
                 if on_draw:
                     on_draw(True)
+            except ModelAccessError:
+                raise
             except Exception as exc:
                 responses[(line_index, unit_index, pass_name)] = {
                     "transcription": "",
@@ -1543,13 +1174,14 @@ def cu_ocr_markdown(input_path: str, timeout_s: int = 180, retries: int = 4,
     for attempt in range(retries + 1):
         backoff = min(30.0, 2.0 ** attempt) + random.uniform(0, 1.5)
         try:
-            r = requests.post(url, headers=hdr, data=body, timeout=120)
+            r = _http_session().post(url, headers=hdr, data=body, timeout=120)
         except requests.exceptions.RequestException as exc:  # timeout / DNS / reset
             last_err = str(exc)
             if attempt < retries:
                 time.sleep(backoff)
                 continue
             raise RuntimeError(f"[CU] submit error after retries: {last_err}")
+        _require_model_access(r, "[CU]")
         if r.status_code == 202:
             break
         if r.status_code in (408, 429, 500, 502, 503, 504) and attempt < retries:
@@ -1561,7 +1193,9 @@ def cu_ocr_markdown(input_path: str, timeout_s: int = 180, retries: int = 4,
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
-            g = requests.get(op, headers=hdr, timeout=30).json()
+            response = _http_session().get(op, headers=hdr, timeout=30)
+            _require_model_access(response, "[CU]")
+            g = response.json()
         except requests.exceptions.RequestException:  # transient poll error -> keep polling
             time.sleep(2)
             continue
@@ -1601,6 +1235,11 @@ C) The page image (attached) - it is the AUTHORITY. Use it to fix garbled italic
 Rules:
 - Output the full document text ONCE, in reading order. NO duplication - never
   repeat the same sentence from both sources.
+- Preserve the literal handwriting readings from B, including uncertain markers,
+  leading zeros, abbreviations, names, repeated words, and numeric group order.
+  Do not silently rewrite a value, expand an abbreviation, normalize a name, or
+  complete missing characters. De-duplication is only BETWEEN OCR sources, not
+  removal of repetitions genuinely present inside one handwriting reading.
 - Use source A for regular printed text.
 - Fix garbled italic printed Hebrew using the image + context.
 - Insert each handwritten value at its correct place, wrapped in
@@ -2004,42 +1643,6 @@ def _information_text(text: str) -> str:
     return re.sub(r"[^\w\u0590-\u05ff]", "", (text or "").replace("[?]", ""))
 
 
-def prefer_eligible_ivrit_candidate(final: dict, evidence: dict) -> dict:
-    """Use HASH only after the existing vision-correlation gate admitted it."""
-    gate = evidence.get("advisory_gate") or {}
-    ivrit_text = str(evidence.get("text") or "").strip()
-    current_text = str(final.get("final_transcription") or "").strip()
-    if (
-        evidence.get("status") != "complete"
-        or not gate.get("eligible")
-        or not ivrit_text
-        or _information_text(ivrit_text) == _information_text(current_text)
-    ):
-        return final
-    if final.get("classification") not in (None, "handwritten_text"):
-        return final
-
-    selected = dict(final)
-    selected["final_transcription"] = ivrit_text
-    selected["classification"] = "handwritten_text"
-    alternatives = selected.setdefault("alternative_transcriptions", [])
-    if current_text and current_text != ivrit_text and current_text not in alternatives:
-        alternatives.insert(0, current_text)
-    selected.setdefault("notes", []).append(
-        "eligible HASH tie-break: selected independently gated compact Hebrew evidence"
-    )
-    selected["needs_review"] = bool(final.get("needs_review"))
-    selected["decision_status"] = "ivrit_eligible_tiebreak"
-    selected["ivrit_tiebreak"] = {
-        "rejected_transcription": current_text,
-        "reason": gate.get("reason"),
-        "vision_source": gate.get("vision_source"),
-        "character_agreement": gate.get("character_agreement"),
-        "selected_variant": evidence.get("selected_variant", "original"),
-    }
-    return selected
-
-
 def separate_numeric_field_marks(final: dict) -> dict:
     """Keep standalone X marks out of otherwise numeric transcription."""
     if str(final.get("field_type") or "").lower() != "numeric":
@@ -2108,7 +1711,7 @@ def _structured_result_confidence(final: dict) -> float:
 
 
 def reconcile_repeated_structured_fields(finals: list[dict], regions: list[dict]) -> list[dict]:
-    """Use a stronger duplicate identifier to repair one-digit OCR drift."""
+    """Flag similar identifiers that disagree without copying another field's value."""
     position_words = re.compile(
         r"\b(?:top|bottom|upper|lower|middle|left|right|form|handwritten|entry|"
         r"next|below|above|line|table|on|in)\b",
@@ -2149,17 +1752,21 @@ def reconcile_repeated_structured_fields(finals: list[dict], regions: list[dict]
                 loser = dict(reconciled[loser_index])
                 rejected = loser.get("final_transcription", "")
                 selected = winner.get("final_transcription", "")
-                loser["final_transcription"] = selected
-                alternatives = loser.setdefault("alternative_transcriptions", [])
-                if rejected and rejected != selected and rejected not in alternatives:
-                    alternatives.insert(0, rejected)
-                loser.setdefault("notes", []).append(
-                    "cross-region consensus: matched the stronger repeated identifier"
+                loser["final_transcription"] = (
+                    rejected if "[?]" in rejected else rejected + "[?]"
                 )
-                loser["decision_status"] = "cross_region_structured_consensus"
-                loser["cross_region_consensus"] = {
+                alternatives = loser.setdefault("alternative_transcriptions", [])
+                if selected and selected != rejected and selected not in alternatives:
+                    alternatives.insert(0, selected)
+                loser.setdefault("notes", []).append(
+                    "similar identifiers disagree: peer confidence is not evidence for replacing this field"
+                )
+                loser["needs_review"] = True
+                loser["decision_status"] = "cross_region_conflict_review"
+                loser["cross_region_conflict"] = {
                     "matched_region": winner_index + 1,
-                    "rejected_transcription": rejected,
+                    "retained_transcription": rejected,
+                    "alternative_transcription": selected,
                     "winner_confidence": winner_confidence,
                     "loser_confidence": loser_confidence,
                 }
@@ -2353,7 +1960,8 @@ def reconcile_uncertain_repeated_numbers(
         current_digits = "".join(re.findall(r"\d", current_text))
         info = _information_text(current_text)
         if (
-            "[?]" not in current_text
+            final.get("cross_region_conflict")
+            or "[?]" not in current_text
             or len(current_digits) < 4
             or "/" in current_text
             or re.search(r"[A-Za-z\u0590-\u05ff]", info)
@@ -2442,8 +2050,19 @@ def protect_faithful_candidate(final: dict, usable: list[dict]) -> dict:
     return protected
 
 
+def _plain_numeric_reading(text: str) -> bool:
+    text = (text or "").replace("[?]", "").strip()
+    return len(re.findall(r"\d", text)) >= 2 and bool(re.fullmatch(r"[\d\s,./:|+-]+", text))
+
+
+def _numeric_reading_key(text: str) -> str:
+    stripped = (text or "").replace("[?]", "").strip()
+    sign = stripped[0] if stripped and stripped[0] in "+-" else ""
+    return sign + _numeric_sequence(stripped)
+
+
 def should_contextual_recheck(final: dict, usable: list[dict]) -> bool:
-    """Escalate uncertain or language-bearing fields; leave clean numeric fields fast."""
+    """Independently audit numeric values as well as uncertain/language-bearing fields."""
     if final.get("classification") in {"signature_non_text", "no_handwriting"}:
         return False
     texts = [
@@ -2454,6 +2073,8 @@ def should_contextual_recheck(final: dict, usable: list[dict]) -> bool:
     candidate = max(texts, key=lambda text: len(_information_text(text)), default="")
     final_text = final.get("final_transcription", "")
     combined = f"{candidate} {final_text}"
+    if _plain_numeric_reading(final_text):
+        return True
     if not _information_text(final_text):
         return True
     if "[?]" in combined:
@@ -2518,11 +2139,10 @@ def contextual_region_recheck(
     context_image, highlighted_page = build_contextual_region_images(page_img, region["box"])
     candidate_text = candidate.get("final_transcription", "")
     candidate_has_hebrew = bool(re.search(r"[\u0590-\u05ff]", candidate_text))
-    candidate_hint = "(withheld for an independent Hebrew reread)" if candidate_has_hebrew \
-        else candidate_text or "(none)"
-    preservation_rule = "" if candidate_has_hebrew else """
-- Preserve all visible words/digits and their grouping. Do not shorten or reorder the candidate
-  unless the highlighted visual evidence clearly proves the correction."""
+    candidate_hint = (
+        "(withheld for an independent Hebrew reread)" if candidate_has_hebrew
+        else "(withheld for an independent stroke-based reread)"
+    )
     context_block = build_context_block(printed_context)
     numeric_cell_rules = ""
     numeric_cell_schema = ""
@@ -2536,8 +2156,10 @@ def contextual_region_recheck(
   ],"""
     prompt = f"""Re-read the handwriting inside the RED rectangle on this Hebrew form.
 
-You receive a larger local crop and the full page so nearby printed labels, table cells,
-and field position are visible. Transcribe ONLY handwriting inside the red rectangle.
+The FIRST image is the authoritative tight original crop of the target.
+The larger local crop and full page provide field position and printed-label context ONLY.
+Transcribe ONLY the target crop. Never copy a word or number from another field, even when
+it looks clearer or occurs repeatedly elsewhere on the page.
 
 Current OCR candidate: {candidate_hint}
 
@@ -2546,14 +2168,20 @@ Rules:
 - Use nearby printed labels only to identify the field type, never copy them as handwriting.
 - Read Hebrew words right-to-left, but digits and numeric cells in physical left-to-right order.
 {numeric_cell_rules}
-{preservation_rule}
+- Preserve the visible characters, numeric grouping, leading zeros, and the date length as
+  written. Do not complete a year, repair a familiar name, or fill a digit from context.
 - Return uncertainty as [?]. Classify signatures and marks explicitly.
+{_MARK_SELECTION_RULE}
 {context_block}
 Return JSON only:
 {{
   "classification": "handwritten_text | mark_or_checkbox | signature_non_text | no_handwriting",
   "field_type": "date | numeric | name | address | free_text | mark | signature | unknown",
   "final_transcription": "...",
+  "handwritten_transcription": "genuine handwritten words and numbers only, or empty",
+  "marks": [],
+  "digits": [],
+{_MARK_SELECTION_SCHEMA}
 {numeric_cell_schema}
   "confidence": 0.0,
   "alternative_transcriptions": [],
@@ -2563,12 +2191,61 @@ Return JSON only:
 """
     result = _responses_call([
         {"type": "input_text", "text": prompt},
+        {"type": "input_text", "text": "Authoritative tight original target crop:"},
+        {
+            "type": "input_image",
+            "image_url": _to_data_uri(crop_region(page_img, *region["box"])),
+        },
         {"type": "input_text", "text": "Larger context crop with target rectangle:"},
         {"type": "input_image", "image_url": _to_data_uri(context_image)},
         {"type": "input_text", "text": "Full page with the same target rectangle:"},
         {"type": "input_image", "image_url": _to_data_uri(highlighted_page)},
     ], retries=0, max_tokens=10000, reasoning=reasoning)
     return result, (context_image, highlighted_page)
+
+
+def numeric_region_confirmation(image_tasks: list[tuple[str, Image.Image]]) -> dict:
+    faithful = [
+        (name, image) for name, image in image_tasks
+        if name in _FAITHFUL_VISUAL_SOURCES
+    ]
+    if not faithful:
+        raise RuntimeError("numeric confirmation requires faithful target images")
+    prompt = """Independently read the exact numeric handwriting in this target crop.
+You receive no OCR candidates and no other fields. The original crop is authoritative;
+the other images only clarify the same strokes. Do not guess from a familiar number.
+Preserve leading zeros, every visible digit, date length, and physical numeric group order.
+Do not complete a year or borrow digits from a printed label. Use [?] for ambiguity.
+If there is no numeric handwriting, classify what is visible rather than invent digits.
+Return JSON only:
+{"classification":"handwritten_text | mark_or_checkbox | signature_non_text | no_handwriting",
+ "final_transcription":"...", "confidence":0.0, "visual_evidence":"specific stroke evidence",
+ "words":[], "notes":[]}
+"""
+    content = [{"type": "input_text", "text": prompt}]
+    for name, image in faithful:
+        content.append({"type": "input_text", "text": f"Target view: {name}"})
+        content.append({"type": "input_image", "image_url": _to_data_uri(image)})
+    return _responses_call(
+        content, retries=0, reasoning="medium", max_tokens=6000, endpoint_limit=1,
+    )
+
+
+def numeric_correction_confirmed(current: dict, recheck: dict, confirmation: dict) -> bool:
+    current_text = str(current.get("final_transcription") or "")
+    texts = [str(read.get("final_transcription") or "") for read in (recheck, confirmation)]
+    if not _plain_numeric_reading(current_text):
+        return False
+    if any(
+        not _plain_numeric_reading(text) or "?" in text
+        or read.get("classification") != "handwritten_text"
+        or type(read.get("confidence")) not in (int, float)
+        or not 0.80 <= read["confidence"] <= 1.0
+        for read, text in zip((recheck, confirmation), texts)
+    ):
+        return False
+    sequences = [_numeric_reading_key(text) for text in texts]
+    return sequences[0] == sequences[1] and sequences[0] != _numeric_reading_key(current_text)
 
 
 def script_conflict_region_recheck(
@@ -2579,7 +2256,7 @@ def script_conflict_region_recheck(
         page_img, region["box"]
     )
     original_crop = crop_region(page_img, *region["box"])
-    blue_only = prepare_ivrit_blue_only_image(original_crop)
+    blue_only = prepare_blue_only_image(original_crop)
     context_block = build_context_block(printed_context)
     prompt = f"""Candidate-blind script audit for handwriting inside the RED rectangle.
 
@@ -2645,6 +2322,8 @@ Return JSON only:
         for future in futures:
             try:
                 audits.append(future.result())
+            except ModelAccessError:
+                raise
             except Exception as exc:
                 audits.append({
                     "script": "error",
@@ -2913,7 +2592,9 @@ def assemble_spatial_numeric_cells(recheck: dict) -> dict:
     return assembled
 
 
-def accept_contextual_recheck(current: dict, recheck: dict) -> dict:
+def accept_contextual_recheck(
+    current: dict, recheck: dict, *, confirmed_numeric: bool = False,
+) -> dict:
     """Accept a contextual read only when it is non-empty and not less informative."""
     if SPATIAL_NUMERIC_CELLS:
         recheck = assemble_spatial_numeric_cells(recheck)
@@ -2931,6 +2612,15 @@ def accept_contextual_recheck(current: dict, recheck: dict) -> dict:
     recheck_has_hebrew = bool(re.search(r"[\u0590-\u05ff]", recheck_info))
     if current_has_hebrew and not recheck_has_hebrew:
         return current
+    numeric_change = (
+        _plain_numeric_reading(current.get("final_transcription", ""))
+        and _plain_numeric_reading(recheck.get("final_transcription", ""))
+        and _numeric_reading_key(current["final_transcription"])
+        != _numeric_reading_key(recheck["final_transcription"])
+    )
+    confidence = float(recheck.get("confidence", 0.0) or 0.0)
+    if numeric_change and (not confirmed_numeric or confidence < 0.80):
+        return current
     structured_pattern = re.compile(r"(?:\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|[O0]\+)", re.I)
     current_structured = {
         token.upper().replace(".", "/").replace("-", "/")
@@ -2940,9 +2630,10 @@ def accept_contextual_recheck(current: dict, recheck: dict) -> dict:
         token.upper().replace(".", "/").replace("-", "/")
         for token in structured_pattern.findall(recheck.get("final_transcription", ""))
     }
-    if not current_structured.issubset(recheck_structured):
+    if not current_structured.issubset(recheck_structured) and not (
+        confirmed_numeric and numeric_change
+    ):
         return current
-    confidence = float(recheck.get("confidence", 0.0) or 0.0)
     if confidence < CONTEXTUAL_RECHECK_MIN_CONFIDENCE and recheck_info != current_info:
         return current
     accepted = dict(recheck)
@@ -2953,64 +2644,6 @@ def accept_contextual_recheck(current: dict, recheck: dict) -> dict:
     accepted["decision_status"] = "contextual_recheck"
     accepted["contextual_recheck"] = True
     return accepted
-
-
-def protect_contextual_recheck_with_cross_engine_agreement(
-    current: dict,
-    recheck: dict,
-    accepted: dict,
-    vision_results: list[dict],
-    ivrit_evidence: dict,
-) -> dict:
-    """Do not let one context guess override exact visual/Core4/HASH agreement."""
-    current_text = str(current.get("final_transcription") or "")
-    recheck_text = str(recheck.get("final_transcription") or "")
-    accepted_text = str(accepted.get("final_transcription") or "")
-    current_info = _information_text(current_text)
-    if (
-        len(current_info) < 3
-        or _information_text(recheck_text) == current_info
-        or _information_text(accepted_text) == current_info
-        or ivrit_evidence.get("status") != "complete"
-        or _information_text(str(ivrit_evidence.get("text") or "")) != current_info
-    ):
-        return accepted
-    faithful_supporters = [
-        result.get("source", "")
-        for result in vision_results
-        if _is_faithful_source(result.get("source", ""))
-        and _information_text(
-            str((result.get("ocr") or {}).get("full_transcription") or "")
-        ) == current_info
-    ]
-    advisory_gate = ivrit_evidence.get("advisory_gate") or {}
-    eligible_hash_support = bool(advisory_gate.get("eligible"))
-    if not faithful_supporters and not eligible_hash_support:
-        return accepted
-
-    protected = dict(current)
-    if not protected.get("field_type") and accepted.get("field_type"):
-        protected["field_type"] = accepted.get("field_type")
-    alternatives = list(protected.get("alternative_transcriptions") or [])
-    for text in [recheck_text, *(recheck.get("alternative_transcriptions") or [])]:
-        if text and text != current_text and text not in alternatives:
-            alternatives.append(text)
-    protected["alternative_transcriptions"] = alternatives
-    protected.setdefault("notes", []).append(
-        "contextual override rejected: visual and independently gated HASH agree"
-    )
-    protected["needs_review"] = True
-    protected["decision_status"] = "cross_engine_agreement_protected"
-    protected["cross_engine_agreement"] = {
-        "selected_transcription": current_text,
-        "rejected_contextual_transcription": recheck_text,
-        "vision_supporting_sources": faithful_supporters,
-        "vision_correlated_source": advisory_gate.get("vision_source"),
-        "ivrit_advisory_gate": advisory_gate,
-        "ivrit_source": ivrit_evidence.get("source", IVRIT_OCR_SOURCE),
-        "ivrit_selected_variant": ivrit_evidence.get("selected_variant", "original"),
-    }
-    return protected
 
 
 def is_signature_flourish(image: Image.Image) -> bool:
@@ -3084,6 +2717,71 @@ def is_black_signature_flourish(image: Image.Image) -> bool:
     return dominant_flourish or complex_flourish
 
 
+def finalize_mark_selection(final: dict, usable: list[dict]) -> dict:
+    if final.get("classification") not in {"handwritten_text", "mark_or_checkbox"} or final.get("selection") is None:
+        return final
+    resolved = {**final, "notes": list(final.get("notes") or [])}
+    selection = final["selection"]
+    if not isinstance(selection, dict) or selection.get("kind") not in {"circle", "check"}:
+        resolved["needs_review"] = True
+        resolved.setdefault("notes", []).append("invalid selected-mark evidence; human review required")
+        return resolved
+    marks = resolved.get("marks") or []
+    if not isinstance(marks, list) or any(not isinstance(mark, str) for mark in marks):
+        resolved["needs_review"] = True
+        resolved["notes"].append("invalid mark metadata; human review required")
+        return resolved
+    text = selection.get("text")
+    evidence = selection.get("visual_evidence")
+    if not isinstance(text, str) or not isinstance(evidence, str) or not text.strip() or not evidence.strip():
+        resolved["needs_review"] = True
+        resolved.setdefault("notes", []).append("selected label lacks text or visible pen evidence")
+        return resolved
+    text, evidence = text.strip(), evidence.strip()
+    supported = False
+    for result in usable:
+        if not _is_faithful_source(result.get("source", "")):
+            continue
+        reading = result.get("ocr") or {}
+        source_selection = reading.get("selection")
+        source_label = source_selection.get("text", "") if isinstance(source_selection, dict) else ""
+        if _information_text(text) and _information_text(text) in {
+            _information_text(reading.get("full_transcription") or ""),
+            _information_text(source_label),
+        }:
+            supported = True
+            break
+    handwriting = final.get("handwritten_transcription")
+    existing = str(final.get("final_transcription") or "").strip()
+    mixed = isinstance(handwriting, str) and bool(handwriting.strip())
+    if mixed:
+        resolved["final_transcription"] = handwriting.strip()
+        resolved["classification"] = "handwritten_text"
+        if "?" in handwriting:
+            resolved["needs_review"] = True
+    elif _information_text(existing) and _information_text(existing) != _information_text(text):
+        mixed = True
+        resolved["needs_review"] = True
+    else:
+        resolved["final_transcription"] = text
+    resolved["selection"] = {**selection, "text": text, "visual_evidence": evidence}
+    resolved["marks"] = list(dict.fromkeys([
+        *marks, selection["kind"],
+    ]))
+    resolved["needs_review"] = bool(resolved.get("needs_review")) or not supported
+    resolved["decision_status"] = (
+        "mixed_mark_and_text" if mixed
+        else "selected_mark_value" if supported else "selected_mark_review"
+    )
+    note = (
+        "selected printed value supported by pen evidence and faithful OCR"
+        if supported else "selected printed value requires independent reading confirmation"
+    )
+    if note not in resolved["notes"]:
+        resolved["notes"].append(note)
+    return resolved
+
+
 def finalize_region_semantics(
     final: dict, usable: list[dict], signature_flourish: bool = False,
 ) -> dict:
@@ -3124,6 +2822,21 @@ def finalize_region_semantics(
             "signature geometry: empty text and explicit signature evidence agree"
         )
     resolved["classification"] = classification
+    handwriting = resolved.get("handwritten_transcription")
+    if (
+        classification == "mark_or_checkbox"
+        and isinstance(handwriting, str)
+        and _information_text(handwriting)
+        and (
+            re.search(r"[A-Za-z\u0590-\u05ff]", handwriting)
+            or len(re.findall(r"\d", handwriting)) > 1
+        )
+    ):
+        resolved["final_transcription"] = handwriting.strip()
+        classification = "handwritten_text"
+        resolved["classification"] = classification
+    resolved = finalize_mark_selection(resolved, usable)
+    classification = resolved["classification"]
     if (
         not signature_flourish
         and not _norm_read(resolved.get("final_transcription", ""))
@@ -3180,7 +2893,11 @@ def finalize_region_semantics(
     elif classification == "mark_or_checkbox":
         marks = [str(mark).lower() for mark in resolved.get("marks", [])]
         digits = [str(digit) for digit in resolved.get("digits", []) if str(digit).isdigit()]
-        if any(mark in {"x", "×"} for mark in marks) and digits:
+        if (
+            any(mark in {"x", "×"} for mark in marks)
+            and len("".join(digits)) == 1
+            and not resolved.get("selection")
+        ):
             resolved["final_transcription"] = f"סימון x ו המספר {' '.join(digits)}"
             resolved["decision_status"] = "structured_mark"
     return resolved
@@ -3303,25 +3020,11 @@ def visual_reconcile_ocr_results(
     readings = [
         (r.get("ocr") or {}).get("full_transcription", "")
         for r in usable
-        if r.get("source") not in {IVRIT_OCR_SOURCE, KRAKEN_OCR_SOURCE}
         if (r.get("ocr") or {}).get("full_transcription", "").strip()
     ]
     agreement = aggregate_votes(readings) if readings else {}
     agreement_text = agreement.get("final_transcription", "") or "(none)"
     context_block = build_context_block(printed_context)
-    ivrit_rule = ""
-    if any(result.get("source") == IVRIT_OCR_SOURCE for result in usable):
-        ivrit_rule = """- The candidate source ivrit_hash_v1 is an independent HASH v1
-  CNN-CTC OCR reading. Its confidence is uncalibrated and its measured natural-form
-  word error rate is high. Use it only as spelling evidence when the visible strokes
-  support it. Never select it solely because it supplies a complete or familiar Hebrew word.
-"""
-    kraken_rule = ""
-    if any(result.get("source") == KRAKEN_OCR_SOURCE for result in usable):
-        kraken_rule = """- The candidate source kraken_ppocrv6_medium is an independent local
-  CTC line reading. It is experimental and may confuse scripts. Use it only when the visible
-  strokes support it; never select it because it forms a more familiar word.
-"""
     instruction = f"""You are doing final visual adjudication of Hebrew handwriting OCR.
 
 You will receive:
@@ -3332,7 +3035,7 @@ You will receive:
 Rules:
 - The images are the source of truth.
 - Candidate readings are hints only.
-{ivrit_rule}{kraken_rule}- Original crop, contrast, denoised, and original-image chunks are faithful evidence.
+- Original crop, contrast, denoised, and original-image chunks are faithful evidence.
 - Thresholded, thickened, line-removed, and isolated-stroke images are supporting evidence only.
 - Never choose a reading supported only by one supporting transform when the faithful images
     disagree with it. Return uncertain letters/words instead of completing a plausible name.
@@ -3350,6 +3053,7 @@ Rules:
 - Do not invent unsupported words.
 - Mark uncertain words with [?].
 - Classify signatures and checkbox/mark regions explicitly; never transcribe a signature as text.
+{_MARK_SELECTION_RULE}
 - Return JSON only.
 {context_block}
 Candidate OCR readings (hints only):
@@ -3364,6 +3068,8 @@ Return ONLY a single JSON object:
   "final_transcription": "best Hebrew transcription, right-to-left",
     "marks": ["x"],
     "digits": ["1"],
+  "handwritten_transcription": "genuine handwritten words and numbers only, or empty",
+{_MARK_SELECTION_SCHEMA}
   "alternative_transcriptions": ["..."],
   "words": [
     {{"text": "word", "confidence": 0.0, "alternatives": ["alt1"], "reason": "short visual reason"}}
@@ -3487,7 +3193,15 @@ def refine_box_to_colored_ink(
     value = hsv[:, :, 2]
     hue = hsv[:, :, 0]
     hint = color_hint.lower()
-    color_mask = (saturation >= 45) & (value <= 245)
+    red, green, blue = np.moveaxis(rgb.astype(np.int16), -1, 0)
+    pen_color = (
+        ((blue - red >= 24) & (blue - green >= 17))
+        | ((green - red >= 20) & (green - blue >= 10))
+    )
+    color_mask = (
+        (saturation >= 45) & (value <= 245)
+        & pen_color
+    )
     if "blue" in hint:
         color_mask &= (hue >= 100) & (hue <= 135)
     elif "green" in hint:
@@ -3707,8 +3421,18 @@ def tighten_regions_to_black_ink_rows(
     for region in regions:
         candidate = dict(region, box=list(region["box"]))
         x, y, width, height = candidate["box"]
+        anchor = candidate.get("_model_box", candidate["box"])
+        anchor_x, anchor_y, anchor_width, anchor_height = anchor
         label = str(candidate.get("label") or "").lower()
-        if "paragraph block" in label or height < minimum_region_height:
+        single_row = (
+            re.search(r"\b(?:row|line|field|entry|heading)\b", label)
+            or compact_handwriting_kind(label) is not None
+        )
+        if (
+            is_handwriting_block_label(label)
+            or not single_row
+            or height < minimum_region_height
+        ):
             tightened.append(candidate)
             continue
 
@@ -3823,7 +3547,7 @@ def tighten_regions_to_black_ink_rows(
             tightened.append(candidate)
             continue
 
-        region_center = y + height / 2
+        region_center = anchor_y + anchor_height / 2
         minimum_row_height = max(24, round(page_height * 0.01))
         maximum_row_height = max(
             140,
@@ -3861,13 +3585,13 @@ def tighten_regions_to_black_ink_rows(
             tightened.append(candidate)
             continue
 
-        row_candidates.sort(key=lambda item: item[0], reverse=True)
-        best_score = row_candidates[0][0]
+        row_candidates.sort(key=lambda item: (
+            max(item[1] - region_center, region_center - item[2], 0),
+            -item[0],
+        ))
         selected = row_candidates[0]
         for row_candidate in row_candidates:
             score, candidate_top, candidate_bottom, _members = row_candidate
-            if score < best_score * 0.20:
-                break
             collision = False
             for used_top, used_bottom, used_center_x in selected_rows:
                 overlap = max(
@@ -3889,13 +3613,24 @@ def tighten_regions_to_black_ink_rows(
                 selected = row_candidate
                 break
         _score, row_top, row_bottom, members = selected
+        members = [
+            component for component in components
+            if row_top <= search_top + component[1] + component[3] / 2 <= row_bottom
+        ]
         vertical_padding = max(6, round(page_height * 0.0017))
-        crop_top = max(0, row_top - vertical_padding)
-        crop_bottom = min(page_height, row_bottom + vertical_padding)
+        stroke_top = min(search_top + component[1] for component in members)
+        stroke_bottom = max(
+            search_top + component[1] + component[3] for component in members
+        )
+        crop_top = max(0, min(row_top, stroke_top) - vertical_padding)
+        crop_bottom = min(page_height, max(row_bottom, stroke_bottom) + vertical_padding)
+        if "_model_box" in candidate:
+            crop_top = min(crop_top, anchor_y)
+            crop_bottom = max(crop_bottom, anchor_y + anchor_height)
         if crop_bottom - crop_top >= height * 0.85:
             tightened.append(candidate)
             continue
-            selected_rows.append((row_top, row_bottom, x + width / 2))
+        selected_rows.append((row_top, row_bottom, x + width / 2))
 
         member_left = min(component[0] for component in members)
         member_right = max(component[0] + component[2] for component in members)
@@ -3906,6 +3641,9 @@ def tighten_regions_to_black_ink_rows(
             crop_right = min(
                 page_width, x + member_right + horizontal_padding,
             )
+            if "_model_box" in candidate:
+                crop_left = min(crop_left, anchor_x)
+                crop_right = max(crop_right, anchor_x + anchor_width)
         else:
             crop_left, crop_right = x, x + width
         candidate["box"] = [
@@ -4040,9 +3778,12 @@ def detect_black_ink_form_rows(page_img: Image.Image) -> list[dict]:
         )
         support_gap = max(30, round(row_height * 2.20))
         support_width = max(8, round(core_width * 0.50))
+        support_height = max(8, round(tall_cutoff * 0.45))
         supported_members = [
-            component for component in members
-            if component[2] >= support_width
+            component for component in components
+            if row_top <= component[1] + component[3] / 2 <= row_bottom
+            and component[2] >= support_width
+            and component[3] >= support_height
             and component[0] + component[2] >= core_left - support_gap
             and component[0] <= core_right + support_gap
         ]
@@ -4056,8 +3797,12 @@ def detect_black_ink_form_rows(page_img: Image.Image) -> list[dict]:
         vertical_padding = max(6, round(page_height * 0.0017))
         crop_left = max(0, left - horizontal_padding)
         crop_right = min(page_width, right + horizontal_padding)
-        crop_top = max(0, row_top - vertical_padding)
-        crop_bottom = min(page_height, row_bottom + vertical_padding)
+        crop_top = max(0, min(
+            row_top, min(component[1] for component in supported_members),
+        ) - vertical_padding)
+        crop_bottom = min(page_height, max(
+            row_bottom, max(component[1] + component[3] for component in supported_members),
+        ) + vertical_padding)
         rows.append({
             "label": f"black handwritten form row {len(rows) + 1}",
             "box": [
@@ -4164,20 +3909,24 @@ def detection_geometry_penalty(
         _x, _y, width, height = region["box"]
         width_fraction = width / max(1, page_width)
         height_fraction = height / max(1, page_height)
-        if any(term in label for term in compact_terms) and width_fraction > 0.42:
+        compact = (
+            is_compact_handwriting_label(label)
+            and any(term in label for term in compact_terms)
+        )
+        if compact and width_fraction > 0.42:
             excess = width_fraction - 0.42
             penalty += 10.0 + excess * 20.0
             issues.append(
                 f"region {index} ({label}) is an implausibly wide compact field "
                 f"({width_fraction:.0%} of page width)"
             )
-        if any(term in label for term in compact_terms) and height_fraction > 0.20:
+        if compact and height_fraction > 0.20:
             penalty += 8.0
             issues.append(
                 f"region {index} ({label}) is an implausibly tall compact field"
             )
         area_fraction = width * height / max(1, page_width * page_height)
-        if "paragraph block" not in label and area_fraction > 0.24:
+        if not is_handwriting_block_label(label) and area_fraction > 0.24:
             penalty += 10.0
             issues.append(f"region {index} covers too much of the page")
     return penalty, issues
@@ -4250,6 +3999,13 @@ def deduplicate_detection_regions(
             larger = kept[larger_index]
             smaller = kept[smaller_index]
             larger_label = larger.get("label", "").lower()
+            if (
+                is_handwriting_block_label(larger_label)
+                and not is_handwriting_block_label(str(smaller.get("label") or ""))
+                and containment >= 0.78
+            ):
+                remove.add(smaller_index)
+                continue
             larger_penalty, _ = detection_geometry_penalty(
                 [larger], page_width, page_height
             )
@@ -4257,7 +4013,8 @@ def deduplicate_detection_regions(
                 [smaller], page_width, page_height
             )
             oversized_compact = (
-                any(term in larger_label for term in compact_terms)
+                is_compact_handwriting_label(larger_label)
+                and any(term in larger_label for term in compact_terms)
                 and larger["box"][2] > page_width * 0.42
             )
             sufficiently_overlapping = containment >= (0.40 if oversized_compact else 0.78)
@@ -4321,6 +4078,15 @@ def needs_lower_detection_pass(regions: list[dict], page_height: int) -> bool:
     return lowest_center < page_height * 0.30
 
 
+def is_handwriting_block_label(label: str) -> bool:
+    """Recognize multi-line prose before matching embedded field names."""
+    return bool(re.search(
+        r"\b(?:block|paragraph|multiline|closing)\b|\bmulti[- ]line\b"
+        r"|\bnote\b(?!\s+(?:line|row)\b)",
+        label, re.I,
+    ))
+
+
 def is_compact_handwriting_label(label: str) -> bool:
     """Return whether detector geometry should stay local to one form field."""
     compact_terms = (
@@ -4328,12 +4094,22 @@ def is_compact_handwriting_label(label: str) -> bool:
         "reference", "identifier", "identification", "id field", "details",
     )
     lowered = label.lower()
-    return any(term in lowered for term in compact_terms)
+    mixed_text_line = (
+        re.search(r"\b(?:line|row)\b", lowered)
+        and re.search(r"\b(?:hebrew|text)\b", lowered)
+    ) or re.search(r"\band\s+hebrew\s+text\b", lowered)
+    return (
+        not is_handwriting_block_label(lowered)
+        and not mixed_text_line
+        and any(term in lowered for term in compact_terms)
+    )
 
 
 def compact_handwriting_kind(label: str) -> str | None:
     """Normalize compact labels so overlapping tile detections can be matched."""
     lowered = label.lower()
+    if not is_compact_handwriting_label(lowered):
+        return None
     if "date" in lowered:
         return "date"
     if "name" in lowered:
@@ -4563,6 +4339,37 @@ def _large_black_handwriting_components(
         ):
             components.append((x, y, x + width, y + height))
     return components
+
+
+def preserve_black_ink_edges(
+    page_img: Image.Image, regions: list[dict],
+) -> list[dict]:
+    """Recover clipped stroke edges without chaining into adjacent text."""
+    components = _large_black_handwriting_components(page_img)
+    preserved = []
+    for region in regions:
+        candidate = dict(region, box=list(region["box"]))
+        x, y, width, height = candidate["box"]
+        left, top, right, bottom = x, y, x + width, y + height
+        limit = max(12, round(min(width, height) * 0.20))
+        for stroke_left, stroke_top, stroke_right, stroke_bottom in components:
+            intersection = (
+                max(0, min(x + width, stroke_right) - max(x, stroke_left))
+                * max(0, min(y + height, stroke_bottom) - max(y, stroke_top))
+            )
+            area = (stroke_right - stroke_left) * (stroke_bottom - stroke_top)
+            if intersection < 0.75 * area:
+                continue
+            if max(
+                x - stroke_left, y - stroke_top,
+                stroke_right - x - width, stroke_bottom - y - height,
+            ) > limit:
+                continue
+            left, top = min(left, stroke_left), min(top, stroke_top)
+            right, bottom = max(right, stroke_right), max(bottom, stroke_bottom)
+        candidate["box"] = [left, top, right - left, bottom - top]
+        preserved.append(candidate)
+    return preserved
 
 
 def supplement_black_handwriting_peer_regions(
@@ -4825,7 +4632,7 @@ Each box should tightly cover the handwriting with a small margin."""
             if bw <= 10 or bh <= 10:
                 continue
             label = str(region.get("label") or "handwriting")
-            if "paragraph block" in label.lower():
+            if is_handwriting_block_label(label):
                 contextual = [bx, by, bw, bh]
             elif is_compact_handwriting_label(label):
                 contextual = [bx, by, bw, bh]
@@ -4836,7 +4643,10 @@ Each box should tightly cover the handwriting with a small margin."""
                     if any(term in label.lower() for term in ("blue", "green", "phone", "email"))
                     else add_handwriting_context(page_img, refined)
                 )
-            regions.append({"label": label, "box": contextual})
+            regions.append({
+                "label": label, "box": contextual,
+                "_model_box": [bx, by, bw, bh],
+            })
         regions = normalize_detected_paragraph_blocks(regions, W, H)
         regions = group_dense_handwriting_lines(regions, W, H)
         return separate_overlapping_line_regions(regions)
@@ -4861,6 +4671,8 @@ Each box should tightly cover the handwriting with a small margin."""
 
     try:
         initial_response = detection_call(content)
+    except ModelAccessError:
+        raise
     except RuntimeError as exc:
         print(
             f"[detect] full-page detection unavailable; trying tiled coverage: {exc}"
@@ -4882,6 +4694,8 @@ Each box should tightly cover the handwriting with a small margin."""
         ]
         try:
             retry_regions = parse_response(detection_call(retry_content))
+        except ModelAccessError:
+            raise
         except RuntimeError as exc:
             print(f"[detect] geometry repair unavailable; keeping initial regions: {exc}")
         else:
@@ -4910,7 +4724,7 @@ Each box should tightly cover the handwriting with a small margin."""
             lower_image = lower_page.resize(
                 (lower_width, lower_height), Image.LANCZOS
             ) if lower_scale < 1.0 else lower_page
-            lower_prompt = f"""This is vertical segment {band_index} of 2 from a scanned Hebrew document,
+            lower_prompt = f"""This is vertical segment {band_index} of {len(coverage_bands)} from a scanned Hebrew document,
 covering {start_fraction:.0%}-{end_fraction:.0%} of the full page and measuring
 {lower_width}x{lower_height} pixels. Scan this entire segment from top to bottom.
 Find every true handwritten pen entry that a whole-page scan may have missed.
@@ -4942,6 +4756,8 @@ Each box must tightly cover one handwritten field or line with a small margin.""
             )
             try:
                 lower_response = detection_call(lower_content)
+            except ModelAccessError:
+                raise
             except RuntimeError as exc:
                 print(
                     f"[detect] coverage segment {band_index} unavailable; "
@@ -4968,14 +4784,29 @@ Each box must tightly cover one handwritten field or line with a small margin.""
             regions = coverage_regions
         else:
             regions.extend(coverage_regions)
-    colored_regions = detect_colored_pen_regions(page_img, regions)
-    if colored_regions:
+    paragraph_layout = any(
+        is_handwriting_block_label(str(region.get("label") or ""))
+        and region["box"][3] >= H * 0.12
+        for region in regions
+    )
+    colored_regions = [] if paragraph_layout else detect_colored_pen_regions(page_img, regions)
+    if paragraph_layout:
+        print(
+            f"[detect] preserving {len(regions)} model region(s) on a paragraph page; "
+            "not replacing them with isolated color components"
+        )
+    elif colored_regions:
         regions = colored_regions
     else:
         black_form_rows = detect_black_ink_form_rows(page_img)
-        regions = black_form_rows or tighten_regions_to_black_ink_rows(
-            page_img, regions,
-        )
+        if black_form_rows:
+            blocks = [
+                region for region in regions
+                if is_handwriting_block_label(str(region.get("label") or ""))
+            ]
+            regions = blocks + black_form_rows
+        else:
+            regions = tighten_regions_to_black_ink_rows(page_img, regions)
         regions = merge_colored_line_fragments(
             tighten_regions_to_colored_ink(page_img, regions)
         )
@@ -4985,7 +4816,13 @@ Each box must tightly cover one handwritten field or line with a small margin.""
         regions = supplement_uncovered_black_handwriting_groups(
             page_img, regions,
         )
-    return deduplicate_detection_regions(regions, W, H)
+    regions = preserve_black_ink_edges(
+        page_img, deduplicate_detection_regions(regions, W, H),
+    )
+    return [
+        {key: value for key, value in region.items() if key != "_model_box"}
+        for region in regions
+    ]
 
 
 def normalize_detected_paragraph_blocks(
@@ -5174,6 +5011,7 @@ _HEBREW_FONTS = [
     "/Library/Fonts/Arial Unicode.ttf",
     "/System/Library/Fonts/Supplemental/Arial.ttf",
     "/System/Library/Fonts/Supplemental/Arial Hebrew.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 ]
 
 
@@ -5329,6 +5167,18 @@ def run_pipeline(
     elif crops:
         regions = [{"label": f"manual_{i + 1}", "box": list(c)} for i, c in enumerate(crops)]
 
+    demo_max_regions = int(os.environ.get("DEMO_MAX_REGIONS", "0"))
+    if demo_max_regions < 0:
+        raise ValueError("DEMO_MAX_REGIONS must not be negative.")
+    if demo_max_regions and len(regions) > demo_max_regions:
+        if cu_future is not None:
+            cu_future.cancel()
+            cu_executor.shutdown(wait=False, cancel_futures=True)
+        raise RuntimeError(
+            f"Page exceeds the public demo limit of {demo_max_regions} detected regions. "
+            "Use a simpler document; no regions were silently truncated."
+        )
+
     if not regions:
         print("\nNo regions to process. Open the rendered page and either:")
         print('  - re-run with one or more --crop "x,y,w,h"  (repeat the flag per box), or')
@@ -5365,71 +5215,6 @@ def run_pipeline(
     region_tasks = [ocr for ocr, _all in region_prep]         # images sent to per-image OCR (#4)
     region_images = [allimg for _ocr, allimg in region_prep]  # full image set for visual reconcile
 
-    # HASH v1 is optional advisory evidence. Start it before GPT so CPU inference
-    # overlaps network calls; one health failure disables it for the whole page.
-    ivrit_available, ivrit_detail = ivrit_ocr_service_status()
-    ivrit_status = "pending" if ivrit_available else (
-        "disabled" if not IVRIT_OCR_ENABLED else "unavailable"
-    )
-    ivrit_results: list[dict] = [
-        {
-            "status": ivrit_status,
-            "source": IVRIT_OCR_SOURCE,
-            "model": "HASH v1",
-            "text": "",
-            "confidence": 0.0,
-            "lines": [],
-            "detail": ivrit_detail,
-        }
-        for _region in regions
-    ]
-    ivrit_executor = None
-    ivrit_futures = {}
-    if ivrit_available:
-        print(
-            f"[ivrit] HASH v1 ready; scheduling {len(regions)} region crop(s) "
-            f"with {min(IVRIT_OCR_WORKERS, len(regions))} worker(s) ..."
-        )
-        ivrit_executor = ThreadPoolExecutor(
-            max_workers=min(IVRIT_OCR_WORKERS, len(regions)),
-        )
-        ivrit_futures = {
-            ivrit_executor.submit(
-                ocr_image_with_ivrit,
-                dict(region_images[region_index])["01_original_crop.png"],
-            ): region_index
-            for region_index in range(len(regions))
-        }
-    else:
-        print(f"[ivrit] HASH v1 advisory OCR unavailable: {ivrit_detail}")
-
-    kraken_available, kraken_detail = kraken_ocr_service_status()
-    kraken_status = "pending" if kraken_available else (
-        "disabled" if not KRAKEN_OCR_ENABLED else "unavailable"
-    )
-    kraken_results: list[dict] = [{
-        "status": kraken_status,
-        "source": KRAKEN_OCR_SOURCE,
-        "model": KRAKEN_OCR_MODEL_NAME,
-        "text": "",
-        "lines": [],
-        "detail": kraken_detail,
-    } for _region in regions]
-    kraken_executor = None
-    kraken_futures = {}
-    if kraken_available:
-        print(f"[kraken] scheduling {len(regions)} original region crop(s) ...")
-        kraken_executor = ThreadPoolExecutor(max_workers=1)
-        kraken_futures = {
-            kraken_executor.submit(
-                ocr_image_with_kraken,
-                dict(region_images[region_index])["01_original_crop.png"],
-            ): region_index
-            for region_index in range(len(regions))
-        }
-    else:
-        print(f"[kraken] advisory OCR unavailable: {kraken_detail}")
-
     # ---- run ALL vision calls in parallel across ALL regions -------------- #
     # Self-consistency: draw each image version VOTE_SEEDS times (distinct seeds)
     # so the deterministic aggregation has multiple genuine samples to vote over.
@@ -5447,6 +5232,8 @@ def run_pipeline(
                     f"[OCR] region {ri + 1}: isolated multi-view plan with "
                     f"{segmented_plans[ri]['draws']} blind draw(s)"
                 )
+            except ModelAccessError:
+                raise
             except Exception as exc:
                 print(
                     f"[OCR] region {ri + 1}: isolated multi-view unavailable "
@@ -5489,8 +5276,6 @@ def run_pipeline(
                     "label": regions[index].get("label"),
                     "box": regions[index]["box"],
                     "completed_draws": len(results),
-                    "ivrit_ocr": ivrit_results[index],
-                    "kraken_ocr": kraken_results[index],
                     "candidates": [
                         {
                             "source": result["source"],
@@ -5514,310 +5299,27 @@ def run_pipeline(
         print(f"[OCR] {len(flat)} vision draws across {len(regions)} region(s) "
               f"({len(vote_seeds)} seed(s)/version), {MAX_WORKERS} in parallel ...")
 
-    def _ocr_batch(tasks):
-        """Run a batch of (region_idx, name, image evidence, seed) OCR draws in parallel.
-        Appends successes to region_results; returns the tasks that failed."""
-        failed = []
-        workers = max(1, min(MAX_WORKERS, len(tasks)))
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut_meta = {
-                ex.submit(
-                    ocr_image_set if isinstance(evidence, list) else ocr_image,
-                    evidence,
-                    prompt,
-                    seed,
-                ): (ri, name, evidence, seed)
-                for ri, name, evidence, seed in tasks
-            }
-            for fut in as_completed(fut_meta):
-                ri, name, evidence, seed = fut_meta[fut]
-                try:
-                    region_results[ri].append({"source": name, "ocr": fut.result()})
-                    draw_progress["completed"] += 1
-                except Exception as exc:
-                    failed.append((ri, name, evidence, seed))
-                    draw_progress["failed"] += 1
-                    print(f"   region {ri + 1} {name} failed: {exc}", file=sys.stderr)
-                _publish_ocr_progress()
-        return failed
-
-    def _retryable(task) -> bool:
-        source = task[1].split("#", 1)[0]
-        return source.startswith("chunk_") or source in RETRYABLE_OCR_VIEWS
-
-    # Retry only faithful evidence. Optional derived transforms are one-shot so a
-    # slow enhancement cannot dominate tail latency.
-    failures = _ocr_batch(flat) if flat else []
-    for ri, plan in segmented_plans.items():
-        def _segmented_progress(success: bool) -> None:
-            draw_progress["completed" if success else "failed"] += 1
-            _publish_ocr_progress()
-
-        try:
-            final, candidates, details = run_isolated_multiview_plan(
-                plan, on_draw=_segmented_progress,
-            )
-            segmented_finals[ri] = final
-            region_results[ri].extend(candidates)
-            _write_json_atomic(
-                region_dirs[ri] / "segmented_multiview_result.json", details,
-            )
-            _publish_ocr_progress()
-        except Exception as exc:
-            print(
-                f"[OCR] region {ri + 1}: isolated multi-view failed ({exc}); "
-                "running standard fallback",
-                file=sys.stderr,
-            )
-            fallback = _standard_tasks({ri})
-            draw_progress["total"] += len(fallback)
-            _publish_ocr_progress()
-            failures.extend(_ocr_batch(fallback))
-
-    for rnd in range(1, 3):
-        failures = [task for task in failures if _retryable(task)]
-        if not failures:
-            break
-        print(f"[OCR] retry round {rnd}: re-running {len(failures)} failed call(s) ...")
-        time.sleep(3 * rnd)
-        failures = _ocr_batch(failures)
-
-    # Safety net: any region that still has NO successful reading -> retry its images once more.
-    stranded = [ri for ri in range(len(regions))
-                if not any(
-                    (r.get("ocr") or {}).get("full_transcription")
-                    or (r.get("ocr") or {}).get("classification")
-                    for r in region_results[ri]
-                )]
-    if stranded:
-        if MULTI_IMAGE_OCR:
-            retry_tasks = [
-                (
-                    ri,
-                    "core2_faithful_retry",
-                    [(name, image) for name, image in region_tasks[ri]
-                     if name in RETRYABLE_OCR_VIEWS],
-                    900,
-                )
-                for ri in stranded
-            ]
-        else:
-            retry_tasks = [(ri, f"{name}#r{k}", img, 900 + k)
-                           for ri in stranded for k, (name, img) in enumerate(region_tasks[ri])
-                           if name in RETRYABLE_OCR_VIEWS or name.startswith("chunk_")]
-        print(f"[OCR] {len(stranded)} region(s) still empty -> final retry of {len(retry_tasks)} call(s) ...")
-        time.sleep(5)
-        rescue_failures = _ocr_batch(retry_tasks)
-        if MULTI_IMAGE_OCR and rescue_failures and OCR_FINAL_ORIGINAL_RESCUE:
-            still_stranded = [
-                ri for ri, _name, _evidence, _seed in rescue_failures
-                if not any(
-                    (result.get("ocr") or {}).get("full_transcription")
-                    or (result.get("ocr") or {}).get("classification")
-                    for result in region_results[ri]
-                )
-            ]
-            original_retries = [
-                (
-                    ri,
-                    "01_original_crop.png#final_rescue",
-                    dict(region_tasks[ri])["01_original_crop.png"],
-                    901,
-                )
-                for ri in sorted(set(still_stranded))
-            ]
-            if original_retries:
-                print(
-                    f"[OCR] final original-image rescue for "
-                    f"{len(set(still_stranded))} region(s) ..."
-                )
-                _ocr_batch(original_retries)
-    if failures:
-        print(f"[OCR] WARNING: {len(failures)} call(s) still failing after all retries", file=sys.stderr)
-
-    if ivrit_futures:
-        for future in as_completed(ivrit_futures):
-            region_index = ivrit_futures[future]
-            try:
-                ivrit_results[region_index] = future.result()
-                print(
-                    f"[ivrit] region {region_index + 1}: "
-                    f"{ivrit_results[region_index].get('text', '')!r}"
-                )
-            except Exception as exc:
-                ivrit_results[region_index] = {
-                    "status": "failed",
-                    "source": IVRIT_OCR_SOURCE,
-                    "model": "HASH v1",
-                    "text": "",
-                    "confidence": 0.0,
-                    "lines": [],
-                    "detail": str(exc),
-                }
-                print(
-                    f"[ivrit] region {region_index + 1} failed: {exc}",
-                    file=sys.stderr,
-                )
-            _write_json_atomic(
-                region_dirs[region_index] / "ivrit_ocr.json",
-                ivrit_results[region_index],
-            )
-            _publish_ocr_progress()
-        ivrit_executor.shutdown(wait=True)
-    else:
-        for region_index, evidence in enumerate(ivrit_results):
-            _write_json_atomic(region_dirs[region_index] / "ivrit_ocr.json", evidence)
-
-    if kraken_futures:
-        for future in as_completed(kraken_futures):
-            region_index = kraken_futures[future]
-            try:
-                kraken_results[region_index] = future.result()
-                print(
-                    f"[kraken] region {region_index + 1}: "
-                    f"{kraken_results[region_index].get('text', '')!r}"
-                )
-            except Exception as exc:
-                kraken_results[region_index] = {
-                    "status": "failed",
-                    "source": KRAKEN_OCR_SOURCE,
-                    "model": KRAKEN_OCR_MODEL_NAME,
-                    "text": "",
-                    "lines": [],
-                    "detail": str(exc),
-                }
-                print(
-                    f"[kraken] region {region_index + 1} failed: {exc}",
-                    file=sys.stderr,
-                )
-            _publish_ocr_progress()
-        kraken_executor.shutdown(wait=True)
-
-    blue_only_inputs = {}
-    for region_index, evidence in enumerate(ivrit_results):
-        if not should_try_ivrit_blue_only(
-            evidence, region_results[region_index], regions[region_index]
-        ):
-            continue
-        blue_image = prepare_ivrit_blue_only_image(
-            dict(region_images[region_index])["01_original_crop.png"]
-        )
-        if blue_image is not None:
-            blue_only_inputs[region_index] = blue_image
-    if blue_only_inputs:
-        print(
-            f"[ivrit] retrying {len(blue_only_inputs)} compact region(s) "
-            "with blue-only isolation ..."
-        )
-        with ThreadPoolExecutor(
-            max_workers=min(IVRIT_OCR_WORKERS, len(blue_only_inputs))
-        ) as executor:
-            futures = {
-                executor.submit(ocr_image_with_ivrit, image): region_index
-                for region_index, image in blue_only_inputs.items()
-            }
-            for future in as_completed(futures):
-                region_index = futures[future]
-                try:
-                    blue_evidence = future.result()
-                except Exception as exc:
-                    blue_evidence = {
-                        "status": "failed",
-                        "source": IVRIT_OCR_SOURCE,
-                        "model": "HASH v1",
-                        "text": "",
-                        "confidence": 0.0,
-                        "lines": [],
-                        "detail": str(exc),
-                    }
-                ivrit_results[region_index] = select_ivrit_preprocessing_variant(
-                    ivrit_results[region_index],
-                    blue_evidence,
-                    region_results[region_index],
-                    regions[region_index],
-                )
-                print(
-                    f"[ivrit] region {region_index + 1}: selected "
-                    f"{ivrit_results[region_index].get('selected_variant')} "
-                    f"{ivrit_results[region_index].get('text', '')!r}"
-                )
-
-    for region_index, evidence in enumerate(ivrit_results):
-        evidence["advisory_gate"] = ivrit_ocr_advisory_gate(
-            evidence, region_results[region_index], regions[region_index]
-        )
-        _write_json_atomic(region_dirs[region_index] / "ivrit_ocr.json", evidence)
-        if evidence["advisory_gate"]["eligible"]:
-            print(
-                f"[ivrit] region {region_index + 1}: advisory candidate eligible "
-                f"({evidence['advisory_gate']['character_agreement']:.0%} "
-                "character agreement)"
-            )
-    for region_index, evidence in enumerate(kraken_results):
-        evidence["advisory_gate"] = kraken_ocr_advisory_gate(
-            evidence, region_results[region_index], regions[region_index]
-        )
-        _write_json_atomic(region_dirs[region_index] / "kraken_ocr.json", evidence)
-        if evidence["advisory_gate"]["eligible"]:
-            print(
-                f"[kraken] region {region_index + 1}: advisory candidate eligible "
-                f"({evidence['advisory_gate']['character_agreement']:.0%} agreement)"
-            )
-    _publish_ocr_progress()
-
     cu_context_markdown = ""
-    if NEARBY_CU_CONTEXT and cu_future is not None:
-        try:
-            cu_context_markdown = cu_future.result()
-        except Exception as exc:
-            print(f"[CU] context unavailable: {exc}", file=sys.stderr)
-
-    # ---- final aggregation per region (deterministic vote -> visual -> text) - #
-    print("[vote] aggregating self-consistency draws per region ..." if VOTE_ENABLED
-          else "[reconcile] final visual adjudication per region ...")
-
-    def _results_with_advisory_ocr(region_index: int) -> list[dict]:
-        results = list(region_results[region_index])
-        evidence = ivrit_results[region_index]
-        candidate = (
-            ivrit_ocr_candidate(evidence)
-            if (evidence.get("advisory_gate") or {}).get("eligible")
-            else None
-        )
-        if candidate is not None:
-            results.append(candidate)
-        kraken_evidence = kraken_results[region_index]
-        kraken_candidate = (
-            kraken_ocr_candidate(kraken_evidence)
-            if (kraken_evidence.get("advisory_gate") or {}).get("eligible")
-            else None
-        )
-        if kraken_candidate is not None:
-            results.append(kraken_candidate)
-        return results
+    reconcile_futures = {}
 
     def _reconcile_region(ri: int) -> dict:
         if segmented_finals[ri] is not None:
             return segmented_finals[ri] or {}
-        res = _results_with_advisory_ocr(ri)
+        res = list(region_results[ri])
         usable = [
             result for result in res
             if (result.get("ocr") or {}).get("full_transcription", "").strip()
             or (result.get("ocr") or {}).get("classification")
         ]
-        semantic_usable = [
-            result for result in usable
-            if result.get("source") not in {IVRIT_OCR_SOURCE, KRAKEN_OCR_SOURCE}
-        ]
         if VOTE_ENABLED:
             readings = [
                 (r.get("ocr") or {}).get("full_transcription", "")
-                for r in semantic_usable
+                for r in usable
             ]
             if readings:
                 vote = aggregate_votes(readings)
                 if "[?]" not in vote.get("final_transcription", ""):
-                    return finalize_region_semantics(vote, semantic_usable)  # no model call
+                    return finalize_region_semantics(vote, usable)  # no model call
         imgs = region_images[ri]
         original_crop = dict(imgs)["01_original_crop.png"]
         signature_flourish = (
@@ -5833,47 +5335,8 @@ def run_pipeline(
 
         def _contextualize(final: dict) -> dict:
             final = finalize_region_semantics(
-                final, semantic_usable, signature_flourish,
+                final, usable, signature_flourish,
             )
-            if should_recheck_hebrew_numeric_script_conflict(
-                final, ivrit_results[ri], regions[ri],
-            ):
-                try:
-                    script_recheck, script_images = script_conflict_region_recheck(
-                        page_img, regions[ri], region_context,
-                    )
-                    _write_json_atomic(
-                        region_dirs[ri] / "script_conflict_recheck.json",
-                        script_recheck,
-                    )
-                    if "blue_only" in script_images:
-                        script_images["blue_only"].save(
-                            region_dirs[ri] / "08_script_blue_only.png"
-                        )
-                    script_images["context"].save(
-                        region_dirs[ri] / "09_script_context.png"
-                    )
-                    script_images["page"].save(
-                        region_dirs[ri] / "10_script_page.png"
-                    )
-                    script_resolved = dict(accept_hebrew_numeric_script_recheck(
-                        final, script_recheck,
-                    ))
-                    if script_resolved.get("final_transcription") != final.get(
-                        "final_transcription"
-                    ):
-                        return script_resolved
-                    unresolved = dict(preserve_uncertain_hebrew_script_conflict(
-                        final, script_recheck,
-                    ))
-                    if unresolved.get("final_transcription") != final.get(
-                        "final_transcription"
-                    ):
-                        return unresolved
-                except Exception as script_exc:
-                    final.setdefault("notes", []).append(
-                        f"script conflict recheck failed: {script_exc}"
-                    )
             if not should_contextual_recheck(final, usable):
                 return final
             try:
@@ -5884,14 +5347,57 @@ def run_pipeline(
                 context_images[0].save(region_dirs[ri] / "08_context_highlight.png")
                 context_images[1].save(region_dirs[ri] / "09_page_highlight.png")
                 _write_json_atomic(region_dirs[ri] / "contextual_recheck.json", recheck)
-                accepted = dict(accept_contextual_recheck(final, recheck))
-                accepted = protect_contextual_recheck_with_cross_engine_agreement(
-                    final,
-                    recheck,
-                    accepted,
-                    semantic_usable,
-                    ivrit_results[ri],
+                numeric_changed = (
+                    _plain_numeric_reading(pre_context_text)
+                    and _plain_numeric_reading(recheck.get("final_transcription", ""))
+                    and _numeric_reading_key(pre_context_text)
+                    != _numeric_reading_key(recheck["final_transcription"])
                 )
+                numeric_evidence = None
+                if numeric_changed:
+                    numeric_evidence = {"confirmed": False}
+                    try:
+                        confirmation = numeric_region_confirmation(imgs)
+                        numeric_evidence.update(
+                            result=confirmation,
+                            confirmed=numeric_correction_confirmed(final, recheck, confirmation),
+                        )
+                    except ModelAccessError:
+                        raise
+                    except (RuntimeError, requests.exceptions.RequestException) as exc:
+                        numeric_evidence["error"] = str(exc)
+                        print(
+                            f"[reconcile] region {ri + 1}: numeric confirmation failed: {exc}",
+                            file=sys.stderr,
+                        )
+                    _write_json_atomic(
+                        region_dirs[ri] / "numeric_confirmation.json", numeric_evidence,
+                    )
+                accepted = dict(accept_contextual_recheck(
+                    final, recheck,
+                    confirmed_numeric=bool(numeric_evidence and numeric_evidence["confirmed"]),
+                ))
+                accepted = finalize_mark_selection(accepted, usable)
+                if numeric_evidence is not None:
+                    accepted["numeric_confirmation"] = numeric_evidence
+                    if numeric_evidence["confirmed"]:
+                        accepted["decision_status"] = "confirmed_numeric_correction"
+                    else:
+                        accepted["needs_review"] = True
+                        accepted["decision_status"] = "numeric_disagreement_review"
+                        if "[?]" not in accepted.get("final_transcription", ""):
+                            accepted["final_transcription"] = (
+                                accepted.get("final_transcription", "") + "[?]"
+                            )
+                        alternatives = list(accepted.get("alternative_transcriptions") or [])
+                        alternative = recheck.get("final_transcription", "")
+                        if alternative and alternative not in alternatives:
+                            alternatives.append(alternative)
+                        accepted["alternative_transcriptions"] = alternatives
+                        accepted["notes"] = [
+                            *(accepted.get("notes") or []),
+                            "numeric rereads did not independently agree; retained original for human review",
+                        ]
                 accepted["pre_context_transcription"] = pre_context_text
                 accepted["contextual_evidence"] = recheck
                 pre_info = _information_text(pre_context_text)
@@ -5940,6 +5446,8 @@ def run_pipeline(
                         )
                         return rescued
                 return accepted
+            except ModelAccessError:
+                raise
             except Exception as recheck_exc:
                 final.setdefault("notes", []).append(
                     f"contextual recheck failed: {recheck_exc}"
@@ -5950,14 +5458,18 @@ def run_pipeline(
             final = visual_reconcile_ocr_results(imgs, res, region_context)
             final.setdefault("notes", []).append("visual reconciliation")
             return _contextualize(final)
+        except ModelAccessError:
+            raise
         except Exception as vexc:
             try:  # 2) text-only reconciliation (fallback)
                 final = reconcile_ocr_results(res, region_context)
                 final.setdefault("notes", []).append(f"text reconciliation (visual failed: {vexc})")
                 return _contextualize(final)
+            except ModelAccessError:
+                raise
             except Exception as texc:  # 3) best non-empty per-image reading
                 vision_usable = [
-                    result for result in semantic_usable
+                    result for result in usable
                     if (result.get("ocr") or {}).get("full_transcription")
                 ]
                 if vision_usable:
@@ -5970,32 +5482,202 @@ def run_pipeline(
                         "words": best["ocr"].get("words", []),
                         "notes": [f"per-image fallback (text failed: {texc})"],
                     })
-                return {"final_transcription": "", "words": [], "notes": ["all reconciliation failed"]}
+                return {
+                    "final_transcription": "[?]", "words": [],
+                    "classification": "handwritten_text",
+                    "needs_review": True, "decision_status": "recognition_failed",
+                    "notes": ["all recognition and reconciliation attempts failed"],
+                }
 
-    finals: list[dict] = [{} for _ in regions]
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        fut_ri = {ex.submit(_reconcile_region, ri): ri for ri in range(len(regions))}
+
+    def _ocr_batch(tasks, reconcile_ready: bool = False):
+        """Run a batch of (region_idx, name, image evidence, seed) OCR draws in parallel.
+        Appends successes to region_results; returns the tasks that failed."""
+        failed = []
+        fut_meta = {
+            executor.submit(
+                ocr_image_set if isinstance(evidence, list) else ocr_image,
+                evidence,
+                prompt,
+                seed,
+            ): (ri, name, evidence, seed)
+            for ri, name, evidence, seed in tasks
+        }
+        for fut in as_completed(fut_meta):
+            ri, name, evidence, seed = fut_meta[fut]
+            try:
+                ocr = fut.result()
+                region_results[ri].append({"source": name, "ocr": ocr})
+                draw_progress["completed"] += 1
+                if reconcile_ready and (
+                    ocr.get("full_transcription") or ocr.get("classification")
+                ):
+                    reconcile_futures[executor.submit(_reconcile_region, ri)] = ri
+            except ModelAccessError:
+                raise
+            except Exception as exc:
+                failed.append((ri, name, evidence, seed))
+                draw_progress["failed"] += 1
+                print(f"   region {ri + 1} {name} failed: {exc}", file=sys.stderr)
+            _publish_ocr_progress()
+        return failed
+
+    def _retryable(task) -> bool:
+        source = task[1].split("#", 1)[0]
+        return source.startswith("chunk_") or source in RETRYABLE_OCR_VIEWS
+
+    # Retry only faithful evidence. Optional derived transforms are one-shot so a
+    # slow enhancement cannot dominate tail latency.
+    overlap_reconciliation = (
+        OCR_STRATEGY == "standard"
+        and MULTI_IMAGE_OCR
+        and not VOTE_ENABLED
+        and not NEARBY_CU_CONTEXT
+    )
+    if overlap_reconciliation:
+        print(
+            f"[OCR] pipelining region reads and visual verification "
+            f"within {MAX_WORKERS} worker(s) ..."
+        )
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        failures = _ocr_batch(flat, reconcile_ready=overlap_reconciliation) if flat else []
+        for ri, plan in segmented_plans.items():
+            def _segmented_progress(success: bool) -> None:
+                draw_progress["completed" if success else "failed"] += 1
+                _publish_ocr_progress()
+
+            try:
+                final, candidates, details = run_isolated_multiview_plan(
+                    plan, on_draw=_segmented_progress,
+                )
+                segmented_finals[ri] = final
+                region_results[ri].extend(candidates)
+                _write_json_atomic(
+                    region_dirs[ri] / "segmented_multiview_result.json", details,
+                )
+                _publish_ocr_progress()
+            except ModelAccessError:
+                raise
+            except Exception as exc:
+                print(
+                    f"[OCR] region {ri + 1}: isolated multi-view failed ({exc}); "
+                    "running standard fallback",
+                    file=sys.stderr,
+                )
+                fallback = _standard_tasks({ri})
+                draw_progress["total"] += len(fallback)
+                _publish_ocr_progress()
+                failures.extend(_ocr_batch(fallback))
+
+        for rnd in range(1, 3):
+            failures = [task for task in failures if _retryable(task)]
+            if not failures:
+                break
+            print(f"[OCR] retry round {rnd}: re-running {len(failures)} failed call(s) ...")
+            time.sleep(3 * rnd)
+            failures = _ocr_batch(failures)
+
+        # Safety net: any region that still has NO successful reading -> retry its images once more.
+        stranded = [ri for ri in range(len(regions))
+                    if not any(
+                        (r.get("ocr") or {}).get("full_transcription")
+                        or (r.get("ocr") or {}).get("classification")
+                        for r in region_results[ri]
+                    )]
+        if stranded:
+            if MULTI_IMAGE_OCR:
+                retry_tasks = [
+                    (
+                        ri,
+                        "core2_faithful_retry",
+                        [(name, image) for name, image in region_tasks[ri]
+                         if name in RETRYABLE_OCR_VIEWS],
+                        900,
+                    )
+                    for ri in stranded
+                ]
+            else:
+                retry_tasks = [(ri, f"{name}#r{k}", img, 900 + k)
+                               for ri in stranded for k, (name, img) in enumerate(region_tasks[ri])
+                               if name in RETRYABLE_OCR_VIEWS or name.startswith("chunk_")]
+            print(f"[OCR] {len(stranded)} region(s) still empty -> final retry of {len(retry_tasks)} call(s) ...")
+            time.sleep(5)
+            rescue_failures = _ocr_batch(retry_tasks)
+            if MULTI_IMAGE_OCR and rescue_failures and OCR_FINAL_ORIGINAL_RESCUE:
+                still_stranded = [
+                    ri for ri, _name, _evidence, _seed in rescue_failures
+                    if not any(
+                        (result.get("ocr") or {}).get("full_transcription")
+                        or (result.get("ocr") or {}).get("classification")
+                        for result in region_results[ri]
+                    )
+                ]
+                original_retries = [
+                    (
+                        ri,
+                        "01_original_crop.png#final_rescue",
+                        dict(region_tasks[ri])["01_original_crop.png"],
+                        901,
+                    )
+                    for ri in sorted(set(still_stranded))
+                ]
+                if original_retries:
+                    print(
+                        f"[OCR] final original-image rescue for "
+                        f"{len(set(still_stranded))} region(s) ..."
+                    )
+                    _ocr_batch(original_retries)
+        if failures:
+            print(f"[OCR] WARNING: {len(failures)} call(s) still failing after all retries", file=sys.stderr)
+
+        if NEARBY_CU_CONTEXT and cu_future is not None:
+            try:
+                cu_context_markdown = cu_future.result()
+            except ModelAccessError:
+                raise
+            except Exception as exc:
+                print(f"[CU] context unavailable: {exc}", file=sys.stderr)
+
+        # ---- final aggregation per region (deterministic vote -> visual -> text) - #
+        print("[vote] aggregating self-consistency draws per region ..." if VOTE_ENABLED
+              else "[reconcile] final visual adjudication per region ...")
+
+
+        finals: list[dict] = [{} for _ in regions]
+        fut_ri = dict(reconcile_futures)
+        already_scheduled = set(fut_ri.values())
+        fut_ri.update({
+            executor.submit(_reconcile_region, ri): ri
+            for ri in range(len(regions)) if ri not in already_scheduled
+        })
         for fut in as_completed(fut_ri):
             ri = fut_ri[fut]
             try:
                 finals[ri] = fut.result()
+            except ModelAccessError:
+                raise
             except Exception as exc:
-                finals[ri] = {"final_transcription": "", "words": [],
-                              "notes": [f"reconcile failed: {exc}"]}
+                finals[ri] = {
+                    "final_transcription": "[?]", "words": [],
+                    "classification": "handwritten_text",
+                    "needs_review": True, "decision_status": "recognition_failed",
+                    "notes": [f"reconcile failed: {exc}"],
+                }
+
+    if finals and all(final.get("decision_status") == "recognition_failed" for final in finals):
+        raise RuntimeError("Recognition failed for every detected region; see pipeline.log")
 
     cu_evidence_markdown = cu_context_markdown
     if not cu_evidence_markdown and cu_future is not None:
         try:
             cu_evidence_markdown = cu_future.result()
+        except ModelAccessError:
+            raise
         except Exception as exc:
             print(f"[CU] numeric evidence unavailable: {exc}", file=sys.stderr)
 
     finals = [separate_numeric_field_marks(final) for final in finals]
     finals = [normalize_numeric_s_homoglyph(final) for final in finals]
-    finals = [
-        prefer_eligible_ivrit_candidate(final, ivrit_results[index])
-        for index, final in enumerate(finals)
-    ]
     finals = reconcile_repeated_dates(finals, regions)
     finals = reconcile_with_cu_numeric_tokens(
         finals, regions, cu_evidence_markdown,
@@ -6011,7 +5693,7 @@ def run_pipeline(
     for i, region in enumerate(regions, 1):
         rdir = region_dirs[i - 1]
         res = region_results[i - 1]
-        reconciliation_results = _results_with_advisory_ocr(i - 1)
+        reconciliation_results = res
         final = finals[i - 1] or {}
         local_cu_context = nearby_printed_context(
             cu_context_markdown, region["box"], page_img.height
@@ -6026,6 +5708,8 @@ def run_pipeline(
              "classification": (r.get("ocr") or {}).get("classification"),
              "marks": (r.get("ocr") or {}).get("marks", []),
              "digits": (r.get("ocr") or {}).get("digits", []),
+             "selection": (r.get("ocr") or {}).get("selection"),
+             "handwritten_transcription": (r.get("ocr") or {}).get("handwritten_transcription"),
              "words": (r.get("ocr") or {}).get("words", [])}
             for r in res
         ]
@@ -6049,14 +5733,13 @@ def run_pipeline(
             "box": region["box"],
             "printed_context_used": region_context,
             "per_image": per_image,
-            "ivrit_ocr": ivrit_results[i - 1],
-            "kraken_ocr": kraken_results[i - 1],
             "field_type": final.get("field_type"),
             "final_transcription": final.get("final_transcription", ""),
             "numeric_cells": final.get("numeric_cells", []),
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
             "pre_context_transcription": final.get("pre_context_transcription"),
             "contextual_evidence": final.get("contextual_evidence"),
+            "numeric_confirmation": final.get("numeric_confirmation"),
             "pre_high_rescue_transcription": final.get(
                 "pre_high_rescue_transcription"
             ),
@@ -6067,13 +5750,17 @@ def run_pipeline(
             "script_conflict_evidence": final.get("script_conflict_evidence"),
             "alternative_transcriptions": final.get("alternative_transcriptions", []),
             "words": final.get("words", []),
+            "marks": final.get("marks", []),
+            "digits": final.get("digits", []),
+            "selection": final.get("selection"),
+            "handwritten_transcription": final.get("handwritten_transcription"),
             "notes": final.get("notes", []),
             "needs_review": final.get("needs_review", False),
             "classification": final.get("classification", "handwritten_text"),
             "decision_status": final.get("decision_status", "visual_reconciliation"),
             "agreement_gate": final.get("agreement_gate"),
-            "cross_engine_agreement": final.get("cross_engine_agreement"),
             "cross_region_consensus": final.get("cross_region_consensus"),
+            "cross_region_conflict": final.get("cross_region_conflict"),
             "vote": {
                 "candidate_count": len(per_image),
                 "selected_text": final.get("final_transcription", ""),
@@ -6091,6 +5778,7 @@ def run_pipeline(
             "final_transcription": final.get("final_transcription"),
             "pre_context_transcription": final.get("pre_context_transcription"),
             "contextual_evidence": final.get("contextual_evidence"),
+            "numeric_confirmation": final.get("numeric_confirmation"),
             "pre_high_rescue_transcription": final.get(
                 "pre_high_rescue_transcription"
             ),
@@ -6099,17 +5787,20 @@ def run_pipeline(
                 "pre_script_conflict_transcription"
             ),
             "script_conflict_evidence": final.get("script_conflict_evidence"),
-            "ivrit_ocr": ivrit_results[i - 1],
-            "kraken_ocr": kraken_results[i - 1],
             "numeric_cells": final.get("numeric_cells", []),
             "spatial_numeric_assembly": final.get("spatial_numeric_assembly", False),
             "words": final.get("words"), "notes": final.get("notes"),
+            "alternative_transcriptions": final.get("alternative_transcriptions", []),
+            "marks": final.get("marks", []),
+            "digits": final.get("digits", []),
+            "selection": final.get("selection"),
+            "handwritten_transcription": final.get("handwritten_transcription"),
             "classification": final.get("classification", "handwritten_text"),
             "needs_review": final.get("needs_review", False),
             "decision_status": final.get("decision_status", "visual_reconciliation"),
             "agreement_gate": final.get("agreement_gate"),
-            "cross_engine_agreement": final.get("cross_engine_agreement"),
             "cross_region_consensus": final.get("cross_region_consensus"),
+            "cross_region_conflict": final.get("cross_region_conflict"),
         }
         if should_emit_region(final, per_image):
             all_results.append(exported_result)
@@ -6133,6 +5824,8 @@ def run_pipeline(
         try:
             print("[CU] collecting background Content Understanding result ...")
             cu_markdown = cu_future.result()
+        except ModelAccessError:
+            raise
         except Exception as exc:
             print(f"[CU] OCR failed: {exc}", file=sys.stderr)
         finally:
@@ -6144,6 +5837,8 @@ def run_pipeline(
             try:
                 cu_markdown = json.loads(cu_json.read_text(encoding="utf-8")) \
                     .get("content_understanding", {}).get("markdown", "")
+            except ModelAccessError:
+                raise
             except Exception:
                 cu_markdown = ""
     if cu_markdown:
@@ -6152,6 +5847,8 @@ def run_pipeline(
     merged = build_merged_html(str(out), page_name, all_results, cu_markdown=cu_markdown)
     try:
         merged_jpg = build_merged_jpg(str(out), page_name, all_results)
+    except ModelAccessError:
+        raise
     except Exception as exc:
         print(f"[merge] jpg failed: {exc}", file=sys.stderr)
         merged_jpg = None
@@ -6161,6 +5858,8 @@ def run_pipeline(
         try:
             print("[merge] fusing CU printed text + GPT handwriting into merged.md ...")
             merged_md = build_merged_markdown(str(out), page_name, input_path, cu_markdown, all_results)
+        except ModelAccessError:
+            raise
         except Exception as exc:
             print(f"[merge] markdown failed: {exc}", file=sys.stderr)
 

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "environmentName": {
+      "value": "inksight-dev-c280"
+    },
+    "location": {
+      "value": "eastus2"
+    },
+    "sessionId": {
+      "value": "c2807b48-f216-4f39-a4ec-9dbd9726bc31"
+    },
+    "deployedBy": {
+      "value": "Roie"
+    },
+    "createdAt": {
+      "value": "2026-10-15T14:28:18.000Z"
+    },
+    "deployerObjectId": {
+      "value": ""
+    }
+  }
+}

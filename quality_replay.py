@@ -37,9 +37,6 @@ def apply_current_rules(regions: list[dict], cu_markdown: str) -> list[dict]:
     for region in regions:
         final = pipeline.separate_numeric_field_marks(dict(region))
         final = pipeline.normalize_numeric_s_homoglyph(final)
-        final = pipeline.prefer_eligible_ivrit_candidate(
-            final, region.get("ivrit_ocr") or {}
-        )
         finals.append(final)
     finals = pipeline.reconcile_repeated_dates(finals, regions)
     finals = pipeline.reconcile_with_cu_numeric_tokens(finals, regions, cu_markdown)

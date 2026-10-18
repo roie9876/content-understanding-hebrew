@@ -41,6 +41,7 @@ let loadedContentUrl = null;
 let diagnosticRequest = 0;
 let goldenRequest = 0;
 let processZoom = Number(localStorage.getItem("inkSightProcessZoom")) || 100;
+let demoConfig = null;
 const JOB_POLL_INTERVAL_MS = 15000;
 
 function setProcessZoom(percent, persist = true) {
@@ -341,168 +342,6 @@ function renderCandidates(diagnostics) {
   adminOutput.append(list);
 }
 
-function renderIvritOcr(diagnostics) {
-  const progressRegions = diagnostics.progress?.regions || [];
-  const finalRegions = diagnostics.final_regions || [];
-  const regions = progressRegions.length ? progressRegions : finalRegions.map((region, index) => ({
-    ...region,
-    region: index + 1,
-  }));
-  const evidenceByRegion = regions.map((region, index) =>
-    region.ivrit_ocr || finalRegions[index]?.ivrit_ocr || {
-      status: "pending",
-      text: "",
-      confidence: 0,
-      lines: [],
-    }
-  );
-  const complete = evidenceByRegion.filter((evidence) => evidence.status === "complete").length;
-  const offered = evidenceByRegion.filter((evidence) => evidence.advisory_gate?.eligible).length;
-  const failed = evidenceByRegion.filter((evidence) => evidence.status === "failed").length;
-  const unavailable = evidenceByRegion.filter((evidence) =>
-    ["disabled", "unavailable"].includes(evidence.status)
-  ).length;
-  const summary = createElement("div", "admin-summary");
-  addAdminStat(summary, "HASH responses", `${complete} / ${regions.length}`);
-  addAdminStat(summary, "Sent to GPT", offered);
-  addAdminStat(summary, "Unavailable", unavailable);
-  addAdminStat(summary, "Failed", failed);
-  adminOutput.append(summary);
-  adminOutput.append(createElement(
-    "div",
-    "admin-empty",
-    "HASH v1 is independent advisory OCR. Its confidence is uncalibrated and its text is never accepted without GPT visual support.",
-  ));
-  const list = createElement("div", "diagnostic-list");
-  regions.forEach((region, index) => {
-    const evidence = evidenceByRegion[index];
-    const lines = evidence.lines || [];
-    const details = regionDetails(region, lines.length, "HASH lines");
-    if (index === 0) details.open = true;
-    const body = createElement("div", "diagnostic-body");
-    body.append(createElement(
-      "div",
-      "candidate-source",
-      `${evidence.model || "HASH v1"} · ${evidence.status || "pending"}`,
-    ));
-    if (evidence.status === "complete") {
-      const gate = evidence.advisory_gate || {};
-      const agreement = gate.character_agreement === undefined
-        ? ""
-        : ` · ${Math.round(Number(gate.character_agreement) * 100)}% character agreement`;
-      body.append(
-        createElement("div", "decision-selected", evidence.text || "(empty reading)"),
-        createElement(
-          "div",
-          "decision-method",
-          `Input: ${evidence.selected_variant || "original"} · Uncalibrated mean confidence: ${Math.round((Number(evidence.confidence) || 0) * 100)}%`,
-        ),
-        createElement(
-          "div",
-          "decision-method",
-          `${gate.eligible ? "Sent to GPT as spelling evidence" : "Excluded from GPT evidence"} · ${gate.reason || "gate pending"}${agreement}`,
-        ),
-      );
-      lines.forEach((line, lineIndex) => {
-        const box = line.box || {};
-        const row = createElement("div", "candidate");
-        row.append(
-          createElement(
-            "div",
-            "candidate-source",
-            `Line ${lineIndex + 1} · ${Math.round((Number(line.confidence) || 0) * 100)}% · [${box.x || 0}, ${box.y || 0}, ${box.width || 0}, ${box.height || 0}]`,
-          ),
-          createElement("div", "candidate-text", line.text || "(empty line)"),
-        );
-        body.append(row);
-      });
-    } else {
-      body.append(createElement(
-        "div",
-        "admin-empty",
-        evidence.detail || "Waiting for the Ivrit OCR sidecar",
-      ));
-    }
-    details.append(body);
-    list.append(details);
-  });
-  if (!regions.length) {
-    list.append(createElement("div", "admin-empty", "Ivrit OCR starts after handwriting detection"));
-  }
-  adminOutput.append(list);
-}
-
-function renderKrakenOcr(diagnostics) {
-  const progressRegions = diagnostics.progress?.regions || [];
-  const finalRegions = diagnostics.final_regions || [];
-  const regions = progressRegions.length ? progressRegions : finalRegions.map((region, index) => ({
-    ...region,
-    region: index + 1,
-  }));
-  const evidenceByRegion = regions.map((region, index) =>
-    region.kraken_ocr || finalRegions[index]?.kraken_ocr || {
-      status: "pending",
-      text: "",
-      lines: [],
-    }
-  );
-  const complete = evidenceByRegion.filter((evidence) => evidence.status === "complete").length;
-  const offered = evidenceByRegion.filter((evidence) => evidence.advisory_gate?.eligible).length;
-  const failed = evidenceByRegion.filter((evidence) => evidence.status === "failed").length;
-  const unavailable = evidenceByRegion.filter((evidence) =>
-    ["disabled", "unavailable"].includes(evidence.status)
-  ).length;
-  const summary = createElement("div", "admin-summary");
-  addAdminStat(summary, "Kraken responses", `${complete} / ${regions.length}`);
-  addAdminStat(summary, "Sent to GPT", offered);
-  addAdminStat(summary, "Unavailable", unavailable);
-  addAdminStat(summary, "Failed", failed);
-  adminOutput.append(summary);
-  adminOutput.append(createElement(
-    "div",
-    "admin-empty",
-    "PP-OCRv6 medium is local advisory line OCR. Only correlated single-line Hebrew is offered to GPT visual adjudication.",
-  ));
-  const list = createElement("div", "diagnostic-list");
-  regions.forEach((region, index) => {
-    const evidence = evidenceByRegion[index];
-    const details = regionDetails(region, (evidence.lines || []).length, "Kraken lines");
-    if (index === 0) details.open = true;
-    const body = createElement("div", "diagnostic-body");
-    body.append(createElement(
-      "div",
-      "candidate-source",
-      `${evidence.model || "PP-OCRv6 medium"} · ${evidence.status || "pending"}`,
-    ));
-    if (evidence.status === "complete") {
-      const gate = evidence.advisory_gate || {};
-      const agreement = gate.character_agreement === undefined
-        ? ""
-        : ` · ${Math.round(Number(gate.character_agreement) * 100)}% character agreement`;
-      body.append(
-        createElement("div", "decision-selected", evidence.text || "(empty reading)"),
-        createElement(
-          "div",
-          "decision-method",
-          `${gate.eligible ? "Sent to GPT as advisory evidence" : "Excluded from GPT evidence"} · ${gate.reason || "gate pending"}${agreement}`,
-        ),
-      );
-    } else {
-      body.append(createElement(
-        "div",
-        "admin-empty",
-        evidence.detail || "Waiting for local Kraken OCR",
-      ));
-    }
-    details.append(body);
-    list.append(details);
-  });
-  if (!regions.length) {
-    list.append(createElement("div", "admin-empty", "Kraken OCR starts after handwriting detection"));
-  }
-  adminOutput.append(list);
-}
-
 function renderDecision(diagnostics) {
   const regions = diagnostics.final_regions || [];
   const summary = createElement("div", "admin-summary");
@@ -525,6 +364,27 @@ function renderDecision(diagnostics) {
       createElement("div", "decision-selected", region.final_transcription || "(empty final transcription)"),
       createElement("div", "decision-method", `Method: ${region.vote?.method || (region.notes || []).join(" · ") || "not recorded"}`),
     );
+    if (region.needs_review) {
+      body.append(createElement("div", "decision-method", "Human review required"));
+    }
+    if (Array.isArray(region.marks) && region.marks.length) {
+      body.append(createElement("div", "decision-method", `Marks: ${region.marks.join(" · ")}`));
+    }
+    if (Array.isArray(region.digits) && region.digits.length) {
+      body.append(createElement("div", "decision-method", `Digits: ${region.digits.join(" · ")}`));
+    }
+    if (typeof region.selection?.text === "string" && region.selection.text) {
+      body.append(createElement(
+        "div", "decision-method",
+        `Selected printed value: ${region.selection.text}`,
+      ));
+    }
+    if (region.numeric_confirmation) {
+      body.append(createElement(
+        "div", "decision-method",
+        `Independent numeric correction: ${region.numeric_confirmation.confirmed ? "confirmed" : "disagreement — review required"}`,
+      ));
+    }
     const alternatives = region.vote?.alternatives || region.alternative_transcriptions || [];
     if (alternatives.length) {
       const alternativeList = createElement("div", "alternative-list");
@@ -533,15 +393,25 @@ function renderDecision(diagnostics) {
     }
     const evidence = createElement("div", "word-evidence");
     (region.words || []).forEach((word) => {
-      const confidence = Math.max(0, Math.min(1, Number(word.confidence) || 0));
+      const entry = typeof word === "string" ? { text: word } : word;
       const row = createElement("div", "word-row");
-      row.append(createElement("span", "word-label", word.text || ""));
-      const track = createElement("span", "confidence-track");
-      const fill = createElement("span");
-      fill.style.width = `${Math.round(confidence * 100)}%`;
-      track.append(fill);
-      row.append(track, createElement("span", "", `${Math.round(confidence * 100)}%`));
-      if (word.reason) row.append(createElement("div", "word-reason", word.reason));
+      if (!entry || typeof entry !== "object" || typeof entry.text !== "string") {
+        row.append(createElement("span", "word-label", "Invalid word evidence"));
+        evidence.append(row);
+        return;
+      }
+      row.append(createElement("span", "word-label", entry.text));
+      const confidence = entry.confidence;
+      if (Number.isFinite(confidence) && confidence >= 0 && confidence <= 1) {
+        const track = createElement("span", "confidence-track");
+        const fill = createElement("span");
+        fill.style.width = `${Math.round(confidence * 100)}%`;
+        track.append(fill);
+        row.append(track, createElement("span", "", `${Math.round(confidence * 100)}%`));
+      } else {
+        row.append(createElement("span", "", "Confidence not provided"));
+      }
+      if (typeof entry.reason === "string") row.append(createElement("div", "word-reason", entry.reason));
       evidence.append(row);
     });
     body.append(evidence);
@@ -581,8 +451,6 @@ async function showAdminView(page) {
     adminOutput.replaceChildren();
     if (activeView === "detection") renderDetection(diagnostics, page);
     if (activeView === "candidates") renderCandidates(diagnostics);
-    if (activeView === "ivrit") renderIvritOcr(diagnostics);
-    if (activeView === "kraken") renderKrakenOcr(diagnostics);
     if (activeView === "decision") renderDecision(diagnostics);
     if (activeView === "logs") renderLogs(diagnostics);
     if (hadRegionDetails) {
@@ -603,6 +471,10 @@ async function showAdminView(page) {
 async function uploadDocument(file) {
   if (!file) return;
   setError(uploadError, "");
+  if (demoConfig && file.size > demoConfig.max_upload_bytes) {
+    setError(uploadError, "The file exceeds the public demo upload-size limit.");
+    return;
+  }
   const formData = new FormData();
   formData.append("document", file);
   uploadForm.classList.add("dragging");
@@ -794,7 +666,7 @@ async function showResultView(page) {
     if (mergedDocumentFrame.src !== mergedUrl) mergedDocumentFrame.src = page.merged_document_url;
   } else if (activeView === "golden" && page.golden_comparison_url && page.stage === "complete") {
     showGoldenComparison(page);
-  } else if (["detection", "candidates", "ivrit", "kraken", "decision", "logs"].includes(activeView)) {
+  } else if (["detection", "candidates", "decision", "logs"].includes(activeView)) {
     showAdminView(page);
   } else {
     if (activeView === "merged") mergedDocumentFrame.src = "about:blank";
@@ -966,17 +838,6 @@ document.querySelector("#clearSelectionButton").addEventListener("click", () => 
   renderPageSelection();
 });
 document.querySelector("#analyzeSelectedButton").addEventListener("click", analyzeSelectedPages);
-const isolatedMultiviewModels = new Set(["gpt-5.4", "gpt-5.6-sol"]);
-strategySelect.addEventListener("change", () => {
-  if (strategySelect.value === "isolated-multiview" && !isolatedMultiviewModels.has(modelSelect.value)) {
-    modelSelect.value = "gpt-5.6-sol";
-  }
-});
-modelSelect.addEventListener("change", () => {
-  if (strategySelect.value === "isolated-multiview" && !isolatedMultiviewModels.has(modelSelect.value)) {
-    strategySelect.value = "standard";
-  }
-});
 document.querySelector("#selectionBackButton").addEventListener("click", () => {
   activeUpload = null;
   selectedPages.clear();
@@ -1036,7 +897,29 @@ document.querySelector("#themeButton").addEventListener("click", () => {
   document.documentElement.dataset.theme = current === "dark" ? "light" : "dark";
 });
 
+async function loadDemoConfig() {
+  try {
+    const response = await fetch("/api/demo-config");
+    if (response.status === 404) {
+      console.warn("Deployment metadata is unavailable from this older local server; restart it to load the updated backend.");
+      return;
+    }
+    if (!response.ok) throw new Error("Deployment information could not be loaded.");
+    const config = await response.json();
+    if (!config.public_demo) return;
+    demoConfig = config;
+    const banner = document.querySelector("#demoBanner");
+    banner.textContent = `Public demo: use non-confidential documents only. Your files and saved results persist in Azure and are private to this browser cookie; clearing cookies loses access. One analysis at a time, ${config.max_jobs_per_hour} starts/hour, ${config.max_jobs_total} total. Processing closes ${new Date(config.expires_at).toLocaleString()}. Active jobs do not resume after a server restart.`;
+    banner.hidden = false;
+    document.querySelector("#uploadLimits").textContent = `Supported images or PDF - up to ${config.max_upload_bytes / (1024 * 1024)} MiB, ${config.max_pages} pages, ${config.max_regions} detected regions/page`;
+    document.querySelector(".saved-runs .eyebrow").textContent = "THIS BROWSER'S HISTORY";
+  } catch (error) {
+    setError(uploadError, error.message);
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   refreshIcons();
+  loadDemoConfig();
   loadSavedRuns();
 });

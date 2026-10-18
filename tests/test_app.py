@@ -87,8 +87,8 @@ class UploadFormatTests(unittest.TestCase):
 
 
 class ConcurrentJobTests(unittest.TestCase):
-    def test_default_profile_is_gpt54_standard_core4(self):
-        self.assertEqual("gpt-5.4", web_app.DEFAULT_MODEL_PROFILE)
+    def test_ui_only_offers_sol61_with_standard_core4(self):
+        self.assertEqual("gpt-6.1-sol", web_app.DEFAULT_MODEL_PROFILE)
         self.assertEqual("standard", web_app.DEFAULT_OCR_STRATEGY)
 
         response = web_app.app.test_client().get("/")
@@ -96,15 +96,16 @@ class ConcurrentJobTests(unittest.TestCase):
         response.close()
 
         self.assertEqual(200, response.status_code)
-        self.assertIn('<option value="gpt-5.4" selected>', html)
+        models = html.split('<select id="modelSelect" name="model_profile">', 1)[1].split(
+            "</select>", 1,
+        )[0]
+        self.assertEqual(1, models.count("<option"))
+        self.assertIn('<option value="gpt-6.1-sol" selected>', models)
         self.assertIn('<option value="standard" selected>', html)
-        self.assertNotIn('<option value="gpt-5.6-sol" selected>', html)
-        self.assertIn('<option value="copilot-claude-opus-4.8">', html)
-        self.assertIn('Claude Opus 4.8 · GitHub Copilot SDK · Core4', html)
-        self.assertIn('data-view="ivrit"', html)
-        self.assertIn('<span>Ivrit OCR</span>', html)
-        self.assertIn('data-view="kraken"', html)
-        self.assertIn('<span>Kraken OCR</span>', html)
+        self.assertNotIn('<option value="isolated-multiview">', html)
+        self.assertNotIn('data-view="ivrit"', html)
+        self.assertNotIn('data-view="kraken"', html)
+        self.assertNotIn('standard-kraken', html)
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -500,6 +501,30 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("low", environment["OCR_REASONING"])
         self.assertEqual("", environment["GPT_TARGETS"])
 
+    def test_sol61_profile_is_selectable_and_sets_page_environment(self):
+        response = web_app.app.test_client().get("/")
+        html = response.get_data(as_text=True)
+        response.close()
+        self.assertIn('<option value="gpt-6.1-sol" selected>', html)
+
+        with patch.dict(os.environ, {"GPT_TARGETS": '[{"deployment":"gpt-5.4"}]'}):
+            environment = web_app._page_environment("gpt-6.1-sol", "standard")
+
+        self.assertEqual(
+            os.environ.get("GPT_61_SOL_ENDPOINT", os.environ.get(
+                "GPT_SOL_ENDPOINT", web_app._PRIMARY_ENDPOINT,
+            )),
+            environment["GPT_ENDPOINT"],
+        )
+        self.assertEqual(
+            os.environ.get("GPT_61_SOL_DEPLOYMENT", "gpt-6.1-sol"),
+            environment["GPT_DEPLOYMENT"],
+        )
+        self.assertEqual("low", environment["GPT_REASONING"])
+        self.assertEqual("low", environment["OCR_REASONING"])
+        self.assertEqual("", environment["GPT_TARGETS"])
+        self.assertEqual("standard", environment["OCR_STRATEGY"])
+
     def test_isolated_multiview_reaches_page_subprocess_environment(self):
         environment = web_app._page_environment(
             "gpt-5.6-sol", "isolated-multiview",
@@ -533,21 +558,6 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("medium", environment["DETECTION_REASONING"])
         self.assertEqual("6000", environment["DETECTION_MAX_TOKENS"])
         self.assertEqual("90", environment["GPT_READ_TIMEOUT"])
-        self.assertEqual("0", environment["KRAKEN_OCR_ENABLED"])
-
-    def test_kraken_strategy_enables_advisory_with_same_fast_profile(self):
-        environment = web_app._page_environment(
-            "gpt-5.4", "standard-kraken-medium",
-        )
-
-        self.assertEqual("1", environment["KRAKEN_OCR_ENABLED"])
-        self.assertEqual("low", environment["OCR_REASONING"])
-        self.assertEqual("medium", environment["DETECTION_REASONING"])
-        self.assertEqual("6000", environment["DETECTION_MAX_TOKENS"])
-        self.assertEqual("90", environment["GPT_READ_TIMEOUT"])
-        self.assertEqual("PP-OCRv6 medium", pipeline.KRAKEN_OCR_MODEL_NAME)
-        self.assertTrue(pipeline.KRAKEN_OCR_MODEL.endswith("medium.safetensors"))
-        self.assertEqual("kraken_ppocrv6_medium", pipeline.KRAKEN_OCR_SOURCE)
 
     def test_sol_none_profile_sets_fast_page_subprocess_environment(self):
         environment = web_app._model_environment("gpt-5.6-sol-none")
@@ -721,7 +731,6 @@ class ConcurrentJobTests(unittest.TestCase):
                         "/api/jobs",
                         data={
                             "upload_id": upload_id,
-                            "model_profile": "gpt-5.4",
                             "ocr_strategy": "standard",
                             "pages": "2,4-5",
                         },
@@ -729,6 +738,7 @@ class ConcurrentJobTests(unittest.TestCase):
             payload = response.get_json()
 
             self.assertEqual(202, response.status_code)
+            self.assertEqual("gpt-6.1-sol", payload["model_profile"])
             self.assertEqual([2, 4, 5], payload["selected_pages"])
             self.assertEqual("standard", payload["ocr_strategy"])
             self.assertEqual([2, 4, 5], [page["page"] for page in payload["pages"]])
@@ -773,6 +783,13 @@ class ConcurrentJobTests(unittest.TestCase):
             self.assertEqual(run_dir.name, snapshot["run_name"])
         finally:
             web_app._jobs.pop("saved-job", None)
+
+    def test_legacy_manifest_without_model_keeps_original_gpt54_profile(self):
+        job = web_app._job_from_manifest(
+            {"file_name": "legacy.pdf", "page_count": 1}, self.output_dir,
+        )
+
+        self.assertEqual("gpt-5.4", job["model_profile"])
 
     def test_atomic_json_diagnostic_is_immediately_readable(self):
         diagnostic = self.output_dir / "ocr_progress.json"
@@ -893,8 +910,46 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertGreater(refined[1] + refined[3], 405)
         self.assertLess(refined[2], 260)
 
+    def test_color_refiner_does_not_treat_yellow_paper_as_pen_ink(self):
+        page = Image.new("RGB", (600, 600), (235, 228, 150))
+        draw = ImageDraw.Draw(page)
+        draw.line((180, 320, 205, 260), fill="black", width=7)
+        draw.line((250, 320, 275, 270), fill="black", width=7)
+
+        refined = pipeline.refine_box_to_colored_ink(
+            page, [150, 240, 160, 100], 200, 380,
+        )
+
+        self.assertIsNone(refined)
+
+    def test_mixed_hebrew_numeric_line_is_not_a_compact_number_field(self):
+        label = "handwritten number and Hebrew line"
+
+        self.assertFalse(pipeline.is_compact_handwriting_label(label))
+        self.assertIsNone(pipeline.compact_handwriting_kind(label))
+        penalty, issues = pipeline.detection_geometry_penalty(
+            [{"label": label, "box": [100, 400, 800, 150]}], 1000, 1000,
+        )
+        self.assertEqual(0, penalty)
+        self.assertEqual([], issues)
+
+    @patch.object(pipeline, "_large_black_handwriting_components")
+    def test_stroke_edge_preservation_does_not_chain_into_neighbors(self, components):
+        components.return_value = [
+            (170, 100, 210, 160),
+            (205, 100, 220, 160),
+            (100, 200, 130, 260),
+        ]
+        page = Image.new("RGB", (400, 400), "white")
+        original = [{"label": "handwritten line", "box": [100, 100, 100, 60]}]
+
+        regions = pipeline.preserve_black_ink_edges(page, original)
+
+        self.assertEqual([100, 100, 110, 60], regions[0]["box"])
+        self.assertEqual([100, 100, 100, 60], original[0]["box"])
+
     @patch("handwriting_pipeline._bearer", return_value="token")
-    @patch("handwriting_pipeline.requests.post")
+    @patch("handwriting_pipeline.requests.Session.post")
     def test_responses_retries_unsupported_parameter_with_zero_retries(
         self, post, _bearer
     ):
@@ -1481,6 +1536,81 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertGreater(left, 150)
         self.assertLess(left + width, 800)
 
+    def test_black_form_geometry_preserves_multiline_blocks(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        for rule_y in range(180, 901, 120):
+            draw.line((80, rule_y, 920, rule_y), fill="black", width=2)
+        for row_y in (275, 395, 515, 635, 755, 875):
+            for stroke_x in (180, 290, 410, 540, 680, 790):
+                draw.line(
+                    (stroke_x, row_y, stroke_x + 24, row_y - 64),
+                    fill="black", width=7,
+                )
+        regions = [
+            {"label": "Upper handwritten block with date and recipient",
+             "box": [100, 190, 800, 220]},
+            {"label": "Middle handwritten note and numeric details",
+             "box": [100, 430, 800, 220]},
+            {"label": "Lower handwritten closing and contact details",
+             "box": [100, 670, 800, 220]},
+        ]
+
+        tightened = pipeline.tighten_regions_to_black_ink_rows(page, regions)
+
+        self.assertEqual(regions, tightened)
+        self.assertFalse(pipeline.is_compact_handwriting_label(regions[0]["label"]))
+
+    @patch.object(pipeline, "_responses_call")
+    @patch.object(pipeline, "refine_box_to_ink")
+    @patch.object(pipeline, "detect_black_ink_form_rows")
+    @patch.object(pipeline, "detect_colored_pen_regions", return_value=[])
+    def test_detection_preserves_block_extent_through_form_postprocessing(
+        self, _colored, form_rows, refine, responses,
+    ):
+        page = Image.new("RGB", (1000, 1000), "white")
+        model_box = [100, 200, 800, 600]
+        responses.return_value = {"regions": [{
+            "label": "Handwritten block with date and recipient",
+            "box": model_box,
+        }]}
+        form_rows.return_value = [
+            {"label": f"black handwritten form row {index}", "box": [200, top, 600, 80]}
+            for index, top in enumerate((250, 450, 650), 1)
+        ]
+        refine.return_value = [200, 250, 600, 80]
+
+        regions = pipeline.detect_handwriting_regions(page)
+
+        self.assertTrue(any(
+            region["box"][1] <= model_box[1]
+            and region["box"][1] + region["box"][3] >= model_box[1] + model_box[3]
+            for region in regions
+        ))
+        refine.assert_not_called()
+
+    @patch.object(pipeline, "detect_colored_pen_regions")
+    @patch.object(pipeline, "_responses_call")
+    def test_paragraph_detection_is_not_replaced_by_blue_margin_fragments(
+        self, responses, colored_regions,
+    ):
+        responses.return_value = {"regions": [
+            {"label": "handwritten paragraph", "box": [100, 100, 800, 350]},
+            {"label": "handwritten closing paragraph", "box": [100, 550, 800, 350]},
+        ]}
+        colored_regions.return_value = [
+            {"label": "colored handwriting", "box": [950, 200, 30, 20]},
+            {"label": "colored handwriting", "box": [950, 600, 30, 20]},
+        ]
+
+        regions = pipeline.detect_handwriting_regions(
+            Image.new("RGB", (1000, 1000), "white"),
+        )
+
+        self.assertEqual(2, len(regions))
+        self.assertTrue(all(region["box"][2] >= 800 for region in regions))
+        colored_regions.assert_not_called()
+
     def test_black_form_geometry_assigns_overlapping_regions_to_distinct_rows(self):
         page = Image.new("RGB", (1000, 1000), "white")
         draw = ImageDraw.Draw(page)
@@ -1505,6 +1635,72 @@ class ConcurrentJobTests(unittest.TestCase):
         second_top = tightened[1]["box"][1]
         self.assertLess(first_top, second_top)
         self.assertGreaterEqual(second_top - first_top, 90)
+
+    def test_black_form_geometry_keeps_model_anchor_and_cross_rule_strokes(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        for rule_y in (300, 420, 540):
+            draw.line((100, rule_y, 900, rule_y), fill="black", width=2)
+        for stroke_x in (220, 360, 520):
+            draw.line((stroke_x, 410, stroke_x + 22, 280), fill="black", width=7)
+        for stroke_x in range(200, 801, 60):
+            draw.line((stroke_x, 530, stroke_x + 22, 455), fill="black", width=10)
+        regions = [{
+            "label": "handwritten Hebrew line",
+            "box": [80, 260, 840, 290],
+            "_model_box": [180, 275, 400, 140],
+        }]
+
+        tightened = pipeline.tighten_regions_to_black_ink_rows(page, regions)
+
+        left, top, width, height = tightened[0]["box"]
+        self.assertLessEqual(top, 275)
+        self.assertGreaterEqual(top + height, 415)
+        self.assertLess(top + height, 450)
+        self.assertLessEqual(left, 180)
+        self.assertGreaterEqual(left + width, 580)
+
+    @patch.object(pipeline, "_responses_call")
+    def test_black_note_detection_covers_all_strong_strokes(self, responses):
+        source = Path("sample/bank discount samples/העברה-קוקי.pdf")
+        if not source.exists():
+            self.skipTest("local handwritten note fixture is unavailable")
+        labels_and_boxes = [
+            ("handwritten date", [738, 240, 394, 240]),
+            ("short handwritten Hebrew entry", [2265, 576, 142, 105]),
+            ("handwritten Hebrew line", [1585, 680, 752, 191]),
+            ("handwritten Hebrew line", [1510, 1052, 719, 141]),
+            ("handwritten Hebrew and numeric line", [648, 1232, 1777, 189]),
+            ("handwritten Hebrew continuation line", [1420, 1390, 982, 164]),
+            ("handwritten Hebrew line", [1135, 1600, 1320, 205]),
+            ("handwritten number and Hebrew line", [849, 1758, 1484, 198]),
+            ("short handwritten Hebrew heading", [1196, 2117, 444, 91]),
+            ("handwritten Hebrew line", [977, 2190, 731, 166]),
+            ("handwritten phone number and Hebrew text", [919, 2330, 788, 177]),
+        ]
+        responses.return_value = {
+            "regions": [{"label": label, "box": box} for label, box in labels_and_boxes],
+        }
+        page = pipeline.render_pdf_page(str(source), 1, 400).convert("RGB")
+
+        regions = pipeline.detect_handwriting_regions(page)
+
+        self.assertEqual(11, len(regions))
+        self.assertTrue(all("_model_box" not in region for region in regions))
+        mask = Image.new("L", page.size, 0)
+        draw = ImageDraw.Draw(mask)
+        for region in regions:
+            x, y, width, height = region["box"]
+            draw.rectangle((x, y, x + width - 1, y + height - 1), fill=255)
+        components = pipeline._large_black_handwriting_components(page)
+        self.assertTrue(components)
+        for left, top, right, bottom in components:
+            with self.subTest(component=(left, top, right, bottom)):
+                pixels = mask.crop((left, top, right, bottom))
+                coverage = sum(pixels.getdata()) / (
+                    255 * (right - left) * (bottom - top)
+                )
+                self.assertGreaterEqual(coverage, 0.95)
 
     def test_black_form_detector_recovers_rows_missing_from_model_detection(self):
         page = Image.new("RGB", (1000, 1000), "white")
@@ -1543,6 +1739,25 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual(2, len(merged))
         self.assertEqual([100, 300, 465, 80], merged[0]["box"])
         self.assertEqual(regions[2]["box"], merged[1]["box"])
+
+    def test_black_form_row_keeps_short_trailing_digits(self):
+        page = Image.new("RGB", (1000, 1000), "white")
+        draw = ImageDraw.Draw(page)
+        for rule_y in (180, 300, 420, 540, 660, 780, 900):
+            draw.line((80, rule_y, 920, rule_y), fill="black", width=2)
+        for row_y in (275, 515, 875):
+            for stroke_x in (180, 290, 410, 540, 680, 790):
+                draw.line(
+                    (stroke_x, row_y, stroke_x + 24, row_y - 64),
+                    fill="black", width=7,
+                )
+            draw.rectangle((850, row_y - 20, 870, row_y), outline="black", width=4)
+
+        detected = pipeline.detect_black_ink_form_rows(page)
+
+        self.assertEqual(3, len(detected))
+        for region in detected:
+            self.assertGreaterEqual(region["box"][0] + region["box"][2], 871)
 
     def test_colored_page_finds_pen_region_model_missed(self):
         page = Image.new("RGB", (1000, 1000), "white")
@@ -1645,201 +1860,6 @@ class ConcurrentJobTests(unittest.TestCase):
 
         self.assertEqual(0, responses_call.call_args.kwargs["retries"])
         self.assertEqual(1, responses_call.call_args.kwargs["endpoint_limit"])
-
-    @patch.object(pipeline.requests, "post")
-    def test_ivrit_ocr_sidecar_normalizes_hash_response(self, post):
-        response = Mock()
-        response.json.return_value = {
-            "text": "שלום עולם",
-            "pages": [{
-                "number": 1,
-                "width": 200,
-                "height": 80,
-                "lines": [
-                    {
-                        "text": "שלום",
-                        "confidence": 0.8,
-                        "box": {"x": 100, "y": 5, "width": 80, "height": 30},
-                    },
-                    {
-                        "text": "עולם",
-                        "confidence": 0.6,
-                        "box": {"x": 10, "y": 42, "width": 90, "height": 30},
-                    },
-                ],
-            }],
-        }
-        post.return_value = response
-
-        result = pipeline.ocr_image_with_ivrit(Image.new("RGB", (200, 80), "white"))
-
-        self.assertEqual("complete", result["status"])
-        self.assertEqual("ivrit_hash_v1", result["source"])
-        self.assertEqual("שלום עולם", result["text"])
-        self.assertAlmostEqual(0.7, result["confidence"])
-        self.assertEqual(2, len(result["lines"]))
-        response.raise_for_status.assert_called_once_with()
-        self.assertEqual(
-            (3, pipeline.IVRIT_OCR_TIMEOUT), post.call_args.kwargs["timeout"]
-        )
-        file_name, image_bytes, content_type = post.call_args.kwargs["files"]["file"]
-        self.assertEqual("region.png", file_name)
-        self.assertTrue(image_bytes.startswith(b"\x89PNG"))
-        self.assertEqual("image/png", content_type)
-
-    def test_ivrit_advisory_gate_keeps_only_related_compact_hebrew(self):
-        def evidence(text, lines=1):
-            return {
-                "status": "complete",
-                "text": text,
-                "lines": [
-                    {"text": text, "confidence": 0.99, "box": {}}
-                    for _index in range(lines)
-                ],
-            }
-
-        def vision(text, classification=None):
-            return [{
-                "source": "core4_multi",
-                "ocr": {
-                    "full_transcription": text,
-                    "classification": classification,
-                },
-            }]
-
-        related = pipeline.ivrit_ocr_advisory_gate(
-            evidence("בארותיים"), vision("ירושל״ם"), {"label": "address word"},
-        )
-        mislabeled_related = pipeline.ivrit_ocr_advisory_gate(
-            evidence("בארותיים"),
-            vision("ירושל״ם"),
-            {"label": "handwritten number on second line"},
-        )
-        duplicate = pipeline.ivrit_ocr_advisory_gate(
-            evidence("בארותיים"),
-            vision("בארותיים"),
-            {"label": "handwritten number on second line"},
-        )
-        numeric = pipeline.ivrit_ocr_advisory_gate(
-            evidence("סרעדעפת"), vision("12/7/26"), {"label": "date"},
-        )
-        multiline = pipeline.ivrit_ocr_advisory_gate(
-            evidence("שורה אחת\nשורה שתיים", lines=2),
-            vision("שורה אחת\nשורה אחרת"),
-            {"label": "handwritten paragraph"},
-        )
-        unrelated = pipeline.ivrit_ocr_advisory_gate(
-            evidence("כסף"), vision("ביב[?]"), {"label": "address word"},
-        )
-
-        self.assertTrue(related["eligible"])
-        self.assertTrue(mislabeled_related["eligible"])
-        self.assertGreaterEqual(
-            related["character_agreement"], pipeline.IVRIT_OCR_MIN_AGREEMENT
-        )
-        self.assertEqual("duplicate_of_vision_reading", duplicate["reason"])
-        self.assertFalse(duplicate["eligible"])
-        self.assertEqual("structured_or_numeric_region", numeric["reason"])
-        self.assertEqual("multiline_reading", multiline["reason"])
-        self.assertEqual("unrelated_to_vision_reading", unrelated["reason"])
-        self.assertFalse(numeric["eligible"])
-        self.assertFalse(multiline["eligible"])
-        self.assertFalse(unrelated["eligible"])
-
-    def test_ivrit_candidate_does_not_expose_uncalibrated_confidence(self):
-        candidate = pipeline.ivrit_ocr_candidate({
-            "status": "complete",
-            "text": "בארותיים",
-            "confidence": 0.99,
-            "lines": [{"text": "בארותיים", "confidence": 0.99, "box": {}}],
-            "advisory_gate": {"eligible": True},
-        })
-
-        self.assertIsNotNone(candidate)
-        self.assertNotIn("hash_confidence", candidate["ocr"])
-        self.assertNotIn("confidence", candidate["ocr"]["words"][0])
-
-    @patch.object(pipeline.subprocess, "run")
-    def test_kraken_ocr_runs_local_small_model_in_rtl_line_mode(self, run):
-        def complete(command, **_kwargs):
-            Path(command[command.index("-i") + 2]).write_text(
-                "רחלי רחלה\n", encoding="utf-8"
-            )
-            return Mock(returncode=0, stdout="", stderr="")
-
-        run.side_effect = complete
-        result = pipeline.ocr_image_with_kraken(
-            Image.new("RGB", (200, 80), "white")
-        )
-
-        self.assertEqual("רחלי רחלה", result["text"])
-        self.assertEqual(pipeline.KRAKEN_OCR_SOURCE, result["source"])
-        command = run.call_args.args[0]
-        self.assertIn("--no-segmentation", command)
-        self.assertIn("--base-dir", command)
-        self.assertIn("R", command)
-        self.assertIn("cpu", command)
-
-    def test_kraken_gate_admits_only_correlated_compact_hebrew(self):
-        vision = [{
-            "source": "core4_multi",
-            "ocr": {"full_transcription": "רחלי כחלה"},
-        }]
-        related = pipeline.kraken_ocr_advisory_gate(
-            {"status": "complete", "text": "דהלי רחלה"},
-            vision,
-            {"label": "handwritten Hebrew word"},
-        )
-        numeric = pipeline.kraken_ocr_advisory_gate(
-            {"status": "complete", "text": "5252731"},
-            vision,
-            {"label": "account number"},
-        )
-
-        self.assertTrue(related["eligible"])
-        self.assertFalse(numeric["eligible"])
-        self.assertEqual("structured_or_numeric_region", numeric["reason"])
-
-    def test_hebrew_numeric_script_conflict_requires_semantic_text_slot(self):
-        final = {
-            "classification": "handwritten_text",
-            "field_type": "numeric",
-            "final_transcription": "1242 13",
-        }
-        evidence = {
-            "status": "complete",
-            "text": "צתראך\nות כ\nץ",
-        }
-
-        self.assertTrue(pipeline.should_recheck_hebrew_numeric_script_conflict(
-            final, evidence, {"label": "handwritten acknowledgment entry"}
-        ))
-        for label in (
-            "handwritten date",
-            "account number",
-            "black handwritten form row 4",
-        ):
-            self.assertFalse(
-                pipeline.should_recheck_hebrew_numeric_script_conflict(
-                    final, evidence, {"label": label}
-                ),
-                label,
-            )
-        self.assertTrue(pipeline.should_recheck_hebrew_numeric_script_conflict(
-            final,
-            {**evidence, "lines": [{}, {}, {}]},
-            {"label": "colored handwriting"},
-        ))
-        self.assertFalse(pipeline.should_recheck_hebrew_numeric_script_conflict(
-            final,
-            {**evidence, "lines": [{}]},
-            {"label": "colored handwriting"},
-        ))
-        self.assertFalse(pipeline.should_recheck_hebrew_numeric_script_conflict(
-            {**final, "final_transcription": "דנית ראובן"},
-            evidence,
-            {"label": "handwritten acknowledgment entry"},
-        ))
 
     def test_script_conflict_recheck_is_candidate_blind(self):
         page = Image.new("RGB", (800, 1000), "white")
@@ -2034,115 +2054,6 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("[?]", suppressed["final_transcription"])
         self.assertEqual("script_conflict_unresolved", suppressed["decision_status"])
 
-    def test_eligible_ivrit_candidate_breaks_visual_tie(self):
-        final = {
-            "classification": "handwritten_text",
-            "final_transcription": "מויש פאלרמו",
-            "notes": [],
-            "needs_review": True,
-        }
-        evidence = {
-            "status": "complete",
-            "text": "מרטין פאלרמו",
-            "selected_variant": "blue_only",
-            "advisory_gate": {
-                "eligible": True,
-                "reason": "preprocessing_consensus",
-                "vision_source": "core4_multi",
-                "character_agreement": 0.7619,
-            },
-        }
-
-        selected = pipeline.prefer_eligible_ivrit_candidate(final, evidence)
-
-        self.assertEqual("מרטין פאלרמו", selected["final_transcription"])
-        self.assertEqual("ivrit_eligible_tiebreak", selected["decision_status"])
-        self.assertEqual("מויש פאלרמו", selected["alternative_transcriptions"][0])
-        self.assertNotIn("confidence", selected["ivrit_tiebreak"])
-
-    def test_ineligible_ivrit_candidate_cannot_replace_visual_result(self):
-        final = {
-            "classification": "handwritten_text",
-            "final_transcription": "שלום",
-        }
-        evidence = {
-            "status": "complete",
-            "text": "חלום",
-            "advisory_gate": {"eligible": False, "reason": "unrelated"},
-        }
-
-        self.assertIs(
-            final,
-            pipeline.prefer_eligible_ivrit_candidate(final, evidence),
-        )
-
-    def test_ivrit_blue_only_recovers_overlapping_single_line_segmentation(self):
-        image = Image.new("RGB", (220, 110), "white")
-        draw = ImageDraw.Draw(image)
-        draw.line((15, 70, 205, 70), fill="black", width=3)
-        draw.text((30, 78), "printed field", fill="black")
-        for left in (35, 70, 105, 140, 175):
-            draw.line((left, 25, left + 15, 72), fill=(35, 75, 190), width=6)
-        isolated = pipeline.prepare_ivrit_blue_only_image(image)
-
-        self.assertIsNotNone(isolated)
-        pixels = list(isolated.getdata())
-        self.assertTrue(any(blue > red + 20 for red, green, blue in pixels))
-        self.assertFalse(any(max(pixel) < 80 for pixel in pixels))
-
-        original = {
-            "status": "complete",
-            "text": "משת פאלר מן\nן",
-            "confidence": 0.92,
-            "lines": [
-                {
-                    "text": "משת פאלר מן",
-                    "confidence": 0.94,
-                    "box": {"x": 0, "y": 10, "width": 200, "height": 70},
-                },
-                {
-                    "text": "ן",
-                    "confidence": 0.88,
-                    "box": {"x": 120, "y": 35, "width": 20, "height": 70},
-                },
-            ],
-        }
-        blue_only = {
-            "status": "complete",
-            "text": "מרטין פאלרמו",
-            "confidence": 0.95,
-            "lines": [{
-                "text": "מרטין פאלרמו",
-                "confidence": 0.95,
-                "box": {"x": 0, "y": 0, "width": 200, "height": 70},
-            }],
-        }
-        vision = [{
-            "source": "core4_multi",
-            "ocr": {"full_transcription": "מוטי פא[?]ר[?]"},
-        }]
-        region = {"label": "handwritten note on line"}
-
-        self.assertTrue(pipeline.should_try_ivrit_blue_only(original, vision, region))
-        selected = pipeline.select_ivrit_preprocessing_variant(
-            original, blue_only, vision, region,
-        )
-        gate = pipeline.ivrit_ocr_advisory_gate(selected, vision, region)
-
-        self.assertEqual("blue_only", selected["selected_variant"])
-        self.assertEqual("מרטין פאלרמו", selected["text"])
-        self.assertEqual("preprocessing_consensus", gate["reason"])
-        self.assertTrue(gate["eligible"])
-        multiline_vision = [{
-            "source": "core4_multi",
-            "ocr": {"full_transcription": "שורה אחת\nשורה שתיים"},
-        }]
-        self.assertFalse(
-            pipeline.should_try_ivrit_blue_only(
-                original, multiline_vision, region,
-            )
-        )
-
     @patch("handwriting_pipeline._responses_call")
     def test_reconciliation_uses_fallbacks_instead_of_hidden_retries(self, responses_call):
         responses_call.return_value = {"final_transcription": "טקסט", "words": []}
@@ -2162,10 +2073,6 @@ class ConcurrentJobTests(unittest.TestCase):
             {"source": "a", "ocr": {"full_transcription": "8 עמינדב"}},
             {"source": "b", "ocr": {"full_transcription": "8 עמינדב"}},
             {"source": "c", "ocr": {"full_transcription": "8 עמיאל"}},
-            {
-                "source": pipeline.IVRIT_OCR_SOURCE,
-                "ocr": {"full_transcription": "מילה שגויה", "advisory": True},
-            },
         ]
 
         pipeline.visual_reconcile_ocr_results([("01_original_crop.png", image)], results)
@@ -2173,12 +2080,10 @@ class ConcurrentJobTests(unittest.TestCase):
         prompt = responses_call.call_args.args[0][0]["text"]
         self.assertIn("Deterministic agreement summary", prompt)
         self.assertIn("8 עמינדב", prompt)
-        self.assertIn("ivrit_hash_v1", prompt)
-        self.assertIn("word error rate is high", prompt)
         agreement_section = prompt.split(
             "Deterministic agreement summary across candidates", 1
         )[1].split("Return ONLY", 1)[0]
-        self.assertNotIn("מילה שגויה", agreement_section)
+        self.assertIn("8 עמינדב", agreement_section)
 
     @patch.object(pipeline, "_responses_call")
     def test_visual_adjudication_omits_hash_warning_without_candidate(self, responses_call):
@@ -2338,7 +2243,7 @@ class ConcurrentJobTests(unittest.TestCase):
             "ocr": {"full_transcription": "שלום[?]", "words": [{"confidence": 0.4}]},
         }]
 
-        self.assertFalse(pipeline.should_contextual_recheck(
+        self.assertTrue(pipeline.should_contextual_recheck(
             {"classification": "handwritten_text", "final_transcription": "5298570"}, easy
         ))
         self.assertTrue(pipeline.should_contextual_recheck(
@@ -2493,83 +2398,7 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertEqual("בארותיים", at_floor["final_transcription"])
         self.assertEqual("contextual_recheck", at_floor["decision_status"])
 
-    def test_contextual_recheck_cannot_override_exact_cross_engine_agreement(self):
-        current = {
-            "classification": "handwritten_text",
-            "final_transcription": "בארותיים",
-            "words": [],
-            "notes": ["visual reconciliation"],
-        }
-        recheck = {
-            "classification": "handwritten_text",
-            "field_type": "address",
-            "final_transcription": "אורנים",
-            "confidence": 0.69,
-            "alternative_transcriptions": ["אורנית[?]"],
-        }
-        accepted = pipeline.accept_contextual_recheck(current, recheck)
-        vision = [{
-            "source": "core4_multi",
-            "ocr": {"full_transcription": "בארותיים"},
-        }]
-        ivrit = {
-            "status": "complete",
-            "source": pipeline.IVRIT_OCR_SOURCE,
-            "text": "בארותיים",
-            "selected_variant": "original",
-        }
-
-        protected = pipeline.protect_contextual_recheck_with_cross_engine_agreement(
-            current, recheck, accepted, vision, ivrit,
-        )
-
-        self.assertEqual("בארותיים", protected["final_transcription"])
-        self.assertEqual(
-            "cross_engine_agreement_protected", protected["decision_status"]
-        )
-        self.assertIn("אורנים", protected["alternative_transcriptions"])
-        self.assertTrue(protected["needs_review"])
-        self.assertEqual(
-            ["core4_multi"],
-            protected["cross_engine_agreement"]["vision_supporting_sources"],
-        )
-
-        unrelated_ivrit = {**ivrit, "text": "כסף"}
-        unprotected = pipeline.protect_contextual_recheck_with_cross_engine_agreement(
-            current, recheck, accepted, vision, unrelated_ivrit,
-        )
-        self.assertEqual("אורנים", unprotected["final_transcription"])
-        self.assertEqual("contextual_recheck", unprotected["decision_status"])
-
-        related_vision = [{
-            "source": "core4_multi",
-            "ocr": {"full_transcription": "האלתיים[?]"},
-        }]
-        eligible_ivrit = {
-            **ivrit,
-            "advisory_gate": {
-                "eligible": True,
-                "reason": "related_compact_hebrew",
-                "vision_source": "core4_multi",
-                "character_agreement": 0.6667,
-            },
-        }
-        protected_by_eligible_hash = (
-            pipeline.protect_contextual_recheck_with_cross_engine_agreement(
-                current, recheck, accepted, related_vision, eligible_ivrit,
-            )
-        )
-        self.assertEqual(
-            "בארותיים", protected_by_eligible_hash["final_transcription"]
-        )
-        self.assertEqual(
-            "core4_multi",
-            protected_by_eligible_hash["cross_engine_agreement"][
-                "vision_correlated_source"
-            ],
-        )
-
-    def test_repeated_structured_field_uses_stronger_one_digit_match(self):
+    def test_repeated_structured_field_does_not_copy_a_confident_peer(self):
         regions = [
             {"label": "top form customer number"},
             {"label": "bottom form customer number"},
@@ -2588,9 +2417,10 @@ class ConcurrentJobTests(unittest.TestCase):
 
         reconciled = pipeline.reconcile_repeated_structured_fields(finals, regions)
 
-        self.assertEqual("5252 731", reconciled[1]["final_transcription"])
-        self.assertEqual("cross_region_structured_consensus", reconciled[1]["decision_status"])
-        self.assertEqual("6252731", reconciled[1]["alternative_transcriptions"][0])
+        self.assertEqual("6252731[?]", reconciled[1]["final_transcription"])
+        self.assertEqual("cross_region_conflict_review", reconciled[1]["decision_status"])
+        self.assertEqual("5252 731", reconciled[1]["alternative_transcriptions"][0])
+        self.assertTrue(reconciled[1]["needs_review"])
 
     def test_repeated_structured_field_ignores_positional_label_words(self):
         finals = [
@@ -2607,9 +2437,9 @@ class ConcurrentJobTests(unittest.TestCase):
 
         reconciled = pipeline.reconcile_repeated_structured_fields(finals, regions)
 
-        self.assertEqual("5252 731", reconciled[1]["final_transcription"])
+        self.assertEqual("6252731[?]", reconciled[1]["final_transcription"])
         self.assertEqual(
-            "cross_region_structured_consensus", reconciled[1]["decision_status"]
+            "cross_region_conflict_review", reconciled[1]["decision_status"]
         )
 
     def test_repeated_structured_field_rejects_weak_or_non_identifier_matches(self):
@@ -3061,103 +2891,6 @@ class ConcurrentJobTests(unittest.TestCase):
         self.assertTrue((output_dir / region["folder"] / "result.json").exists())
         visual_reconcile.assert_not_called()
 
-    def test_standard_pipeline_persists_external_advisory_evidence(self):
-        input_path = self.output_dir / "region.png"
-        Image.new("RGB", (120, 80), "white").save(input_path)
-        output_dir = self.output_dir / "ivrit-output"
-        gpt_read = {
-            "classification": "handwritten_text",
-            "full_transcription": "שלם",
-            "words": [],
-        }
-        ivrit_read = {
-            "status": "complete",
-            "source": pipeline.IVRIT_OCR_SOURCE,
-            "model": "HASH v1",
-            "text": "שלום",
-            "confidence": 0.42,
-            "lines": [{
-                "text": "שלום",
-                "confidence": 0.42,
-                "box": {"x": 10, "y": 12, "width": 80, "height": 30},
-            }],
-            "raw_response": {"text": "שלום", "pages": []},
-        }
-        kraken_read = {
-            "status": "complete",
-            "source": pipeline.KRAKEN_OCR_SOURCE,
-            "model": pipeline.KRAKEN_OCR_MODEL_NAME,
-            "text": "שלים",
-            "lines": [{"text": "שלים"}],
-        }
-        final = {
-            "classification": "handwritten_text",
-            "final_transcription": "שלום",
-            "pre_high_rescue_transcription": "[?]",
-            "high_uncertainty_evidence": {
-                "final_transcription": "שלום",
-                "confidence": 0.72,
-            },
-            "words": [],
-            "notes": [],
-        }
-
-        with patch.object(pipeline, "OCR_STRATEGY", "standard"), \
-             patch.object(pipeline, "detect_handwriting_regions", return_value=[{
-                 "label": "handwritten word", "box": [0, 0, 120, 80],
-             }]), \
-             patch.object(pipeline, "ivrit_ocr_service_status", return_value=(True, "ready")), \
-             patch.object(pipeline, "ocr_image_with_ivrit", return_value=ivrit_read), \
-             patch.object(pipeline, "kraken_ocr_service_status", return_value=(True, "ready")), \
-             patch.object(pipeline, "ocr_image_with_kraken", return_value=kraken_read), \
-             patch.object(pipeline, "ocr_image_set", return_value=gpt_read), \
-             patch.object(pipeline, "should_contextual_recheck", return_value=False), \
-             patch.object(
-                 pipeline, "visual_reconcile_ocr_results", return_value=final,
-             ) as visual_reconcile:
-            return_code = pipeline.run_pipeline(
-                str(input_path),
-                page=1,
-                dpi=400,
-                crops=None,
-                output_dir=str(output_dir),
-                chunk_width=900,
-                overlap=150,
-                ocr_mode="full",
-                auto_detect=True,
-                merge_md=False,
-            )
-
-        self.assertEqual(0, return_code)
-        reconciliation_results = visual_reconcile.call_args.args[1]
-        self.assertEqual(
-            ["core4_multi", pipeline.IVRIT_OCR_SOURCE, pipeline.KRAKEN_OCR_SOURCE],
-            [result["source"] for result in reconciliation_results],
-        )
-        region_dir = next(output_dir.glob("region_*"))
-        saved_ivrit = json.loads((region_dir / "ivrit_ocr.json").read_text())
-        saved_kraken = json.loads((region_dir / "kraken_ocr.json").read_text())
-        saved_result = json.loads((region_dir / "result.json").read_text())
-        saved_progress = json.loads((output_dir / "ocr_progress.json").read_text())
-        combined = json.loads((output_dir / "handwriting_result.json").read_text())
-        self.assertEqual("שלום", saved_ivrit["text"])
-        self.assertTrue(saved_ivrit["advisory_gate"]["eligible"])
-        self.assertEqual("שלים", saved_kraken["text"])
-        self.assertTrue(saved_kraken["advisory_gate"]["eligible"])
-        self.assertEqual("שלום", saved_result["ivrit_ocr"]["text"])
-        self.assertEqual("שלים", saved_result["kraken_ocr"]["text"])
-        self.assertEqual("[?]", saved_result["pre_high_rescue_transcription"])
-        self.assertEqual(
-            "שלום", saved_result["high_uncertainty_evidence"]["final_transcription"]
-        )
-        self.assertEqual(
-            saved_result["high_uncertainty_evidence"],
-            combined["regions"][0]["high_uncertainty_evidence"],
-        )
-        self.assertEqual("שלום", saved_progress["regions"][0]["ivrit_ocr"]["text"])
-        self.assertEqual("שלים", saved_progress["regions"][0]["kraken_ocr"]["text"])
-        self.assertEqual(1, len(saved_result["per_image"]))
-
     def test_pipeline_uses_cu_numeric_evidence_without_model_context(self):
         input_path = self.output_dir / "numeric-region.png"
         Image.new("RGB", (120, 80), "white").save(input_path)
@@ -3181,9 +2914,6 @@ class ConcurrentJobTests(unittest.TestCase):
              patch.object(pipeline, "detect_handwriting_regions", return_value=[{
                  "label": "handwritten phone number", "box": [0, 0, 120, 80],
              }]), \
-             patch.object(
-                 pipeline, "ivrit_ocr_service_status", return_value=(False, "disabled")
-             ), \
              patch.object(pipeline, "ocr_image_set", return_value=gpt_read), \
              patch.object(pipeline, "should_contextual_recheck", return_value=False), \
              patch.object(
@@ -3218,94 +2948,70 @@ class ConcurrentJobTests(unittest.TestCase):
             "cu_numeric_consensus", result["regions"][0]["decision_status"]
         )
 
-    def test_standard_pipeline_retries_overlapping_hash_lines_with_blue_only(self):
-        input_path = self.output_dir / "blue-form.png"
-        image = Image.new("RGB", (220, 110), "white")
-        draw = ImageDraw.Draw(image)
-        draw.line((10, 72, 210, 72), fill="black", width=3)
-        draw.text((25, 80), "printed field", fill="black")
-        for left in (30, 65, 100, 135, 170):
-            draw.line((left, 22, left + 15, 75), fill=(35, 75, 190), width=6)
-        image.save(input_path)
-        output_dir = self.output_dir / "ivrit-blue-output"
-        original = {
-            "status": "complete",
-            "source": pipeline.IVRIT_OCR_SOURCE,
-            "model": "HASH v1",
-            "text": "משת פאלר מן\nן",
-            "confidence": 0.92,
-            "lines": [
-                {
-                    "text": "משת פאלר מן",
-                    "confidence": 0.94,
-                    "box": {"x": 0, "y": 10, "width": 200, "height": 70},
-                },
-                {
-                    "text": "ן",
-                    "confidence": 0.88,
-                    "box": {"x": 120, "y": 35, "width": 20, "height": 70},
-                },
-            ],
-        }
-        blue_only = {
-            "status": "complete",
-            "source": pipeline.IVRIT_OCR_SOURCE,
-            "model": "HASH v1",
-            "text": "מרטין פאלרמו",
-            "confidence": 0.95,
-            "lines": [{
-                "text": "מרטין פאלרמו",
-                "confidence": 0.95,
-                "box": {"x": 0, "y": 0, "width": 200, "height": 70},
-            }],
-        }
-        core = {
+    def test_standard_pipeline_uses_only_vision_evidence(self):
+        input_path = self.output_dir / "vision-only.png"
+        Image.new("RGB", (120, 80), "white").save(input_path)
+        output_dir = self.output_dir / "vision-only-output"
+        reading = {
             "classification": "handwritten_text",
-            "full_transcription": "מוטי פא[?]ר[?]",
-            "words": [],
+            "full_transcription": "שלום", "words": [],
         }
         final = {
             "classification": "handwritten_text",
-            "final_transcription": "מרטין פאלרמו",
-            "words": [],
-            "notes": [],
+            "final_transcription": "שלום", "words": [], "notes": [],
         }
-
-        with patch.object(pipeline, "OCR_STRATEGY", "standard"), \
-             patch.object(pipeline, "detect_handwriting_regions", return_value=[{
-                 "label": "handwritten note on line", "box": [0, 0, 220, 110],
-             }]), \
-             patch.object(pipeline, "ivrit_ocr_service_status", return_value=(True, "ready")), \
-             patch.object(
-                 pipeline, "ocr_image_with_ivrit", side_effect=[original, blue_only],
-             ) as ivrit_ocr, \
-             patch.object(pipeline, "ocr_image_set", return_value=core), \
+        with patch.object(pipeline, "VOTE_ENABLED", False), \
+             patch.object(pipeline, "OCR_STRATEGY", "standard"), \
+             patch.object(pipeline, "requests") as requests, \
+             patch.object(pipeline, "ocr_image_set", return_value=reading), \
              patch.object(pipeline, "should_contextual_recheck", return_value=False), \
              patch.object(
                  pipeline, "visual_reconcile_ocr_results", return_value=final,
-             ) as visual_reconcile:
-            return_code = pipeline.run_pipeline(
-                str(input_path),
-                page=1,
-                dpi=400,
-                crops=None,
-                output_dir=str(output_dir),
-                chunk_width=900,
-                overlap=150,
-                ocr_mode="full",
-                auto_detect=True,
-                merge_md=False,
+             ) as reconcile:
+            code = pipeline.run_pipeline(
+                str(input_path), page=1, dpi=400, crops=[(0, 0, 120, 80)],
+                output_dir=str(output_dir), chunk_width=900, overlap=150,
+                ocr_mode="full", merge_md=False,
             )
 
-        self.assertEqual(0, return_code)
-        self.assertEqual(2, ivrit_ocr.call_count)
-        region_dir = next(output_dir.glob("region_*"))
-        saved = json.loads((region_dir / "ivrit_ocr.json").read_text())
-        self.assertEqual("blue_only", saved["selected_variant"])
-        self.assertEqual("מרטין פאלרמו", saved["text"])
-        self.assertEqual("preprocessing_consensus", saved["advisory_gate"]["reason"])
-        reconciliation_results = visual_reconcile.call_args.args[1]
-        self.assertEqual("מרטין פאלרמו", reconciliation_results[-1]["ocr"]["full_transcription"])
+        self.assertEqual(0, code)
+        requests.get.assert_not_called()
+        requests.post.assert_not_called()
+        self.assertEqual(["core4_multi"], [
+            result["source"] for result in reconcile.call_args.args[1]
+        ])
+        result = json.loads((output_dir / "handwriting_result.json").read_text())
+        self.assertEqual("שלום", result["regions"][0]["final_transcription"])
+        progress = json.loads((output_dir / "ocr_progress.json").read_text())
+        for region in (result["regions"][0], progress["regions"][0]):
+            self.assertNotIn("ivrit_ocr", region)
+            self.assertNotIn("kraken_ocr", region)
+
+    def test_removed_ocr_strategies_are_rejected(self):
+        client = web_app.app.test_client()
+        for strategy in ("standard-kraken-small", "standard-kraken-medium"):
+            with self.subTest(strategy=strategy):
+                response = client.post("/api/jobs", data={"ocr_strategy": strategy})
+                self.assertEqual(400, response.status_code)
+                self.assertEqual("Unsupported OCR strategy.", response.get_json()["error"])
+
+    def test_saved_runs_with_retired_strategies_remain_readable(self):
+        job = web_app._jobs[self.job_id]
+        job.update(status="complete", historical=True, selected_pages=[1])
+        client = web_app.app.test_client()
+        for strategy in ("standard-kraken-small", "standard-kraken-medium"):
+            with self.subTest(strategy=strategy):
+                job["ocr_strategy"] = strategy
+                with patch.object(web_app, "RESULTS_DIR", self.output_dir):
+                    listing = client.get("/api/runs")
+                snapshot = client.get(f"/api/jobs/{self.job_id}")
+                self.assertEqual(200, listing.status_code)
+                self.assertEqual(200, snapshot.status_code)
+                for result in (listing.get_json()[0], snapshot.get_json()):
+                    self.assertEqual(strategy, result["ocr_strategy"])
+                    self.assertEqual(
+                        f"Retired OCR strategy: {strategy}", result["ocr_strategy_label"],
+                    )
 
     def test_responses_url_accepts_base_or_full_url(self):
         self.assertEqual(
@@ -3318,7 +3024,7 @@ class ConcurrentJobTests(unittest.TestCase):
         )
 
     @patch.object(pipeline, "_bearer", return_value="token")
-    @patch.object(pipeline.requests, "post")
+    @patch.object(pipeline.requests.Session, "post")
     def test_transient_error_immediately_fails_over_to_second_endpoint(self, post, _bearer):
         success = Mock(status_code=200)
         success.json.return_value = {

@@ -11,27 +11,36 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import fitz
 import markdown
-from flask import Flask, abort, jsonify, request, send_file, send_from_directory
+from flask import Flask, abort, g, jsonify, request, send_file, send_from_directory, session
 from dotenv import load_dotenv
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 
-import compare_golden
+from public_demo import DemoError, PublicDemo, write_json_atomic
 
 load_dotenv()
 register_heif_opener()
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR = ROOT / ".ui_data"
+DATA_DIR = Path(os.environ.get("INKSIGHT_DATA_DIR", str(ROOT / ".ui_data")))
 UPLOAD_DIR = DATA_DIR / "uploads"
 OUTPUT_DIR = DATA_DIR / "outputs"
-RESULTS_DIR = ROOT / "analysis_results"
+RESULTS_DIR = Path(os.environ.get("INKSIGHT_RESULTS_DIR", str(ROOT / "analysis_results")))
+_public_mode = os.environ.get("PUBLIC_DEMO", "0")
+if _public_mode not in {"0", "1"}:
+    raise ValueError("PUBLIC_DEMO must be '0' or '1'.")
+PUBLIC_DEMO = _public_mode == "1"
+if not PUBLIC_DEMO and os.environ.get("ENABLE_GOLDEN_COMPARISON", "1") == "1":
+    import compare_golden
+else:
+    compare_golden = None
 IMAGE_EXTENSIONS = {
     ".bmp", ".gif", ".heic", ".heif", ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp",
 }
@@ -93,6 +102,17 @@ MODEL_PROFILES = {
             "GPT_READ_TIMEOUT": "180",
         },
     },
+    "gpt-6.1-sol": {
+        "label": "GPT-6.1 Sol · low reasoning (experimental)",
+        "endpoint": os.environ.get(
+            "GPT_61_SOL_ENDPOINT", os.environ.get("GPT_SOL_ENDPOINT", _PRIMARY_ENDPOINT),
+        ),
+        "deployment": os.environ.get("GPT_61_SOL_DEPLOYMENT", "gpt-6.1-sol"),
+        "environment": {
+            "GPT_REASONING": "low",
+            "OCR_REASONING": "low",
+        },
+    },
     "copilot-claude-opus-4.8": {
         "label": "Claude Opus 4.8 · GitHub Copilot SDK · Core4 (high cost, experimental)",
         "endpoint": "copilot-sdk://local",
@@ -117,16 +137,10 @@ MODEL_PROFILES = {
         },
     },
 }
-DEFAULT_MODEL_PROFILE = "gpt-5.4"
+DEFAULT_MODEL_PROFILE = "gpt-6.1-sol"
 DEFAULT_OCR_STRATEGY = "standard"
 OCR_STRATEGIES = {
     "standard": {"label": "Standard core4 + visual reconciliation"},
-    "standard-kraken-small": {
-        "label": "Experimental standard + Kraken small advisory (legacy)",
-    },
-    "standard-kraken-medium": {
-        "label": "Experimental standard + Kraken medium advisory",
-    },
     "isolated-multiview": {
         "label": "Experimental isolated multi-view (lined handwriting)",
         "model_profiles": {"gpt-5.4", "gpt-5.6-sol"},
@@ -140,10 +154,79 @@ _jobs: dict[str, dict] = {}
 _uploads: dict[str, dict] = {}
 _processes: dict[str, dict[int, subprocess.Popen]] = {}
 _lock = threading.Lock()
+_demo: PublicDemo | None = None
+_demo_starting = False
+
+
+@app.before_request
+def protect_public_demo():
+    global _demo_starting
+    if not PUBLIC_DEMO or request.endpoint in {"healthz", "static"}:
+        return None
+    if _demo is None:
+        raise DemoError("The demo runtime has not been initialized.", 503)
+    if "visitor_id" not in session:
+        session["visitor_id"] = uuid.uuid4().hex
+        session.permanent = True
+    if request.method == "POST":
+        origin = request.headers.get("Origin")
+        if origin and urlsplit(origin).netloc != request.host:
+            raise DemoError("Cross-origin demo requests are not allowed.", 403)
+    arguments = request.view_args or {}
+    with _lock:
+        for field, collection in (("job_id", _jobs), ("upload_id", _uploads)):
+            if field in arguments:
+                item = collection.get(arguments[field])
+                if not item or item.get("owner_id") != session["visitor_id"]:
+                    abort(404)
+    if request.endpoint == "create_upload":
+        _demo.admit("uploads")
+    if request.endpoint == "create_job":
+        if request.form.get("model_profile", DEFAULT_MODEL_PROFILE) != DEFAULT_MODEL_PROFILE \
+                or request.form.get("ocr_strategy", DEFAULT_OCR_STRATEGY) != DEFAULT_OCR_STRATEGY:
+            raise DemoError("The public demo supports GPT-6.1 Sol with Standard Core4 only.")
+        with _lock:
+            upload_id = request.form.get("upload_id")
+            if upload_id and (
+                upload_id not in _uploads
+                or _uploads[upload_id].get("owner_id") != session["visitor_id"]
+            ):
+                abort(404)
+            if _demo_starting or any(_processes.values()) or any(
+                job["status"] in {"queued", "running", "cancelling"} for job in _jobs.values()
+            ):
+                raise DemoError("Another analysis is running. Please try again when it finishes.", 429)
+            _demo.admit("starts")
+            _demo_starting = True
+            g.demo_reserved = True
+        if not upload_id:
+            _demo.admit("uploads")
+    return None
+
+
+@app.errorhandler(DemoError)
+def demo_error(error: DemoError):
+    return jsonify({"error": str(error)}), error.status
+
+
+@app.errorhandler(413)
+def upload_too_large(_error):
+    return jsonify({"error": "The upload exceeds this deployment's file-size limit."}), 413
 
 
 @app.after_request
 def disable_browser_cache(response):
+    global _demo_starting
+    if getattr(g, "demo_reserved", False):
+        with _lock:
+            _demo_starting = False
+    if PUBLIC_DEMO:
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        if response.mimetype == "text/html" and request.endpoint in {"merged_document", "job_file"}:
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'none'; style-src 'unsafe-inline'; img-src 'self' data:; sandbox"
+            )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -185,6 +268,7 @@ def _manifest_data(job_id: str, job: dict) -> dict:
         "completed_at": job.get("completed_at"),
         "elapsed_seconds": job.get("elapsed_seconds"),
         "error": job.get("error"),
+        "owner_id": job.get("owner_id"),
     }
 
 
@@ -194,19 +278,24 @@ def _persist_job(job_id: str) -> None:
     output_dir = Path(job["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest = output_dir / "run.json"
-    temporary = manifest.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(_manifest_data(job_id, job), ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    temporary.replace(manifest)
+    write_json_atomic(manifest, _manifest_data(job_id, job))
 
 
 def _job_from_manifest(manifest: dict, output_dir: Path) -> dict:
     selected_pages = [int(page) for page in manifest.get("selected_pages", [])]
+    status = "complete"
+    message = "Document analysis complete"
+    error = manifest.get("error")
+    if PUBLIC_DEMO:
+        status = manifest.get("status", "failed")
+        message = manifest.get("message", "Saved analysis")
+        if status not in {"complete", "failed", "cancelled"}:
+            status = "failed"
+            message = "Analysis was interrupted by a server restart."
+            error = "Active analyses cannot resume after a restart. Start a new analysis."
     return {
         "file_name": manifest["file_name"],
-        "model_profile": manifest.get("model_profile", DEFAULT_MODEL_PROFILE),
+        "model_profile": manifest.get("model_profile", "gpt-5.4"),
         "ocr_strategy": manifest.get("ocr_strategy", DEFAULT_OCR_STRATEGY),
         "input_path": "",
         "output_dir": str(output_dir),
@@ -214,18 +303,19 @@ def _job_from_manifest(manifest: dict, output_dir: Path) -> dict:
         "page_count": int(manifest["page_count"]),
         "selected_pages": selected_pages,
         "page_states": {
-            page: {"stage": "complete", "message": "Page complete"}
+            page: {"stage": "complete" if status == "complete" else "failed", "message": message}
             for page in selected_pages
         },
         "current_page": selected_pages[0] if selected_pages else 1,
-        "status": "complete",
-        "stage": "complete",
-        "message": "Document analysis complete",
+        "status": status,
+        "stage": status,
+        "message": message,
         "created_at": manifest.get("created_at", output_dir.stat().st_mtime),
         "started_at": manifest.get("started_at"),
         "completed_at": manifest.get("completed_at"),
         "elapsed_seconds": manifest.get("elapsed_seconds"),
-        "error": manifest.get("error"),
+        "error": error,
+        "owner_id": manifest.get("owner_id"),
         "log": [],
         "historical": True,
     }
@@ -238,11 +328,60 @@ def _load_saved_jobs() -> None:
         manifest = _read_json(manifest_path)
         if not manifest or not manifest.get("id") or not manifest.get("file_name"):
             continue
+        if PUBLIC_DEMO and not re.fullmatch(r"[0-9a-f]{32}", str(manifest.get("owner_id", ""))):
+            app.logger.warning("Skipping saved demo run without valid browser ownership: %s", manifest_path.name)
+            continue
         job = _job_from_manifest(manifest, manifest_path.parent)
-        if all((_page_dir(job, page) / "handwriting_result.json").exists() for page in _selected_pages(job)):
+        has_results = all(
+            (_page_dir(job, page) / "handwriting_result.json").exists() for page in _selected_pages(job)
+        )
+        if PUBLIC_DEMO and job["status"] == "complete" and not has_results:
+            job.update(
+                status="failed", stage="failed", message="Saved analysis artifacts are missing.",
+                error="The saved result files are incomplete. Start a new analysis.",
+            )
+        if PUBLIC_DEMO or has_results:
             restored[manifest["id"]] = job
     with _lock:
         _jobs.update(restored)
+
+
+def initialize_runtime() -> None:
+    global _demo
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    if PUBLIC_DEMO:
+        if DATA_DIR.resolve().is_relative_to(RESULTS_DIR.resolve()):
+            raise RuntimeError("Private runtime state must not be inside the served results directory.")
+        if any(
+            path.resolve().is_relative_to((ROOT / "ui").resolve())
+            for path in (DATA_DIR, RESULTS_DIR, UPLOAD_DIR)
+        ):
+            raise RuntimeError("Runtime data must not be inside the publicly served UI directory.")
+        _demo = PublicDemo(DATA_DIR)
+        app.config.update(
+            SECRET_KEY=_demo.secret_key,
+            SESSION_COOKIE_NAME="__Host-inksight-demo",
+            SESSION_COOKIE_SECURE=True,
+            SESSION_COOKIE_HTTPONLY=True,
+            SESSION_COOKIE_SAMESITE="Lax",
+            PERMANENT_SESSION_LIFETIME=timedelta(days=7),
+            MAX_CONTENT_LENGTH=_demo.max_upload_bytes + 65536,
+        )
+        for manifest_path in UPLOAD_DIR.glob("*/upload.json"):
+            upload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if upload.get("id") != manifest_path.parent.name \
+                    or not re.fullmatch(r"[0-9a-f]{32}", str(upload.get("id", ""))) \
+                    or not re.fullmatch(r"[0-9a-f]{32}", str(upload.get("owner_id", ""))) \
+                    or upload.get("input_name") not in {"source.pdf", "source.png"}:
+                raise RuntimeError("Invalid persisted demo upload metadata.")
+            input_path = manifest_path.parent / upload["input_name"]
+            if input_path.is_file():
+                upload["input_path"] = str(input_path)
+                with _lock:
+                    _uploads[upload["id"]] = upload
+    _load_saved_jobs()
 
 
 def _page_count(path: Path) -> int:
@@ -265,8 +404,13 @@ def _flatten_image(image: Image.Image) -> Image.Image:
 def _normalize_image_upload(source_path: Path, upload_folder: Path) -> Path:
     frames: list[Image.Image] = []
     with Image.open(source_path) as source:
-        for frame_number in range(getattr(source, "n_frames", 1)):
+        frame_count = getattr(source, "n_frames", 1)
+        if _demo is not None and frame_count > _demo.max_pages:
+            raise DemoError(f"The public demo accepts at most {_demo.max_pages} pages per upload.")
+        for frame_number in range(frame_count):
             source.seek(frame_number)
+            if _demo is not None and source.width * source.height > 40_000_000:
+                raise DemoError("The image is too large for the public demo (40 million pixels maximum).")
             frames.append(_flatten_image(source.copy()))
     if not frames or any(frame.width < 1 or frame.height < 1 for frame in frames):
         raise ValueError("The uploaded image has no readable frames.")
@@ -333,6 +477,9 @@ def _save_upload(document) -> tuple[str, dict]:
     original_name = Path(document.filename).name or f"document{suffix}"
     uploaded_path = upload_folder / f"uploaded{suffix}"
     document.save(uploaded_path)
+    if _demo is not None and uploaded_path.stat().st_size > _demo.max_upload_bytes:
+        uploaded_path.unlink()
+        raise DemoError("The file exceeds the public demo upload-size limit.", 413)
     input_path = None
     try:
         input_path = (
@@ -341,6 +488,18 @@ def _save_upload(document) -> tuple[str, dict]:
             else _normalize_image_upload(uploaded_path, upload_folder)
         )
         page_count = _page_count(input_path)
+        if _demo is not None:
+            if page_count > _demo.max_pages:
+                raise DemoError(f"The public demo accepts at most {_demo.max_pages} pages per upload.")
+            if input_path.suffix == ".pdf":
+                with fitz.open(input_path) as pdf:
+                    if any(page.rect.width * page.rect.height * (400 / 72) ** 2 > 40_000_000 for page in pdf):
+                        raise DemoError("The PDF page dimensions are too large for the public demo.")
+    except DemoError:
+        uploaded_path.unlink(missing_ok=True)
+        if input_path is not None:
+            input_path.unlink(missing_ok=True)
+        raise
     except Exception as exc:
         uploaded_path.unlink(missing_ok=True)
         if input_path is not None:
@@ -354,6 +513,13 @@ def _save_upload(document) -> tuple[str, dict]:
         "page_count": page_count,
         "created_at": _now(),
     }
+    if _demo is not None:
+        upload["owner_id"] = session["visitor_id"]
+        upload["input_name"] = input_path.name
+        metadata = upload_folder / "upload.json"
+        write_json_atomic(
+            metadata, {key: value for key, value in upload.items() if key != "input_path"},
+        )
     with _lock:
         _uploads[upload_id] = upload
     return upload_id, upload
@@ -414,14 +580,9 @@ def _model_environment(profile_name: str) -> dict[str, str]:
 def _page_environment(model_profile: str, ocr_strategy: str) -> dict[str, str]:
     environment = _model_environment(model_profile)
     environment["OCR_STRATEGY"] = ocr_strategy
-    environment["KRAKEN_OCR_ENABLED"] = (
-        "1" if ocr_strategy in {
-            "standard-kraken-small", "standard-kraken-medium",
-        } else "0"
-    )
-    if model_profile == "gpt-5.4" and ocr_strategy in {
-        "standard", "standard-kraken-small", "standard-kraken-medium",
-    }:
+    if _demo is not None:
+        environment["DEMO_MAX_REGIONS"] = str(_demo.max_regions)
+    if model_profile == "gpt-5.4" and ocr_strategy == "standard":
         environment["GPT_REASONING"] = "low"
         environment["OCR_REASONING"] = "low"
         environment["OCR_MAX_TOKENS"] = "4000"
@@ -537,6 +698,8 @@ def _job_snapshot(job_id: str) -> dict:
     elapsed = source.get("elapsed_seconds")
     if elapsed is None and source["status"] in {"running", "cancelling"}:
         elapsed = round(_now() - source["started_at"], 1)
+    ocr_strategy = source.get("ocr_strategy", DEFAULT_OCR_STRATEGY)
+    strategy = OCR_STRATEGIES.get(ocr_strategy)
     return {
         "id": job_id,
         "run_name": source.get("run_name", Path(source["output_dir"]).name),
@@ -548,10 +711,10 @@ def _job_snapshot(job_id: str) -> dict:
         "model_label": MODEL_PROFILES[
             source.get("model_profile", DEFAULT_MODEL_PROFILE)
         ]["label"],
-        "ocr_strategy": source.get("ocr_strategy", DEFAULT_OCR_STRATEGY),
-        "ocr_strategy_label": OCR_STRATEGIES[
-            source.get("ocr_strategy", DEFAULT_OCR_STRATEGY)
-        ]["label"],
+        "ocr_strategy": ocr_strategy,
+        "ocr_strategy_label": (
+            strategy["label"] if strategy else f"Retired OCR strategy: {ocr_strategy}"
+        ),
         "status": source["status"],
         "stage": source.get("stage", "queued"),
         "message": source.get("message", "Waiting to start"),
@@ -760,6 +923,16 @@ def index():
     return app.send_static_file("index.html")
 
 
+@app.get("/healthz")
+def healthz():
+    return jsonify({"status": "ok"})
+
+
+@app.get("/api/demo-config")
+def demo_config():
+    return jsonify(_demo.public_config() if _demo is not None else {"public_demo": False})
+
+
 @app.post("/api/uploads")
 def create_upload():
     try:
@@ -853,6 +1026,7 @@ def create_job():
             "elapsed_seconds": None,
             "error": None,
             "log": [],
+            "owner_id": upload.get("owner_id"),
         }
     _persist_job(job_id)
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
@@ -866,6 +1040,7 @@ def list_runs():
             job_id for job_id, job in _jobs.items()
             if job.get("status") == "complete"
             and Path(job["output_dir"]).is_relative_to(RESULTS_DIR)
+            and (not PUBLIC_DEMO or job.get("owner_id") == session.get("visitor_id"))
         ]
     runs = [_job_snapshot(job_id) for job_id in run_ids]
     return jsonify([
@@ -1027,6 +1202,8 @@ def download_merged_png(job_id: str, page_number: int):
 
 @app.get("/api/jobs/<job_id>/pages/<int:page_number>/golden-comparison")
 def golden_comparison(job_id: str, page_number: int):
+    if PUBLIC_DEMO or compare_golden is None:
+        return jsonify({"available": False, "reason": "Golden references are not included in this deployment."})
     with _lock:
         job = dict(_jobs[job_id]) if job_id in _jobs else None
     if not job or page_number not in _selected_pages(job):
@@ -1079,6 +1256,5 @@ def job_file(job_id: str, file_path: str):
 
 
 if __name__ == "__main__":
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _load_saved_jobs()
+    initialize_runtime()
     app.run(host="127.0.0.1", port=5173, debug=False, threaded=True)

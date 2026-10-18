@@ -32,6 +32,7 @@
     </header>
 
     <main>
+      <aside class="demo-banner" id="demoBanner" role="note" hidden></aside>
       <section class="upload-view" id="uploadView">
         <div class="upload-heading">
           <span class="eyebrow">DOCUMENT INTELLIGENCE</span>
@@ -43,26 +44,18 @@
           <div class="upload-icon"><i data-lucide="file-up"></i></div>
           <div>
             <strong>Drop a document here</strong>
-            <span>PDF · PNG · JPEG · WebP · TIFF · BMP · GIF · HEIC · up to 100 MB</span>
+            <span id="uploadLimits">PDF · PNG · JPEG · WebP · TIFF · BMP · GIF · HEIC · up to 100 MB</span>
           </div>
           <label class="model-picker">
             <span>Vision model</span>
             <select id="modelSelect" name="model_profile">
-              <option value="gpt-5.4" selected>GPT-5.4</option>
-              <option value="gpt-5.4-pro">GPT-5.4 Pro · medium reasoning (experimental, slower)</option>
-              <option value="gpt-5.6-luna">GPT-5.6 Luna (experimental)</option>
-              <option value="gpt-5.6-sol-none">GPT-5.6 Sol · Fast (no reasoning)</option>
-              <option value="gpt-5.6-sol">GPT-5.6 Sol · low reasoning (experimental)</option>
-              <option value="gpt-5.6-sol-medium">GPT-5.6 Sol · medium reasoning (experimental, slower)</option>
-              <option value="copilot-claude-opus-4.8">Claude Opus 4.8 · GitHub Copilot SDK · Core4 (high cost, experimental)</option>
+              <option value="gpt-6.1-sol" selected>GPT-6.1 Sol · low reasoning (experimental)</option>
             </select>
           </label>
           <label class="model-picker">
             <span>OCR strategy</span>
             <select id="strategySelect" name="ocr_strategy">
               <option value="standard" selected>Standard core4 + visual reconciliation</option>
-              <option value="standard-kraken-medium">Experimental standard + Kraken medium advisory</option>
-              <option value="isolated-multiview">Experimental isolated multi-view · lined handwriting</option>
             </select>
           </label>
           <button class="primary-button" id="browseButton" type="button">
@@ -226,12 +219,6 @@
                 </button>
                 <button class="stage-tab" type="button" data-view="candidates" role="tab" aria-selected="false">
                   <i data-lucide="list-tree"></i><span>Candidates</span>
-                </button>
-                <button class="stage-tab" type="button" data-view="ivrit" role="tab" aria-selected="false">
-                  <i data-lucide="languages"></i><span>Ivrit OCR</span>
-                </button>
-                <button class="stage-tab" type="button" data-view="kraken" role="tab" aria-selected="false">
-                  <i data-lucide="text-search"></i><span>Kraken OCR</span>
                 </button>
                 <button class="stage-tab" type="button" data-view="decision" role="tab" aria-selected="false">
                   <i data-lucide="git-compare-arrows"></i><span>Decision</span>

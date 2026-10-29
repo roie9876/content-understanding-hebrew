@@ -18,7 +18,7 @@ param deployerObjectId string
 param containerImage string = 'mcr.microsoft.com/azuredocs/containerapps-helloworld:latest'
 
 @description('Public demo expiry. The application enforces this value at runtime.')
-param demoExpiresAt string = dateTimeAdd(utcNow(), 'P7D')
+param demoExpiresAt string = ''
 
 var tags = {
   'app-onboard-skill': 'true'

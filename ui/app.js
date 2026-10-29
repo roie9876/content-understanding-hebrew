@@ -909,7 +909,8 @@ async function loadDemoConfig() {
     if (!config.public_demo) return;
     demoConfig = config;
     const banner = document.querySelector("#demoBanner");
-    banner.textContent = `Public demo: use non-confidential documents only. Your files and saved results persist in Azure and are private to this browser cookie; clearing cookies loses access. One analysis at a time, ${config.max_jobs_per_hour} starts/hour, ${config.max_jobs_total} total. Processing closes ${new Date(config.expires_at).toLocaleString()}. Active jobs do not resume after a server restart.`;
+    const deadline = config.expires_at ? ` Processing closes ${new Date(config.expires_at).toLocaleString()}.` : "";
+    banner.textContent = `Public demo: use non-confidential documents only. Your files and saved results persist in Azure and are private to this browser cookie; clearing cookies loses access. One analysis at a time, ${config.max_jobs_per_hour} starts/hour, ${config.max_jobs_total} total.${deadline} Active jobs do not resume after a server restart.`;
     banner.hidden = false;
     document.querySelector("#uploadLimits").textContent = `Supported images or PDF - up to ${config.max_upload_bytes / (1024 * 1024)} MiB, ${config.max_pages} pages, ${config.max_regions} detected regions/page`;
     document.querySelector(".saved-runs .eyebrow").textContent = "THIS BROWSER'S HISTORY";

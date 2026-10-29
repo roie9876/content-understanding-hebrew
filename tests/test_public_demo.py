@@ -49,10 +49,18 @@ class DemoBudgetTests(unittest.TestCase):
         with self.assertRaisesRegex(DemoError, "allowance"):
             restored.admit("starts")
 
+    def test_no_default_expiration(self):
+        self.assertIsNone(self.demo.public_config()["expires_at"])
+        with patch("public_demo.time.time", return_value=self.demo.state["created_at"] + 30 * 24 * 3600):
+            self.demo.admit("starts")
+
     def test_expiration_rejects_at_exact_deadline(self):
-        with patch("public_demo.time.time", return_value=self.demo.expires_at):
+        with patch.dict(os.environ, {"DEMO_EXPIRES_AT": "2030-01-01T00:00:00Z"}):
+            demo = PublicDemo(self.root)
+        self.assertEqual("2030-01-01T00:00:00+00:00", demo.public_config()["expires_at"])
+        with patch("public_demo.time.time", return_value=demo.expires_at):
             with self.assertRaises(DemoError) as error:
-                self.demo.admit("starts")
+                demo.admit("starts")
         self.assertEqual(410, error.exception.status)
 
     def test_missing_signing_key_does_not_silently_reset_ownership(self):

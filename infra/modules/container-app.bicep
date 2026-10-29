@@ -4,6 +4,7 @@ param containerImage string
 param location string
 param tags object
 param acrName string
+param registryLoginServer string = ''
 param managedIdentityResourceId string
 param managedIdentityClientId string
 param foundryOpenAiEndpoint string
@@ -41,12 +42,19 @@ resource app 'Microsoft.App/containerApps@2026-07-01' = {
       ingress: {
         external: true
         targetPort: effectivePort
+        exposedPort: 0
         allowInsecure: false
         transport: 'auto'
+        traffic: [
+          {
+            latestRevision: true
+            weight: 100
+          }
+        ]
       }
       registries: isPlaceholder ? [] : [
         {
-          server: registry.properties.loginServer
+          server: empty(registryLoginServer) ? registry.properties.loginServer : registryLoginServer
           identity: managedIdentityResourceId
         }
       ]
@@ -56,6 +64,8 @@ resource app 'Microsoft.App/containerApps@2026-07-01' = {
       scale: {
         minReplicas: 1
         maxReplicas: 1
+        cooldownPeriod: 300
+        pollingInterval: 30
       }
       containers: [
         {

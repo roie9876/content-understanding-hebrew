@@ -178,11 +178,11 @@ charges. The UI displays that warning and the configured limits.
   surfaces with the same browser. There is no shared public history.
 - Only GPT-6.1 Sol / Standard is accepted; corpus comparisons are unavailable.
 - Defaults: 20 MiB per file, two pages, 40 detected regions per page, one active
-  analysis, ten starts per hour, 25 total starts, and a seven-day processing window.
+  analysis, ten starts per hour, and 25 total starts, with no processing deadline.
   Over-complex pages are rejected, never silently truncated. Images/PDF page sizes
   are also bounded to avoid oversized rendering. Upload admissions are limited too.
-- The processing deadline blocks new uploads/analyses, not access to existing owned
-  results. Limits are operational safeguards, **not a hard dollar spending cap**.
+- An optional `DEMO_EXPIRES_AT` deadline blocks new uploads/analyses, not access to
+  existing owned results. Limits are operational safeguards, **not a hard dollar spending cap**.
 - Rendered document HTML is sandboxed; cross-origin POSTs are rejected.
 
 Set `INKSIGHT_DATA_DIR` and `INKSIGHT_RESULTS_DIR` to private runtime directories.

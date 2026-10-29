@@ -68,7 +68,7 @@ class PublicDemo:
                 raise ValueError("DEMO_EXPIRES_AT must include a timezone.")
             self.expires_at = parsed.timestamp()
         else:
-            self.expires_at = self.state["created_at"] + 7 * 24 * 3600
+            self.expires_at = None
 
     @staticmethod
     def _positive(name: str, default: int) -> int:
@@ -96,7 +96,7 @@ class PublicDemo:
     def admit(self, kind: str) -> None:
         with self.lock:
             now = time.time()
-            if now >= self.expires_at:
+            if self.expires_at is not None and now >= self.expires_at:
                 raise DemoError("The public demo processing window has expired. Contact the owner.", 410)
             if kind not in {"starts", "uploads"}:
                 raise ValueError("Unknown demo admission type.")
@@ -117,5 +117,8 @@ class PublicDemo:
             "max_regions": self.max_regions,
             "max_jobs_per_hour": self.hourly_limit,
             "max_jobs_total": self.total_limit,
-            "expires_at": datetime.fromtimestamp(self.expires_at, timezone.utc).isoformat(),
+            "expires_at": (
+                datetime.fromtimestamp(self.expires_at, timezone.utc).isoformat()
+                if self.expires_at is not None else None
+            ),
         }

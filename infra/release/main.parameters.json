@@ -1,0 +1,25 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "resourceGroupName": { "value": "${AZURE_RESOURCE_GROUP}" },
+    "appName": { "value": "${AZURE_CONTAINER_APP_NAME}" },
+    "environmentName": { "value": "${INKSIGHT_CONTAINER_ENVIRONMENT}" },
+    "registryName": { "value": "${INKSIGHT_REGISTRY_NAME}" },
+    "identityName": { "value": "${INKSIGHT_IDENTITY_NAME}" },
+    "identityClientId": { "value": "${INKSIGHT_IDENTITY_CLIENT_ID}" },
+    "foundryAccountName": { "value": "${INKSIGHT_FOUNDRY_NAME}" },
+    "storageName": { "value": "${INKSIGHT_STORAGE_NAME}" },
+    "containerImage": { "value": "${INKSIGHT_CONTAINER_IMAGE}" },
+    "location": { "value": "${AZURE_LOCATION}" },
+    "appTags": {
+      "value": {
+        "app-onboard-session-id": "${INKSIGHT_DEPLOYMENT_SESSION_ID}",
+        "app-onboard-skill": "true",
+        "created-at": "${INKSIGHT_DEPLOYED_AT}",
+        "deployed-by": "${INKSIGHT_DEPLOYED_BY}",
+        "environment": "${AZURE_ENV_NAME}"
+      }
+    }
+  }
+}

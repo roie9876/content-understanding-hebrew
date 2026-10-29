@@ -1,0 +1,12 @@
+name: inksight
+
+infra:
+  provider: bicep
+  path: infra/release
+
+services:
+  inksight:
+    image: ${INKSIGHT_CONTAINER_IMAGE}
+    host: containerapp
+    resourceName: ${AZURE_CONTAINER_APP_NAME}
+    resourceGroup: ${AZURE_RESOURCE_GROUP}

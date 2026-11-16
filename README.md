@@ -6,14 +6,13 @@ Azure AI engines together:
 | Engine | Role |
 | --- | --- |
 | **Azure AI Content Understanding** | OCR of printed Hebrew + layout + structured field extraction, with confidence scores |
-| **Azure OpenAI GPT vision** (`gpt-5.4`, `gpt-5.6-luna`, or `gpt-5.6-sol`) | Reads Hebrew **handwriting** (which classic OCR does not support) and separates printed vs handwritten text |
+| **Azure OpenAI GPT vision** (`gpt-6.1-sol` by default in the web app) | Detects and reads Hebrew **handwriting**, and separates printed vs handwritten text |
 
 The two outputs are merged side-by-side so you can compare how each engine read the document.
 
-> **Why two engines?** Azure's deterministic OCR (Content Understanding / Document Intelligence)
-> supports **printed** Hebrew but **not** Hebrew **handwriting**. A multimodal LLM (GPT vision)
-> fills that gap. Content Understanding stays the reliable source for the printed form + fields;
-> GPT recovers the handwritten values.
+> **Why two engines?** Content Understanding extracts the printed form, layout, and fields;
+> a multimodal vision model detects and reads handwritten values. The outputs are combined for
+> review.
 
 ## Architecture
 
@@ -22,6 +21,9 @@ handwriting detection, Core4 recognition, visual reconciliation, and document me
 Ivrit OCR / HASH v1 and Kraken are no longer called by the application; their tabs,
 strategy options, and sidecar configuration have been removed. Existing saved analyses
 remain readable, and the standalone Kraken benchmark is retained for historical experiments.
+The web app defaults to GPT-6.1 Sol; legacy model profiles remain available through the API.
+When `handwriting_pipeline.py` is run directly, it uses `GPT_DEPLOYMENT` instead (default:
+`gpt-5.4`), so configure it separately if needed.
 
 Detection preserves multi-line handwritten blocks, even when their labels also mention
 dates or contact details. Single-row form snapping applies only to individual fields or
